@@ -79,3 +79,57 @@
 - 每次新增协议 codec 或修改 IR 时，**必须同步更新本矩阵**
 - N×N 组合中有损判定必须对应一条集成测试（见 `crates/protocols/tests/`）
 - `lossy_default_reject` 的拒绝消息应明确指出被拒绝的维度（如 "tool_choice=required not supported by target protocol gemini"）
+
+## 6. Thinking / Reasoning 配置
+
+| 维度 | chat_completions | messages | responses | gemini | embeddings |
+|------|:---:|:---:|:---:|:---:|:---:|
+| `effort` (low/medium/high) | ✅ (`reasoning_effort`) | ⚠️ → 丢弃（Anthropic 用 budget_tokens） | ✅ (`reasoning.effort`) | ⚠️ → 丢弃 | N/A |
+| `budget_tokens` | ⚠️ → 丢弃 | ✅ (`thinking.budget_tokens`) | ⚠️ → 丢弃 | ✅ (`thinkingConfig.thinkingBudget`) | N/A |
+| `display` (summarized/omitted) | ⚠️ → 丢弃 | ✅ (`thinking.display`) | ⚠️ → 丢弃 | ⚠️ → 丢弃 | N/A |
+| `include_thoughts` | ⚠️ → 丢弃 | ⚠️ → 丢弃 | ⚠️ → 丢弃 | ✅ (`thinkingConfig.includeThoughts`) | N/A |
+
+**跨协议策略**：thinking 配置跨协议时映射或丢弃，不拒绝（thinking 配置不影响语义正确性，只影响模型行为质量）。
+
+## 7. Metadata
+
+| 维度 | chat_completions | messages | responses | gemini | embeddings |
+|------|:---:|:---:|:---:|:---:|:---:|
+| `metadata` KV 对 | ✅ | ⚠️ → 仅保留 `user_id` | ✅ | ✅ (`labels`) | N/A |
+| `user_id` | ✅ | ✅ | ✅ | ✅ | N/A |
+
+**跨协议策略**：Anthropic 只支持 `user_id` 键，其他键静默丢弃（与官方 API 一致）。
+
+## 8. Annotations / Citations
+
+| 维度 | chat_completions | messages | responses | gemini | embeddings |
+|------|:---:|:---:|:---:|:---:|:---:|
+| URL citation | ✅ (`annotations[]`) | ⚠️ → 丢弃 | ✅ (`annotations[]`) | ✅ (`groundingMetadata`) | N/A |
+| File citation | ✅ | ⚠️ → 丢弃 | ✅ | ⚠️ → 丢弃 | N/A |
+
+**跨协议策略**：annotations 跨协议时允许丢弃（annotations 是展示层数据，不影响模型推理）。
+
+## 9. Refusal
+
+| 维度 | chat_completions | messages | responses | gemini | embeddings |
+|------|:---:|:---:|:---:|:---:|:---:|
+| refusal 文本 | ✅ (`message.refusal`) | ⚠️ → 作为 text 输出 | ✅ (`refusal` output item) | ⚠️ → 作为 text 输出 | N/A |
+| refusal stop_reason | ✅ → `content_filter` | ✅ (`stop_reason:"refusal"`) | ✅ → `incomplete` | ✅ → `SAFETY` | N/A |
+
+**跨协议策略**：refusal 文本跨协议时保留为 `Content::Refusal`，目标协议不支持独立 refusal 字段时作为 text 输出。
+
+## 10. Encrypted Reasoning Content
+
+| 维度 | chat_completions | messages | responses | gemini | embeddings |
+|------|:---:|:---:|:---:|:---:|:---:|
+| `encrypted_content` | ⚠️ → 丢弃 | ✅ (`redacted_thinking.data`) | ✅ (`reasoning.encrypted_content`) | ⚠️ → 丢弃 | N/A |
+
+**跨协议策略**：encrypted_content 仅在同协议往返时保留（Responses ↔ Responses, Anthropic ↔ Anthropic），跨协议时丢弃（加密数据是协议特定的）。
+
+## 11. Stop Details
+
+| 维度 | chat_completions | messages | responses | gemini | embeddings |
+|------|:---:|:---:|:---:|:---:|:---:|
+| `stop_details` (structured) | ⚠️ → 仅 `finish_reason` | ✅ (`stop_details` object) | ⚠️ → 仅 `status` | ⚠️ → 仅 `finishReason` | N/A |
+
+**跨协议策略**：stop_details 跨协议时映射到目标协议的 stop reason 字段，结构化 details（type/category/explanation）可能丢失。

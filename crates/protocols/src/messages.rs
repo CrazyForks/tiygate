@@ -143,6 +143,7 @@ impl EndpointCodec for MessagesCodec {
                             Some("text") => {
                                 parts.push(Content::Text {
                                     text: block["text"].as_str().unwrap_or("").to_string(),
+                                    annotations: None,
                                 });
                             }
                             Some("thinking") => {
@@ -153,6 +154,7 @@ impl EndpointCodec for MessagesCodec {
                                     text: block["thinking"].as_str().unwrap_or("").to_string(),
                                     signature: block["signature"].as_str().map(|s| s.to_string()),
                                     id: None,
+                                    encrypted_content: None,
                                 });
                             }
                             Some("redacted_thinking") => {
@@ -163,6 +165,7 @@ impl EndpointCodec for MessagesCodec {
                                     text: block["data"].as_str().unwrap_or("").to_string(),
                                     signature: None,
                                     id: None,
+                                    encrypted_content: None,
                                 });
                             }
                             Some("tool_use") => {
@@ -222,6 +225,7 @@ impl EndpointCodec for MessagesCodec {
                 } else if let Some(text) = msg["content"].as_str() {
                     vec![Content::Text {
                         text: text.to_string(),
+                        annotations: None,
                     }]
                 } else {
                     vec![]
@@ -259,6 +263,23 @@ impl EndpointCodec for MessagesCodec {
                         .collect()
                 })
                 .unwrap_or_default(),
+            thinking: body.get("thinking").and_then(|t| {
+                let budget_tokens = t["budget_tokens"].as_u64().map(|v| v as u32);
+                let display = t["display"].as_str().map(|s| match s {
+                    "summarized" => tiygate_core::ThinkingDisplay::Summarized,
+                    "omitted" => tiygate_core::ThinkingDisplay::Omitted,
+                    _ => tiygate_core::ThinkingDisplay::Summarized,
+                });
+                if budget_tokens.is_none() && display.is_none() {
+                    None
+                } else {
+                    Some(tiygate_core::ThinkingConfig {
+                        budget_tokens,
+                        display,
+                        ..Default::default()
+                    })
+                }
+            }),
             ..Default::default()
         };
 
@@ -271,7 +292,34 @@ impl EndpointCodec for MessagesCodec {
             response_format: None,
             stream,
             ingress_protocol: self.id.clone(),
-            extensions: Default::default(),
+            metadata: body.get("metadata").and_then(|m| {
+                m.get("user_id").and_then(|v| v.as_str()).map(|s| {
+                    let mut map = std::collections::HashMap::new();
+                    map.insert("user_id".to_string(), s.to_string());
+                    map
+                })
+            }),
+            extensions: {
+                let mut ext = std::collections::HashMap::new();
+                // Parse Anthropic native tool_choice into normalized extensions
+                // format so cross-protocol targets can interpret it.
+                if let Some(tc) = body.get("tool_choice") {
+                    if let Some(tc_type) = tc["type"].as_str() {
+                        let normalized = match tc_type {
+                            "auto" => json!("auto"),
+                            "any" => json!("required"),
+                            "none" => json!("none"),
+                            "tool" => {
+                                let name = tc["name"].as_str().unwrap_or("");
+                                json!({"type": "function", "function": {"name": name}})
+                            }
+                            _ => tc.clone(),
+                        };
+                        ext.insert("tool_choice".to_string(), normalized);
+                    }
+                }
+                ext
+            },
         })
     }
 
@@ -290,23 +338,35 @@ impl EndpointCodec for MessagesCodec {
 
         for c in &ir.content {
             match c {
-                Content::Text { text } => {
+                Content::Text { text, .. } => {
                     content_blocks.push(json!({
                         "type": "text",
                         "text": text,
                     }));
                 }
                 Content::Reasoning {
-                    text, signature, ..
+                    text,
+                    signature,
+                    encrypted_content,
+                    ..
                 } => {
-                    let mut block = json!({
-                        "type": "thinking",
-                        "thinking": text,
-                    });
-                    if let Some(sig) = signature {
-                        block["signature"] = json!(sig);
+                    if let Some(encrypted) = encrypted_content {
+                        // Redacted thinking: emit as redacted_thinking block
+                        // with the opaque encrypted data.
+                        content_blocks.push(json!({
+                            "type": "redacted_thinking",
+                            "data": encrypted,
+                        }));
+                    } else {
+                        let mut block = json!({
+                            "type": "thinking",
+                            "thinking": text,
+                        });
+                        if let Some(sig) = signature {
+                            block["signature"] = json!(sig);
+                        }
+                        content_blocks.push(block);
                     }
-                    content_blocks.push(block);
                 }
                 Content::ToolCall {
                     id,
@@ -442,7 +502,7 @@ impl EndpointCodec for MessagesCodec {
             msg.content
                 .iter()
                 .filter_map(|c| match c {
-                    Content::Text { text } => Some(json!({"type": "text", "text": text})),
+                    Content::Text { text, .. } => Some(json!({"type": "text", "text": text})),
                     // Preserve reasoning as an Anthropic thinking block ONLY
                     // when it carries the provider's `signature`. Anthropic
                     // rejects thinking blocks without a valid signature (400
@@ -484,6 +544,7 @@ impl EndpointCodec for MessagesCodec {
                         })),
                         _ => None,
                     },
+                    Content::Refusal { text, .. } => Some(json!({"type": "text", "text": text})),
                 })
                 .collect()
         }
@@ -564,6 +625,50 @@ impl EndpointCodec for MessagesCodec {
         if !ir.params.stop.is_empty() {
             body["stop_sequences"] = json!(ir.params.stop);
         }
+        // Thinking config: output Anthropic thinking block from params.thinking
+        if let Some(ref thinking) = ir.params.thinking {
+            if thinking.budget_tokens.is_some() || thinking.display.is_some() {
+                let mut t = json!({"type": "enabled"});
+                if let Some(budget) = thinking.budget_tokens {
+                    t["budget_tokens"] = json!(budget);
+                }
+                if let Some(display) = thinking.display {
+                    t["display"] = json!(match display {
+                        tiygate_core::ThinkingDisplay::Summarized => "summarized",
+                        tiygate_core::ThinkingDisplay::Omitted => "omitted",
+                    });
+                }
+                body["thinking"] = t;
+            }
+        }
+        // tool_choice: convert normalized extensions format to Anthropic native
+        if let Some(tc) = ir.extensions.get("tool_choice") {
+            let anthropic_tc = if let Some(s) = tc.as_str() {
+                match s {
+                    "auto" => json!({"type": "auto"}),
+                    "required" => json!({"type": "any"}),
+                    "none" => json!({"type": "none"}),
+                    _ => json!({"type": "auto"}),
+                }
+            } else if let Some(obj) = tc.as_object() {
+                // Object form: {"type": "function", "function": {"name": "x"}}
+                if obj.get("type").and_then(|v| v.as_str()) == Some("function") {
+                    let name = obj["function"]["name"].as_str().unwrap_or("");
+                    json!({"type": "tool", "name": name})
+                } else {
+                    tc.clone()
+                }
+            } else {
+                json!({"type": "auto"})
+            };
+            body["tool_choice"] = anthropic_tc;
+        }
+        // Metadata: Anthropic only supports user_id
+        if let Some(ref metadata) = ir.metadata {
+            if let Some(user_id) = metadata.get("user_id") {
+                body["metadata"] = json!({"user_id": user_id});
+            }
+        }
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -582,8 +687,7 @@ impl EndpointCodec for MessagesCodec {
         let response_id = body["id"].as_str().map(String::from);
 
         let mut content = Vec::new();
-        let mut extensions = std::collections::HashMap::new();
-        let mut redacted_data: Vec<serde_json::Value> = Vec::new();
+        let extensions = std::collections::HashMap::new();
 
         if let Some(arr) = body["content"].as_array() {
             for block in arr {
@@ -591,6 +695,7 @@ impl EndpointCodec for MessagesCodec {
                     Some("text") => {
                         content.push(Content::Text {
                             text: block["text"].as_str().unwrap_or("").to_string(),
+                            annotations: None,
                         });
                     }
                     Some("thinking") => {
@@ -598,6 +703,7 @@ impl EndpointCodec for MessagesCodec {
                             text: block["thinking"].as_str().unwrap_or("").to_string(),
                             signature: block["signature"].as_str().map(|s| s.to_string()),
                             id: None,
+                            encrypted_content: None,
                         });
                     }
                     // Anthropic may return `redacted_thinking` blocks when portions
@@ -606,13 +712,12 @@ impl EndpointCodec for MessagesCodec {
                     // to avoid 400 errors.
                     // https://platform.claude.com/docs/en/build-with-claude/extended-thinking
                     Some("redacted_thinking") => {
-                        if let Some(data) = block.get("data") {
-                            redacted_data.push(data.clone());
-                        }
+                        let encrypted = block["data"].as_str().map(|s| s.to_string());
                         content.push(Content::Reasoning {
                             text: String::new(),
                             signature: None,
                             id: None,
+                            encrypted_content: encrypted,
                         });
                     }
                     Some("tool_use") => {
@@ -627,14 +732,8 @@ impl EndpointCodec for MessagesCodec {
             }
         }
 
-        // Store redacted_thinking data in extensions so multi-turn
-        // conversations can echo them back without 400 errors.
-        if !redacted_data.is_empty() {
-            extensions.insert(
-                "anthropic_redacted_thinking".to_string(),
-                json!(redacted_data),
-            );
-        }
+        // redacted_thinking data is now stored in Content::Reasoning.encrypted_content
+        // (migrated from the previous extensions["anthropic_redacted_thinking"] approach).
 
         let finish_reason = body["stop_reason"].as_str().map(|s| match s {
             "end_turn" => FinishReason::Stop,
@@ -1367,18 +1466,21 @@ mod tests {
                     role: Role::User,
                     content: vec![Content::Text {
                         text: "Hello".to_string(),
+                        annotations: None,
                     }],
                 },
                 Message {
                     role: Role::Assistant,
                     content: vec![Content::Text {
                         text: "Hi!".to_string(),
+                        annotations: None,
                     }],
                 },
                 Message {
                     role: Role::User,
                     content: vec![Content::Text {
                         text: "How are you?".to_string(),
+                        annotations: None,
                     }],
                 },
             ],
@@ -1408,6 +1510,7 @@ mod tests {
                 "chat-completions",
                 "v1",
             ),
+            metadata: None,
             extensions: Default::default(),
         };
 
@@ -1458,6 +1561,7 @@ mod tests {
                 role: Role::User,
                 content: vec![Content::Text {
                     text: "Hello".to_string(),
+                    annotations: None,
                 }],
             }],
             tools: vec![],
@@ -1472,6 +1576,7 @@ mod tests {
                 "messages",
                 "2023-06-01",
             ),
+            metadata: None,
             extensions: Default::default(),
         };
 
@@ -1496,6 +1601,7 @@ mod tests {
         let ir = IrResponse {
             content: vec![Content::Text {
                 text: "Hello!".to_string(),
+                annotations: None,
             }],
             usage: Some(Usage {
                 prompt_tokens: 10,
@@ -1633,6 +1739,7 @@ mod tests {
                     role: Role::User,
                     content: vec![Content::Text {
                         text: "hi".to_string(),
+                        annotations: None,
                     }],
                 },
                 Message {
@@ -1669,6 +1776,7 @@ mod tests {
                 "chat-completions",
                 "v1",
             ),
+            metadata: None,
             extensions: Default::default(),
         };
         let (body, _h) = codec.encode_request(&ir).unwrap();
@@ -1843,6 +1951,7 @@ mod tests {
                     role: Role::User,
                     content: vec![Content::Text {
                         text: "hi".to_string(),
+                        annotations: None,
                     }],
                 },
                 // reasoning 无 signature(来自 OpenAI 历史)→ 应被丢弃
@@ -1853,9 +1962,11 @@ mod tests {
                             text: "unsigned thoughts".to_string(),
                             signature: None,
                             id: None,
+                            encrypted_content: None,
                         },
                         Content::Text {
                             text: "answer A".to_string(),
+                            annotations: None,
                         },
                     ],
                 },
@@ -1867,9 +1978,11 @@ mod tests {
                             text: "signed thoughts".to_string(),
                             signature: Some("sig_xyz".to_string()),
                             id: None,
+                            encrypted_content: None,
                         },
                         Content::Text {
                             text: "answer B".to_string(),
+                            annotations: None,
                         },
                     ],
                 },
@@ -1886,6 +1999,7 @@ mod tests {
                 "chat-completions",
                 "v1",
             ),
+            metadata: None,
             extensions: Default::default(),
         };
 

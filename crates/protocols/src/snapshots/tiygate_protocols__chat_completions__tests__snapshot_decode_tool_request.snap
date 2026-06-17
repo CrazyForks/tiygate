@@ -11,6 +11,7 @@ IrRequest {
             content: [
                 Text {
                     text: "What is the weather?",
+                    annotations: None,
                 },
             ],
         },
@@ -43,6 +44,7 @@ IrRequest {
         frequency_penalty: None,
         presence_penalty: None,
         seed: None,
+        thinking: None,
     },
     response_format: None,
     stream: false,
@@ -51,6 +53,7 @@ IrRequest {
         name: "chat-completions",
         version: "v1",
     },
+    metadata: None,
     extensions: {
         "tool_choice": String("auto"),
     },

@@ -97,7 +97,10 @@ impl EndpointCodec for EmbeddingsCodec {
 
         let messages = vec![Message {
             role: Role::User,
-            content: vec![Content::Text { text: input_text }],
+            content: vec![Content::Text {
+                text: input_text,
+                annotations: None,
+            }],
         }];
 
         Ok(IrRequest {
@@ -113,6 +116,7 @@ impl EndpointCodec for EmbeddingsCodec {
                 "embeddings",
                 "v1",
             ),
+            metadata: None,
             extensions,
         })
     }
@@ -140,7 +144,7 @@ impl EndpointCodec for EmbeddingsCodec {
             .iter()
             .filter_map(|m| {
                 m.content.iter().find_map(|c| match c {
-                    Content::Text { text } => Some(text.clone()),
+                    Content::Text { text, .. } => Some(text.clone()),
                     _ => None,
                 })
             })

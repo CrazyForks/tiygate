@@ -131,6 +131,7 @@ impl EndpointCodec for ResponsesCodec {
                 let content = if let Some(text) = item["content"].as_str() {
                     vec![Content::Text {
                         text: text.to_string(),
+                        annotations: None,
                     }]
                 } else if let Some(content_arr) = item["content"].as_array() {
                     let mut parts = Vec::new();
@@ -139,6 +140,7 @@ impl EndpointCodec for ResponsesCodec {
                             Some("input_text") | Some("output_text") => {
                                 parts.push(Content::Text {
                                     text: part["text"].as_str().unwrap_or("").to_string(),
+                                    annotations: None,
                                 });
                             }
                             Some("input_image") => {
@@ -219,10 +221,12 @@ impl EndpointCodec for ResponsesCodec {
                         text,
                         signature: None,
                         id: item["id"].as_str().map(|s| s.to_string()),
+                        encrypted_content: None,
                     }]
                 } else {
                     vec![Content::Text {
                         text: String::new(),
+                        annotations: None,
                     }]
                 };
                 // Merge consecutive items with the same role into one Message
@@ -269,6 +273,21 @@ impl EndpointCodec for ResponsesCodec {
                         .collect()
                 })
                 .unwrap_or_default(),
+            thinking: body.get("reasoning").and_then(|r| {
+                r.get("effort").and_then(|v| v.as_str()).map(|s| {
+                    use tiygate_core::ThinkingEffort;
+                    let effort = match s {
+                        "low" => ThinkingEffort::Low,
+                        "medium" => ThinkingEffort::Medium,
+                        "high" => ThinkingEffort::High,
+                        _ => ThinkingEffort::High,
+                    };
+                    tiygate_core::ThinkingConfig {
+                        effort: Some(effort),
+                        ..Default::default()
+                    }
+                })
+            }),
             ..Default::default()
         };
 
@@ -323,6 +342,11 @@ impl EndpointCodec for ResponsesCodec {
             response_format: None,
             stream,
             ingress_protocol: self.id.clone(),
+            metadata: body.get("metadata").and_then(|m| m.as_object()).map(|obj| {
+                obj.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            }),
             extensions,
         })
     }
@@ -337,13 +361,21 @@ impl EndpointCodec for ResponsesCodec {
         let mut tool_calls = Vec::new();
         for c in &ir.content {
             match c {
-                Content::Text { text } => {
+                Content::Text { text, .. } => {
                     message_text.push_str(text);
                 }
-                Content::Reasoning { text, id, .. } => {
+                Content::Reasoning {
+                    text,
+                    id,
+                    encrypted_content,
+                    ..
+                } => {
                     let mut item = json!({"type": "reasoning", "summary": [{"type": "summary_text", "text": text}]});
                     if let Some(rid) = id {
                         item["id"] = json!(rid);
+                    }
+                    if let Some(enc) = encrypted_content {
+                        item["encrypted_content"] = json!(enc);
                     }
                     output_items.push(item);
                 }
@@ -353,6 +385,9 @@ impl EndpointCodec for ResponsesCodec {
                     arguments,
                 } => {
                     tool_calls.push(json!({"call_id": id, "type": "function_call", "name": name, "arguments": serde_json::to_string(arguments).unwrap_or_default(), "status": "completed"}));
+                }
+                Content::Refusal { text, .. } => {
+                    output_items.push(json!({"type": "refusal", "refusal": text}));
                 }
                 _ => {}
             }
@@ -412,7 +447,7 @@ impl EndpointCodec for ResponsesCodec {
             match msg.role {
                 Role::System => {
                     for c in &msg.content {
-                        if let Content::Text { text } = c {
+                        if let Content::Text { text, .. } = c {
                             let existing = body["instructions"].as_str().unwrap_or("");
                             body["instructions"] = json!(format!("{existing}\n{text}"));
                         }
@@ -431,7 +466,7 @@ impl EndpointCodec for ResponsesCodec {
 
                     for c in &msg.content {
                         match c {
-                            Content::Text { text } => {
+                            Content::Text { text, .. } => {
                                 text_parts.push(json!({"type": "input_text", "text": text}));
                             }
                             Content::Media {
@@ -449,7 +484,12 @@ impl EndpointCodec for ResponsesCodec {
                                 }
                                 _ => {}
                             },
-                            Content::Reasoning { text, id, .. } => {
+                            Content::Reasoning {
+                                text,
+                                id,
+                                encrypted_content,
+                                ..
+                            } => {
                                 // Responses API treats reasoning as a sibling
                                 // output/input item, NOT as a content sub-part
                                 // of the message. The OpenAI Responses spec
@@ -476,6 +516,9 @@ impl EndpointCodec for ResponsesCodec {
                                 });
                                 if let Some(rid) = id {
                                     item["id"] = json!(rid);
+                                }
+                                if let Some(enc) = encrypted_content {
+                                    item["encrypted_content"] = json!(enc);
                                 }
                                 reasoning_items.push(item);
                             }
@@ -508,6 +551,9 @@ impl EndpointCodec for ResponsesCodec {
                                 // prior function calls have matching outputs.
                                 tool_outputs_json
                                     .push(responses_function_call_output(tool_call_id, content));
+                            }
+                            Content::Refusal { text, .. } => {
+                                text_parts.push(json!({"type": "input_text", "text": text}));
                             }
                         }
                     }
@@ -574,6 +620,16 @@ impl EndpointCodec for ResponsesCodec {
         if !ir.params.stop.is_empty() {
             body["stop"] = json!(ir.params.stop);
         }
+        // Metadata: output from ir.metadata as JSON object
+        if let Some(ref metadata) = ir.metadata {
+            if !metadata.is_empty() {
+                let mut meta = serde_json::Map::new();
+                for (k, v) in metadata {
+                    meta.insert(k.clone(), json!(v));
+                }
+                body["metadata"] = json!(meta);
+            }
+        }
 
         // Replay modeled Responses extensions captured at decode time.
         if let Some(tc) = ir.extensions.get("tool_choice") {
@@ -582,12 +638,25 @@ impl EndpointCodec for ResponsesCodec {
         if let Some(tf) = ir.extensions.get("text") {
             body["text"] = tf.clone();
         }
-        if let Some(effort) = ir
-            .extensions
-            .get("reasoning_effort")
-            .and_then(|v| v.as_str())
-        {
-            body["reasoning"] = json!({"effort": effort});
+        // Thinking config: output reasoning.effort from params.thinking
+        // or from the legacy extensions["reasoning_effort"] fallback.
+        if body.get("reasoning").is_none() {
+            if let Some(ref thinking) = ir.params.thinking {
+                if let Some(effort) = thinking.effort {
+                    body["reasoning"] = json!({"effort": match effort {
+                        tiygate_core::ThinkingEffort::Low => "low",
+                        tiygate_core::ThinkingEffort::Medium => "medium",
+                        tiygate_core::ThinkingEffort::High => "high",
+                        tiygate_core::ThinkingEffort::Max => "high",
+                    }});
+                }
+            } else if let Some(effort) = ir
+                .extensions
+                .get("reasoning_effort")
+                .and_then(|v| v.as_str())
+            {
+                body["reasoning"] = json!({"effort": effort});
+            }
         }
         // Replay Responses-specific top-level passthrough fields.
         if let Some(extra) = ir
@@ -621,8 +690,31 @@ impl EndpointCodec for ResponsesCodec {
                             for part in content_arr {
                                 if part["type"] == "output_text" {
                                     if let Some(text) = part["text"].as_str() {
+                                        let annotations = part.get("annotations")
+                                            .and_then(|a| a.as_array())
+                                            .map(|arr| {
+                                                arr.iter()
+                                                    .filter_map(|a| {
+                                                        let type_str = a["type"].as_str()?;
+                                                        let kind = match type_str {
+                                                            "url_citation" => tiygate_core::AnnotationKind::UrlCitation,
+                                                            "file_citation" => tiygate_core::AnnotationKind::FileCitation,
+                                                            _ => return None,
+                                                        };
+                                                        Some(tiygate_core::Annotation {
+                                                            kind,
+                                                            start_index: a["start_index"].as_u64().map(|v| v as u32),
+                                                            end_index: a["end_index"].as_u64().map(|v| v as u32),
+                                                            title: a["url_citation"]["title"].as_str().or_else(|| a["file_citation"]["filename"].as_str()).map(String::from),
+                                                            url: a["url_citation"]["url"].as_str().map(String::from),
+                                                        })
+                                                    })
+                                                    .collect::<Vec<_>>()
+                                            })
+                                            .filter(|v: &Vec<_>| !v.is_empty());
                                         content.push(Content::Text {
                                             text: text.to_string(),
+                                            annotations,
                                         });
                                     }
                                 }
@@ -655,6 +747,19 @@ impl EndpointCodec for ResponsesCodec {
                                     text,
                                     signature: None,
                                     id: item["id"].as_str().map(|s| s.to_string()),
+                                    encrypted_content: item["encrypted_content"]
+                                        .as_str()
+                                        .map(|s| s.to_string()),
+                                });
+                            }
+                        }
+                    }
+                    Some("refusal") => {
+                        if let Some(text) = item["refusal"].as_str() {
+                            if !text.is_empty() {
+                                content.push(Content::Refusal {
+                                    text: text.to_string(),
+                                    category: None,
                                 });
                             }
                         }
@@ -677,6 +782,20 @@ impl EndpointCodec for ResponsesCodec {
             }
             other => FinishReason::Other(other.to_string()),
         });
+        // Populate stop_details on incomplete status
+        let stop_details = if body["status"].as_str() == Some("incomplete") {
+            let reason = body
+                .get("incomplete_details")
+                .and_then(|d| d["reason"].as_str())
+                .unwrap_or("incomplete");
+            Some(tiygate_core::ir::StopDetails {
+                stop_reason: reason.to_string(),
+                kind: Some(reason.to_string()),
+                ..Default::default()
+            })
+        } else {
+            None
+        };
         let usage = body.get("usage").map(|u| {
             let cache_read = u["input_tokens_details"]["cached_tokens"].as_u64();
             // Responses' `input_tokens` includes the cached portion; the IR
@@ -697,7 +816,7 @@ impl EndpointCodec for ResponsesCodec {
             usage,
             finish_reason,
             response_id,
-            stop_details: None,
+            stop_details,
             extensions: Default::default(),
         })
     }
@@ -1540,6 +1659,7 @@ mod tests {
         let ir = IrResponse {
             content: vec![Content::Text {
                 text: "Hi!".to_string(),
+                annotations: None,
             }],
             usage: Some(Usage {
                 prompt_tokens: 10,
@@ -1583,6 +1703,7 @@ mod tests {
         let ir = IrResponse {
             content: vec![Content::Text {
                 text: "ok".to_string(),
+                annotations: None,
             }],
             usage: Some(Usage {
                 prompt_tokens: 100,
@@ -1714,6 +1835,7 @@ mod tests {
                     role: Role::User,
                     content: vec![Content::Text {
                         text: "杭州明天天气？".to_string(),
+                        annotations: None,
                     }],
                 },
                 Message {
@@ -1723,6 +1845,7 @@ mod tests {
                             text: "我需要先查日期再查天气。".to_string(),
                             signature: None,
                             id: None,
+                            encrypted_content: None,
                         },
                         Content::ToolCall {
                             id: "call_1".to_string(),
@@ -1744,6 +1867,7 @@ mod tests {
             params: tiygate_core::GenerationParams::default(),
             stream: false,
             response_format: None,
+            metadata: None,
             extensions: Default::default(),
         };
         let (body, _) = codec.encode_request(&ir).unwrap();
@@ -1793,12 +1917,14 @@ mod tests {
                     text: "thinking...".to_string(),
                     signature: None,
                     id: None,
+                    encrypted_content: None,
                 }],
             }],
             tools: vec![],
             params: tiygate_core::GenerationParams::default(),
             stream: false,
             response_format: None,
+            metadata: None,
             extensions: Default::default(),
         };
         let (body, _) = codec.encode_request(&ir).unwrap();
@@ -1937,12 +2063,14 @@ mod tests {
                     text: "from anthropic".to_string(),
                     signature: Some("sig_anthropic".to_string()),
                     id: None,
+                    encrypted_content: None,
                 }],
             }],
             tools: vec![],
             params: tiygate_core::GenerationParams::default(),
             stream: false,
             response_format: None,
+            metadata: None,
             extensions: Default::default(),
         };
         let (body, _) = codec.encode_request(&ir).unwrap();

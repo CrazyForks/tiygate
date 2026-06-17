@@ -11,6 +11,7 @@ IrRequest {
             content: [
                 Text {
                     text: "Hello",
+                    annotations: None,
                 },
             ],
         },
@@ -27,6 +28,7 @@ IrRequest {
         frequency_penalty: None,
         presence_penalty: None,
         seed: None,
+        thinking: None,
     },
     response_format: None,
     stream: false,
@@ -35,5 +37,6 @@ IrRequest {
         name: "messages",
         version: "2023-06-01",
     },
+    metadata: None,
     extensions: {},
 }

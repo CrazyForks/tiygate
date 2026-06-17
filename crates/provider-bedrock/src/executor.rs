@@ -127,7 +127,7 @@ impl BedrockExecutor {
                     .content
                     .iter()
                     .filter_map(|c| match c {
-                        Content::Text { text } => Some(text.clone()),
+                        Content::Text { text, .. } => Some(text.clone()),
                         _ => None,
                     })
                     .collect::<Vec<_>>()
@@ -174,6 +174,7 @@ impl BedrockExecutor {
                 if let Some(text) = item["text"].as_str() {
                     ir_content.push(Content::Text {
                         text: text.to_string(),
+                        annotations: None,
                     });
                 }
                 if item["toolUse"].is_object() {
@@ -573,6 +574,7 @@ mod tests {
                 role: Role::User,
                 content: vec![Content::Text {
                     text: "Hello".to_string(),
+                    annotations: None,
                 }],
             }],
             system: Some("You are helpful.".to_string()),
@@ -587,6 +589,7 @@ mod tests {
                 frequency_penalty: None,
                 presence_penalty: None,
                 seed: None,
+                thinking: None,
             },
             response_format: None,
             ingress_protocol: ProtocolEndpoint::new(
@@ -594,6 +597,7 @@ mod tests {
                 "messages",
                 "v1",
             ),
+            metadata: None,
             extensions: Default::default(),
         }
     }
@@ -708,7 +712,7 @@ mod tests {
         let resp = result.unwrap();
         assert_eq!(resp.content.len(), 1);
         match &resp.content[0] {
-            Content::Text { text } => assert_eq!(text, "Hi from Bedrock mock!"),
+            Content::Text { text, .. } => assert_eq!(text, "Hi from Bedrock mock!"),
             _ => panic!("expected text content"),
         }
         let usage = resp.usage.as_ref().expect("usage present");

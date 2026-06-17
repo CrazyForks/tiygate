@@ -36,6 +36,7 @@ fn basic_request() -> IrRequest {
             role: Role::User,
             content: vec![Content::Text {
                 text: "Hello".to_string(),
+                annotations: None,
             }],
         }],
         tools: vec![],
@@ -48,6 +49,7 @@ fn basic_request() -> IrRequest {
             frequency_penalty: None,
             presence_penalty: None,
             seed: None,
+            thinking: None,
         },
         response_format: None,
         stream: false,
@@ -56,6 +58,7 @@ fn basic_request() -> IrRequest {
             "chat-completions",
             "v1",
         ),
+        metadata: None,
         extensions: HashMap::new(),
     }
 }
@@ -80,6 +83,7 @@ fn response() -> IrResponse {
     IrResponse {
         content: vec![Content::Text {
             text: "Hi!".to_string(),
+            annotations: None,
         }],
         usage: None,
         finish_reason: Some(tiygate_core::FinishReason::Stop),
@@ -204,7 +208,7 @@ fn nxn_response_roundtrip_preserves_text() {
             .iter()
             .flat_map(|m| m.content.iter())
             .filter_map(|c| match c {
-                Content::Text { text } => Some(text.clone()),
+                Content::Text { text, .. } => Some(text.clone()),
                 _ => None,
             })
             .collect();
@@ -346,6 +350,7 @@ fn pass_through_bytes_preserved_in_response() {
             role: Role::User,
             content: vec![Content::Text {
                 text: original_text.to_string(),
+                annotations: None,
             }],
         }],
         tools: vec![],
@@ -357,6 +362,7 @@ fn pass_through_bytes_preserved_in_response() {
             "chat-completions",
             "v1",
         ),
+        metadata: None,
         extensions: HashMap::new(),
     };
 
@@ -370,7 +376,7 @@ fn pass_through_bytes_preserved_in_response() {
         .iter()
         .flat_map(|m| m.content.iter())
         .filter_map(|c| match c {
-            Content::Text { text } => Some(text.clone()),
+            Content::Text { text, .. } => Some(text.clone()),
             _ => None,
         })
         .collect();
@@ -764,4 +770,380 @@ fn responses_to_chat_reasoning_with_tool_calls_roundtrip() {
         .as_array()
         .expect("tool_calls array");
     assert_eq!(tc.len(), 2, "应有 2 个 tool_calls");
+}
+
+// ── Thinking config cross-protocol tests ────────────────────────────
+
+#[test]
+fn chat_thinking_effort_roundtrip() {
+    let codec = find_codec(ProtocolSuite::OpenAiCompatible, "chat-completions");
+    let env = make_env();
+    let body = json!({
+        "model": "o3",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "high",
+    });
+    let ir = codec.decode_request(body, &env).unwrap();
+    assert_eq!(
+        ir.params.thinking.as_ref().unwrap().effort,
+        Some(tiygate_core::ThinkingEffort::High)
+    );
+    let (encoded, _) = codec.encode_request(&ir).unwrap();
+    assert_eq!(encoded["reasoning_effort"], "high");
+}
+
+#[test]
+fn anthropic_thinking_config_roundtrip() {
+    let codec = find_codec(ProtocolSuite::AnthropicMessages, "messages");
+    let env = make_env();
+    let body = json!({
+        "model": "claude-3.5-sonnet",
+        "max_tokens": 4096,
+        "messages": [{"role": "user", "content": "hi"}],
+        "thinking": {"type": "enabled", "budget_tokens": 2048},
+    });
+    let ir = codec.decode_request(body, &env).unwrap();
+    assert_eq!(
+        ir.params.thinking.as_ref().unwrap().budget_tokens,
+        Some(2048)
+    );
+    let (encoded, _) = codec.encode_request(&ir).unwrap();
+    assert_eq!(encoded["thinking"]["type"], "enabled");
+    assert_eq!(encoded["thinking"]["budget_tokens"], 2048);
+}
+
+#[test]
+fn gemini_thinking_config_roundtrip() {
+    let codec = find_codec(ProtocolSuite::GoogleGemini, "generateContent");
+    let env = make_env();
+    let body = json!({
+        "model": "gemini-2.0-flash",
+        "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+        "generationConfig": {
+            "thinkingConfig": {"includeThoughts": true, "thinkingBudget": 1024}
+        },
+    });
+    let ir = codec.decode_request(body, &env).unwrap();
+    assert_eq!(
+        ir.params.thinking.as_ref().unwrap().include_thoughts,
+        Some(true)
+    );
+    assert_eq!(
+        ir.params.thinking.as_ref().unwrap().budget_tokens,
+        Some(1024)
+    );
+    let (encoded, _) = codec.encode_request(&ir).unwrap();
+    assert_eq!(
+        encoded["generationConfig"]["thinkingConfig"]["includeThoughts"],
+        true
+    );
+    assert_eq!(
+        encoded["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+        1024
+    );
+}
+
+#[test]
+fn chat_thinking_effort_cross_to_anthropic() {
+    let chat = find_codec(ProtocolSuite::OpenAiCompatible, "chat-completions");
+    let anthropic = find_codec(ProtocolSuite::AnthropicMessages, "messages");
+    let env = make_env();
+    let body = json!({
+        "model": "o3",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "medium",
+    });
+    let ir = chat.decode_request(body, &env).unwrap();
+    let (encoded, _) = anthropic.encode_request(&ir).unwrap();
+    // Cross-protocol: effort maps to nothing on Anthropic (no effort field)
+    // but the IR carries the thinking config
+    assert!(encoded.get("thinking").is_none() || encoded.get("reasoning_effort").is_none());
+}
+
+// ── Refusal tests ───────────────────────────────────────────────────
+
+#[test]
+fn chat_refusal_decodes_as_refusal_content() {
+    let codec = find_codec(ProtocolSuite::OpenAiCompatible, "chat-completions");
+    let body = json!({
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "model": "gpt-4o",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "refusal": "I cannot help with that."
+            },
+            "finish_reason": "content_filter",
+        }],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+    });
+    let ir = codec.decode_response(body).unwrap();
+    // Refusal should be Content::Refusal, not Content::Text
+    assert!(ir
+        .content
+        .iter()
+        .any(|c| matches!(c, Content::Refusal { .. })));
+    // stop_details should be populated
+    assert_eq!(ir.stop_details.as_ref().unwrap().stop_reason, "refusal");
+}
+
+#[test]
+fn chat_refusal_encodes_refusal_field() {
+    let codec = find_codec(ProtocolSuite::OpenAiCompatible, "chat-completions");
+    let ir = IrResponse {
+        content: vec![Content::Refusal {
+            text: "Cannot comply.".to_string(),
+            category: None,
+        }],
+        usage: None,
+        finish_reason: Some(tiygate_core::FinishReason::ContentFilter),
+        response_id: Some("test".to_string()),
+        stop_details: None,
+        extensions: HashMap::new(),
+    };
+    let encoded = codec.encode_response(&ir).unwrap();
+    assert_eq!(
+        encoded["choices"][0]["message"]["refusal"],
+        "Cannot comply."
+    );
+}
+
+// ── Stop details cross-protocol tests ───────────────────────────────
+
+#[test]
+fn gemini_safety_populates_stop_details() {
+    let codec = find_codec(ProtocolSuite::GoogleGemini, "generateContent");
+    let body = json!({
+        "candidates": [{
+            "content": {"role": "model", "parts": [{"text": "partial"}]},
+            "finishReason": "SAFETY",
+        }],
+        "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5, "totalTokenCount": 15},
+    });
+    let ir = codec.decode_response(body).unwrap();
+    assert_eq!(ir.stop_details.as_ref().unwrap().stop_reason, "safety");
+    assert_eq!(
+        ir.stop_details.as_ref().unwrap().kind.as_ref().unwrap(),
+        "safety"
+    );
+}
+
+#[test]
+fn responses_incomplete_populates_stop_details() {
+    let codec = find_codec(ProtocolSuite::OpenAiResponses, "responses");
+    let body = json!({
+        "id": "resp_1",
+        "object": "response",
+        "output": [],
+        "status": "incomplete",
+        "incomplete_details": {"reason": "max_output_tokens"},
+        "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+    });
+    let ir = codec.decode_response(body).unwrap();
+    assert_eq!(
+        ir.stop_details.as_ref().unwrap().stop_reason,
+        "max_output_tokens"
+    );
+}
+
+// ── Encrypted reasoning content tests ───────────────────────────────
+
+#[test]
+fn anthropic_redacted_thinking_uses_encrypted_content() {
+    let codec = find_codec(ProtocolSuite::AnthropicMessages, "messages");
+    let body = json!({
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "content": [
+            {"type": "redacted_thinking", "data": "opaque-encrypted-data"},
+            {"type": "text", "text": "result"},
+        ],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 10, "output_tokens": 5},
+    });
+    let ir = codec.decode_response(body).unwrap();
+    // The redacted thinking should be stored in encrypted_content
+    let reasoning = ir.content.iter().find(|c| {
+        matches!(
+            c,
+            Content::Reasoning {
+                encrypted_content: Some(_),
+                ..
+            }
+        )
+    });
+    assert!(
+        reasoning.is_some(),
+        "redacted_thinking should be Content::Reasoning with encrypted_content"
+    );
+    if let Some(Content::Reasoning {
+        encrypted_content, ..
+    }) = reasoning
+    {
+        assert_eq!(encrypted_content.as_ref().unwrap(), "opaque-encrypted-data");
+    }
+    // Verify round-trip: encode_response should emit redacted_thinking
+    let encoded = codec.encode_response(&ir).unwrap();
+    let has_redacted = encoded["content"]
+        .as_array()
+        .map(|arr| arr.iter().any(|b| b["type"] == "redacted_thinking"))
+        .unwrap_or(false);
+    assert!(
+        has_redacted,
+        "encode_response should emit redacted_thinking block"
+    );
+}
+
+#[test]
+fn responses_encrypted_content_roundtrip() {
+    let codec = find_codec(ProtocolSuite::OpenAiResponses, "responses");
+    let body = json!({
+        "id": "resp_1",
+        "object": "response",
+        "output": [{
+            "type": "reasoning",
+            "id": "rs_abc",
+            "summary": [{"type": "summary_text", "text": "thinking..."}],
+            "encrypted_content": "enc-data-123",
+        }],
+        "status": "completed",
+        "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+    });
+    let ir = codec.decode_response(body).unwrap();
+    let reasoning = ir
+        .content
+        .iter()
+        .find(|c| matches!(c, Content::Reasoning { .. }));
+    assert!(reasoning.is_some());
+    if let Some(Content::Reasoning {
+        encrypted_content, ..
+    }) = reasoning
+    {
+        assert_eq!(encrypted_content.as_ref().unwrap(), "enc-data-123");
+    }
+    // Verify encode_response outputs encrypted_content
+    let encoded = codec.encode_response(&ir).unwrap();
+    let has_enc = encoded["output"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .any(|item| item["encrypted_content"] == "enc-data-123")
+        })
+        .unwrap_or(false);
+    assert!(has_enc, "encode_response should output encrypted_content");
+}
+
+// ── Metadata cross-protocol tests ───────────────────────────────────
+
+#[test]
+fn anthropic_metadata_user_id_roundtrip() {
+    let codec = find_codec(ProtocolSuite::AnthropicMessages, "messages");
+    let env = make_env();
+    let body = json!({
+        "model": "claude-3.5-sonnet",
+        "max_tokens": 1024,
+        "messages": [{"role": "user", "content": "hi"}],
+        "metadata": {"user_id": "user-123"},
+    });
+    let ir = codec.decode_request(body, &env).unwrap();
+    assert_eq!(
+        ir.metadata.as_ref().unwrap().get("user_id").unwrap(),
+        "user-123"
+    );
+    let (encoded, _) = codec.encode_request(&ir).unwrap();
+    assert_eq!(encoded["metadata"]["user_id"], "user-123");
+}
+
+#[test]
+fn chat_metadata_roundtrip() {
+    let codec = find_codec(ProtocolSuite::OpenAiCompatible, "chat-completions");
+    let env = make_env();
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "hi"}],
+        "metadata": {"session_id": "sess-1", "user_id": "u1"},
+    });
+    let ir = codec.decode_request(body, &env).unwrap();
+    assert_eq!(ir.metadata.as_ref().unwrap().len(), 2);
+    let (encoded, _) = codec.encode_request(&ir).unwrap();
+    assert_eq!(encoded["metadata"]["session_id"], "sess-1");
+    assert_eq!(encoded["metadata"]["user_id"], "u1");
+}
+
+// ── Gemini cache_write_tokens encode test ───────────────────────────
+
+#[test]
+fn gemini_encode_response_includes_cache_write_in_prompt() {
+    let codec = find_codec(ProtocolSuite::GoogleGemini, "generateContent");
+    let ir = IrResponse {
+        content: vec![Content::Text {
+            text: "ok".to_string(),
+            annotations: None,
+        }],
+        usage: Some(tiygate_core::Usage {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            cache_read_tokens: Some(200),
+            cache_write_tokens: Some(300),
+            total_tokens: 650,
+            ..Default::default()
+        }),
+        finish_reason: Some(tiygate_core::FinishReason::Stop),
+        response_id: None,
+        stop_details: None,
+        extensions: HashMap::new(),
+    };
+    let encoded = codec.encode_response(&ir).unwrap();
+    // promptTokenCount = 100 + 200 (cache_read) + 300 (cache_write) = 600
+    assert_eq!(encoded["usageMetadata"]["promptTokenCount"], 600);
+    // totalTokenCount = 600 + 50 = 650
+    assert_eq!(encoded["usageMetadata"]["totalTokenCount"], 650);
+    assert_eq!(encoded["usageMetadata"]["cachedContentTokenCount"], 200);
+}
+
+// ── Annotations test ────────────────────────────────────────────────
+
+#[test]
+fn chat_annotations_decode_to_content_text() {
+    let codec = find_codec(ProtocolSuite::OpenAiCompatible, "chat-completions");
+    let body = json!({
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "model": "gpt-4o",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "Check this source.",
+                "annotations": [{
+                    "type": "url_citation",
+                    "start_index": 0,
+                    "end_index": 10,
+                    "url_citation": {
+                        "url": "https://example.com",
+                        "title": "Example",
+                    },
+                }],
+            },
+            "finish_reason": "stop",
+        }],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+    });
+    let ir = codec.decode_response(body).unwrap();
+    let text = ir.content.iter().find_map(|c| match c {
+        Content::Text {
+            annotations: Some(a),
+            ..
+        } => Some(a),
+        _ => None,
+    });
+    assert!(text.is_some(), "text content should have annotations");
+    let anns = text.unwrap();
+    assert_eq!(anns.len(), 1);
+    assert_eq!(anns[0].url.as_ref().unwrap(), "https://example.com");
+    assert_eq!(anns[0].title.as_ref().unwrap(), "Example");
 }

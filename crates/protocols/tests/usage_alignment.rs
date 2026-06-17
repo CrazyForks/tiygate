@@ -143,8 +143,10 @@ fn cache_anthropic_to_gemini_writes_cached_content() {
     let ir = in_codec.decode_response(body).unwrap();
     let encoded = out_codec.encode_response(&ir).unwrap();
     assert_eq!(encoded["usageMetadata"]["cachedContentTokenCount"], 1000);
-    assert_eq!(encoded["usageMetadata"]["promptTokenCount"], 20);
+    // Gemini's promptTokenCount includes cached content (re-added by encoder)
+    assert_eq!(encoded["usageMetadata"]["promptTokenCount"], 1020);
     assert_eq!(encoded["usageMetadata"]["candidatesTokenCount"], 30);
+    assert_eq!(encoded["usageMetadata"]["totalTokenCount"], 1050);
 }
 
 #[test]
@@ -153,6 +155,7 @@ fn cache_chat_to_responses_roundtrip() {
     let ir = IrResponse {
         content: vec![Content::Text {
             text: "ok".to_string(),
+            annotations: None,
         }],
         usage: Some(Usage {
             prompt_tokens: 100,
@@ -450,6 +453,7 @@ fn stream_responses_emit_cache_in_completion() {
     let ir = IrResponse {
         content: vec![Content::Text {
             text: "ok".to_string(),
+            annotations: None,
         }],
         usage: Some(Usage {
             prompt_tokens: 100,
@@ -484,6 +488,7 @@ fn nxn_cache_preserved(from: ProtocolSuite, to: ProtocolSuite) {
     let ir = IrResponse {
         content: vec![Content::Text {
             text: "x".to_string(),
+            annotations: None,
         }],
         usage: Some(Usage {
             prompt_tokens: 100,

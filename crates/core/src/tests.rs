@@ -375,6 +375,7 @@ mod tests {
     fn test_content_serde() {
         let text = Content::Text {
             text: "hello".to_string(),
+            annotations: None,
         };
         let json = serde_json::to_value(&text).unwrap();
         assert_eq!(json["type"], "text");

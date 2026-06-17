@@ -27,8 +27,9 @@ pub mod tracing_ctx;
 // Re-export key types
 pub use header_forward::HeaderForwardPolicy;
 pub use ir::{
-    Content, FinishReason, GenerationParams, IrRequest, IrResponse, Message, RawEnvelope,
-    ResponseFormat, Role, StreamPart, Tool, TruncationReason, Usage, UsageAccumulator,
+    Annotation, AnnotationKind, Content, FinishReason, GenerationParams, IrRequest, IrResponse,
+    Message, RawEnvelope, ResponseFormat, Role, StreamPart, ThinkingConfig, ThinkingDisplay,
+    ThinkingEffort, Tool, TruncationReason, Usage, UsageAccumulator,
 };
 pub use pipeline::{
     ExecutionHook, HookDecision, ObserveHook, PipelineContext, PipelineStage, PreRequestHook,

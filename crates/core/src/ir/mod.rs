@@ -31,6 +31,11 @@ pub struct IrRequest {
     pub stream: bool,
     /// The protocol used by the ingress request.
     pub ingress_protocol: ProtocolEndpoint,
+    /// Request-level metadata (e.g. Anthropic `metadata.user_id`, OpenAI
+    /// `metadata` KV pairs, Gemini `labels`). Cross-protocol mappings may
+    /// drop keys that the target protocol cannot express.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<HashMap<String, String>>,
     /// Extension fields for protocol-specific data.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub extensions: HashMap<String, serde_json::Value>,
@@ -110,7 +115,13 @@ pub enum Role {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Content {
     /// Plain text content.
-    Text { text: String },
+    Text {
+        text: String,
+        /// Citation / file-citation annotations attached to this text
+        /// (e.g. OpenAI `annotations[]`, Gemini `groundingMetadata`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        annotations: Option<Vec<Annotation>>,
+    },
     /// Reasoning / chain-of-thought content.
     Reasoning {
         text: String,
@@ -129,6 +140,12 @@ pub enum Content {
         /// echoed back to Responses with a fabricated id.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
+        /// Encrypted reasoning content for cross-turn replay (e.g. OpenAI
+        /// Responses `reasoning.encrypted_content`, Anthropic
+        /// `redacted_thinking.data`). Carries opaque provider-specific
+        /// encrypted data that must be replayed verbatim on subsequent turns.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        encrypted_content: Option<String>,
     },
     /// A tool call issued by the model.
     ToolCall {
@@ -141,6 +158,13 @@ pub enum Content {
         tool_call_id: String,
         name: String,
         content: String,
+    },
+    /// A refusal from the model (OpenAI `message.refusal`, Responses
+    /// `refusal` output item, Anthropic `stop_reason:"refusal"`).
+    Refusal {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        category: Option<String>,
     },
     /// A multimodal media part (image, audio, document).
     Media {
@@ -236,6 +260,83 @@ pub struct GenerationParams {
     pub presence_penalty: Option<f32>,
     /// Seed for deterministic sampling.
     pub seed: Option<i64>,
+    /// Reasoning / thinking configuration (OpenAI `reasoning_effort`,
+    /// Anthropic `thinking`, Gemini `thinkingConfig`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingConfig>,
+}
+
+/// Reasoning / thinking effort level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThinkingEffort {
+    Low,
+    Medium,
+    High,
+    Max,
+}
+
+/// How reasoning is displayed to the client (Anthropic-specific).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingDisplay {
+    Summarized,
+    Omitted,
+}
+
+/// Reasoning / thinking configuration that maps across protocols.
+///
+/// - **OpenAI Chat**: `reasoning_effort` ↔ `effort`
+/// - **OpenAI Responses**: `reasoning.effort` ↔ `effort`
+/// - **Anthropic**: `thinking: {type, budget_tokens, display}` ↔
+///   `budget_tokens` / `display`
+/// - **Gemini**: `thinkingConfig: {includeThoughts, thinkingBudget}` ↔
+///   `include_thoughts` / `budget_tokens`
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ThinkingConfig {
+    /// Effort level (maps to `reasoning_effort` / `reasoning.effort`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<ThinkingEffort>,
+    /// Maximum thinking token budget (Anthropic `budget_tokens`,
+    /// Gemini `thinkingBudget`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_tokens: Option<u32>,
+    /// How reasoning is displayed (Anthropic `display`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<ThinkingDisplay>,
+    /// Whether to include thought summaries in the response (Gemini
+    /// `includeThoughts`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_thoughts: Option<bool>,
+}
+
+/// Citation or file-citation annotation attached to text content.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Annotation {
+    /// The kind of annotation.
+    pub kind: AnnotationKind,
+    /// Start index of the annotated span (OpenAI annotations).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_index: Option<u32>,
+    /// End index of the annotated span (OpenAI annotations).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_index: Option<u32>,
+    /// Title of the cited resource.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// URL of the cited resource.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+/// The kind of annotation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnnotationKind {
+    /// URL citation (OpenAI `url_citation`).
+    UrlCitation,
+    /// File citation (OpenAI `file_citation`).
+    FileCitation,
 }
 
 /// Response format constraints.

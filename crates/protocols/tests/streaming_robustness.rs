@@ -150,7 +150,10 @@ fn gemini_decode_then_encode_does_not_double_count_cache() {
     let ir = codec.decode_response(body).unwrap();
     assert_eq!(ir.usage.as_ref().unwrap().prompt_tokens, 200);
     let encoded = codec.encode_response(&ir).unwrap();
-    assert_eq!(encoded["usageMetadata"]["promptTokenCount"], 200);
+    // Non-streaming encoder now re-adds cache_read to promptTokenCount
+    // (consistent with the streaming encoder and Gemini's wire convention).
+    assert_eq!(encoded["usageMetadata"]["promptTokenCount"], 1000);
+    assert_eq!(encoded["usageMetadata"]["totalTokenCount"], 1050);
     assert_eq!(encoded["usageMetadata"]["cachedContentTokenCount"], 800);
 }
 

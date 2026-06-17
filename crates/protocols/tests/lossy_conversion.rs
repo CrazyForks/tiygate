@@ -28,6 +28,7 @@ fn req_with_tools() -> IrRequest {
             role: Role::User,
             content: vec![Content::Text {
                 text: "hi".to_string(),
+                annotations: None,
             }],
         }],
         tools: vec![Tool {
@@ -44,6 +45,7 @@ fn req_with_tools() -> IrRequest {
             "chat-completions",
             "v1",
         ),
+        metadata: None,
         extensions: HashMap::new(),
     }
 }
@@ -124,6 +126,7 @@ fn with_reasoning(req: &mut IrRequest) {
         text: "thinking...".to_string(),
         signature: None,
         id: None,
+        encrypted_content: None,
     });
 }
 

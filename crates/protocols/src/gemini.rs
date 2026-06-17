@@ -118,11 +118,13 @@ impl EndpointCodec for GeminiCodec {
                                     text: text.to_string(),
                                     signature: None,
                                     id: None,
+                                    encrypted_content: None,
                                 });
                             }
                         } else if let Some(text) = part["text"].as_str() {
                             cp.push(Content::Text {
                                 text: text.to_string(),
+                                annotations: None,
                             });
                         } else if let Some(fc) = part.get("functionCall") {
                             let name = fc["name"].as_str().unwrap_or("").to_string();
@@ -183,6 +185,7 @@ impl EndpointCodec for GeminiCodec {
                 } else {
                     vec![Content::Text {
                         text: String::new(),
+                        annotations: None,
                     }]
                 };
                 messages.push(Message { role, content });
@@ -229,6 +232,29 @@ impl EndpointCodec for GeminiCodec {
             ..Default::default()
         };
 
+        // Parse thinkingConfig from generationConfig
+        let thinking = gc.get("thinkingConfig").and_then(|tc| {
+            let include_thoughts = tc["includeThoughts"].as_bool();
+            let budget_tokens = tc["thinkingBudget"].as_u64().map(|v| v as u32);
+            if include_thoughts.is_none() && budget_tokens.is_none() {
+                None
+            } else {
+                Some(tiygate_core::ThinkingConfig {
+                    include_thoughts,
+                    budget_tokens,
+                    ..Default::default()
+                })
+            }
+        });
+        let params = if let Some(thinking) = thinking {
+            tiygate_core::GenerationParams {
+                thinking: Some(thinking),
+                ..params
+            }
+        } else {
+            params
+        };
+
         // Parse inbound structured-output config. Gemini carries it in
         // generationConfig.responseSchema (+ responseMimeType=application/json).
         let response_format = if let Some(schema) = gc.get("responseSchema") {
@@ -271,6 +297,11 @@ impl EndpointCodec for GeminiCodec {
             response_format,
             stream,
             ingress_protocol: self.id.clone(),
+            metadata: body.get("labels").and_then(|l| l.as_object()).map(|obj| {
+                obj.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            }),
             extensions,
         })
     }
@@ -279,7 +310,7 @@ impl EndpointCodec for GeminiCodec {
         let mut parts = Vec::new();
         for c in &ir.content {
             match c {
-                Content::Text { text } => parts.push(json!({"text": text})),
+                Content::Text { text, .. } => parts.push(json!({"text": text})),
                 Content::Reasoning { text, .. } => {
                     // Gemini's standard "thought" format is a text part flagged
                     // with `thought: true`, not `{"thought": text}`. Emit the
@@ -311,18 +342,23 @@ impl EndpointCodec for GeminiCodec {
             });
         }
         if let Some(usage) = &ir.usage {
+            // IR prompt_tokens is cache-free; Gemini's promptTokenCount
+            // includes both cache_read and cache_write. Re-add both so the
+            // wire value matches Gemini's convention and stays consistent
+            // with the streaming encoder.
+            let cache_read = usage.cache_read_tokens.unwrap_or(0);
+            let cache_write = usage.cache_write_tokens.unwrap_or(0);
+            let prompt_for_gemini = usage.prompt_tokens + cache_read + cache_write;
             response["usageMetadata"] = json!({
-                "promptTokenCount": usage.prompt_tokens,
+                "promptTokenCount": prompt_for_gemini,
                 "candidatesTokenCount": usage.completion_tokens,
-                "totalTokenCount": usage.total_tokens,
+                "totalTokenCount": prompt_for_gemini + usage.completion_tokens,
             });
             if let Some(rt) = usage.reasoning_tokens {
                 response["usageMetadata"]["thoughtsTokenCount"] = json!(rt);
             }
-            if let Some(cr) = usage.cache_read_tokens {
-                if cr > 0 {
-                    response["usageMetadata"]["cachedContentTokenCount"] = json!(cr);
-                }
+            if cache_read > 0 {
+                response["usageMetadata"]["cachedContentTokenCount"] = json!(cache_read);
             }
         }
         Ok(response)
@@ -363,7 +399,7 @@ impl EndpointCodec for GeminiCodec {
             let mut parts = Vec::new();
             for c in &msg.content {
                 match c {
-                    Content::Text { text } => parts.push(json!({"text": text})),
+                    Content::Text { text, .. } => parts.push(json!({"text": text})),
                     Content::Reasoning { text, .. } => {
                         // Gemini standard reasoning format: text part flagged
                         // thought:true.
@@ -406,6 +442,9 @@ impl EndpointCodec for GeminiCodec {
                         }
                         _ => {}
                     },
+                    Content::Refusal { text, .. } => {
+                        parts.push(json!({"text": text}));
+                    }
                 }
             }
             if !parts.is_empty() {
@@ -435,6 +474,20 @@ impl EndpointCodec for GeminiCodec {
         if !ir.params.stop.is_empty() {
             gc["stopSequences"] = json!(ir.params.stop);
             has_gc = true;
+        }
+        // Thinking config: output thinkingConfig from params.thinking
+        if let Some(ref thinking) = ir.params.thinking {
+            let mut tc = json!({});
+            if let Some(include) = thinking.include_thoughts {
+                tc["includeThoughts"] = json!(include);
+            }
+            if let Some(budget) = thinking.budget_tokens {
+                tc["thinkingBudget"] = json!(budget);
+            }
+            if tc.as_object().map(|m| !m.is_empty()).unwrap_or(false) {
+                gc["thinkingConfig"] = tc;
+                has_gc = true;
+            }
         }
         // Gemini structured output: responseSchema in generationConfig
         // https://ai.google.dev/gemini-api/docs/structured-output
@@ -469,6 +522,16 @@ impl EndpointCodec for GeminiCodec {
                 if body.get(k).is_none() {
                     body[k] = v.clone();
                 }
+            }
+        }
+        // Metadata: output from ir.metadata as Gemini labels
+        if let Some(ref metadata) = ir.metadata {
+            if !metadata.is_empty() && body.get("labels").is_none() {
+                let mut labels = serde_json::Map::new();
+                for (k, v) in metadata {
+                    labels.insert(k.clone(), json!(v));
+                }
+                body["labels"] = json!(labels);
             }
         }
 
@@ -509,23 +572,27 @@ impl EndpointCodec for GeminiCodec {
                                         text: text.to_string(),
                                         signature: None,
                                         id: None,
+                                        encrypted_content: None,
                                     });
                                 }
                             } else if let Some(text) = part["text"].as_str() {
                                 content.push(Content::Text {
                                     text: text.to_string(),
+                                    annotations: None,
                                 });
                             } else if let Some(t) = part["thought"].as_str() {
                                 content.push(Content::Reasoning {
                                     text: t.to_string(),
                                     signature: None,
                                     id: None,
+                                    encrypted_content: None,
                                 });
                             } else if let Some(t) = part["thought"]["text"].as_str() {
                                 content.push(Content::Reasoning {
                                     text: t.to_string(),
                                     signature: None,
                                     id: None,
+                                    encrypted_content: None,
                                 });
                             } else if let Some(fc) = part.get("functionCall") {
                                 let name = fc["name"].as_str().unwrap_or("").to_string();
@@ -551,6 +618,51 @@ impl EndpointCodec for GeminiCodec {
                 json!(thought_signatures),
             );
         }
+        // Parse groundingMetadata from the first candidate and attach
+        // grounding citations as annotations to text content.
+        if let Some(grounding) = body["candidates"]
+            .as_array()
+            .and_then(|arr| arr.first())
+            .and_then(|c| c.get("groundingMetadata"))
+        {
+            if !grounding.is_null() {
+                // Store full groundingMetadata in extensions for round-trip
+                extensions.insert("gemini_grounding_metadata".to_string(), grounding.clone());
+                // Extract URL citations from groundingChunks
+                let annotations: Vec<tiygate_core::Annotation> = grounding["groundingChunks"]
+                    .as_array()
+                    .map(|chunks| {
+                        chunks
+                            .iter()
+                            .filter_map(|chunk| {
+                                let web = chunk.get("web")?;
+                                Some(tiygate_core::Annotation {
+                                    kind: tiygate_core::AnnotationKind::UrlCitation,
+                                    start_index: None,
+                                    end_index: None,
+                                    title: web["title"].as_str().map(String::from),
+                                    url: web["uri"].as_str().map(String::from),
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !annotations.is_empty() {
+                    // Attach annotations to the last text content block
+                    for c in content.iter_mut() {
+                        if let Content::Text {
+                            annotations: ref mut a,
+                            ..
+                        } = c
+                        {
+                            if a.is_none() {
+                                *a = Some(annotations.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let finish_reason = body["candidates"]
             .as_array()
             .and_then(|arr| arr.first())
@@ -561,6 +673,21 @@ impl EndpointCodec for GeminiCodec {
                 "SAFETY" => FinishReason::ContentFilter,
                 other => FinishReason::Other(other.to_string()),
             });
+        // Populate stop_details on SAFETY finish reason
+        let stop_details = if body["candidates"]
+            .as_array()
+            .and_then(|arr| arr.first())
+            .and_then(|c| c["finishReason"].as_str())
+            == Some("SAFETY")
+        {
+            Some(tiygate_core::ir::StopDetails {
+                stop_reason: "safety".to_string(),
+                kind: Some("safety".to_string()),
+                ..Default::default()
+            })
+        } else {
+            None
+        };
         let usage = body.get("usageMetadata").map(|u| {
             let cache_read = u["cachedContentTokenCount"].as_u64();
             // Gemini's promptTokenCount includes cached content; the IR keeps
@@ -580,7 +707,7 @@ impl EndpointCodec for GeminiCodec {
             usage,
             finish_reason,
             response_id,
-            stop_details: None,
+            stop_details,
             extensions,
         })
     }
@@ -635,10 +762,12 @@ impl StreamEncoder for GeminiStreamEncoder {
             }
             StreamPart::Usage { usage } => {
                 // IR prompt_tokens is cache-free; Gemini's promptTokenCount
-                // includes cached content. Re-add so streamed usage matches the
-                // non-stream encoder and totalTokenCount stays consistent.
+                // includes both cache_read and cache_write. Re-add both so
+                // streamed usage matches the non-stream encoder and
+                // totalTokenCount stays consistent.
                 let cache_read = usage.cache_read_tokens.unwrap_or(0);
-                let prompt_for_gemini = usage.prompt_tokens + cache_read;
+                let cache_write = usage.cache_write_tokens.unwrap_or(0);
+                let prompt_for_gemini = usage.prompt_tokens + cache_read + cache_write;
                 let mut um = json!({
                     "promptTokenCount": prompt_for_gemini,
                     "candidatesTokenCount": usage.completion_tokens,
@@ -922,6 +1051,7 @@ mod tests {
         let ir = IrResponse {
             content: vec![Content::Text {
                 text: "Hi!".to_string(),
+                annotations: None,
             }],
             usage: Some(Usage {
                 prompt_tokens: 5,
@@ -1067,6 +1197,7 @@ mod tests {
                 "generateContent",
                 "v1beta",
             ),
+            metadata: None,
             extensions: ir.extensions.clone(),
         };
         let (body, _h) = codec.encode_request(&req).unwrap();
@@ -1086,9 +1217,11 @@ mod tests {
                     text: "thinking...".to_string(),
                     signature: None,
                     id: None,
+                    encrypted_content: None,
                 },
                 Content::Text {
                     text: "answer".to_string(),
+                    annotations: None,
                 },
             ],
             usage: None,
@@ -1109,7 +1242,7 @@ mod tests {
         assert!(
             matches!(&ir2.content[0], Content::Reasoning { text, .. } if text == "thinking...")
         );
-        assert!(matches!(&ir2.content[1], Content::Text { text } if text == "answer"));
+        assert!(matches!(&ir2.content[1], Content::Text { text , ..} if text == "answer"));
     }
 
     #[test]

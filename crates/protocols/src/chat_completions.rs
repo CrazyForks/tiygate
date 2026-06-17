@@ -119,6 +119,7 @@ impl EndpointCodec for ChatCompletionsCodec {
                     } else {
                         vec![Content::Text {
                             text: text.to_string(),
+                            annotations: None,
                         }]
                     }
                 } else if let Some(arr) = msg["content"].as_array() {
@@ -143,6 +144,7 @@ impl EndpointCodec for ChatCompletionsCodec {
                                 text: rc.to_string(),
                                 signature: None,
                                 id: None,
+                                encrypted_content: None,
                             },
                         );
                     }
@@ -181,6 +183,7 @@ impl EndpointCodec for ChatCompletionsCodec {
                 if content.is_empty() {
                     content.push(Content::Text {
                         text: String::new(),
+                        annotations: None,
                     });
                 }
 
@@ -197,7 +200,7 @@ impl EndpointCodec for ChatCompletionsCodec {
             .filter(|m| m.role == Role::System)
             .flat_map(|m| {
                 m.content.iter().filter_map(|c| match c {
-                    Content::Text { text } => Some(text.clone()),
+                    Content::Text { text, .. } => Some(text.clone()),
                     _ => None,
                 })
             })
@@ -309,6 +312,19 @@ impl EndpointCodec for ChatCompletionsCodec {
                         .collect()
                 })
                 .unwrap_or_default(),
+            thinking: body["reasoning_effort"].as_str().map(|s| {
+                use tiygate_core::ThinkingEffort;
+                let effort = match s {
+                    "low" => ThinkingEffort::Low,
+                    "medium" => ThinkingEffort::Medium,
+                    "high" => ThinkingEffort::High,
+                    _ => ThinkingEffort::High,
+                };
+                tiygate_core::ThinkingConfig {
+                    effort: Some(effort),
+                    ..Default::default()
+                }
+            }),
             ..Default::default()
         };
 
@@ -339,6 +355,11 @@ impl EndpointCodec for ChatCompletionsCodec {
             response_format,
             stream,
             ingress_protocol: self.id.clone(),
+            metadata: body.get("metadata").and_then(|m| m.as_object()).map(|obj| {
+                obj.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            }),
             extensions,
         })
     }
@@ -355,12 +376,41 @@ impl EndpointCodec for ChatCompletionsCodec {
 
         let mut choices = Vec::new();
         let mut message_content = String::new();
+        let mut message_refusal = String::new();
+        let mut message_annotations: Vec<Value> = Vec::new();
         let mut tool_calls_json = Vec::new();
 
         for content in &ir.content {
             match content {
-                Content::Text { text } => {
+                Content::Text { text, annotations } => {
                     message_content.push_str(text);
+                    if let Some(ref anns) = annotations {
+                        for a in anns {
+                            let ann_json = match a.kind {
+                                tiygate_core::AnnotationKind::UrlCitation => {
+                                    let mut obj =
+                                        json!({"type": "url_citation", "url_citation": {}});
+                                    if let Some(ref url) = a.url {
+                                        obj["url_citation"]["url"] = json!(url);
+                                    }
+                                    if let Some(ref title) = a.title {
+                                        obj["url_citation"]["title"] = json!(title);
+                                    }
+                                    if let Some(si) = a.start_index {
+                                        obj["start_index"] = json!(si);
+                                    }
+                                    if let Some(ei) = a.end_index {
+                                        obj["end_index"] = json!(ei);
+                                    }
+                                    obj
+                                }
+                                tiygate_core::AnnotationKind::FileCitation => {
+                                    json!({"type": "file_citation", "file_citation": {"filename": a.title}})
+                                }
+                            };
+                            message_annotations.push(ann_json);
+                        }
+                    }
                 }
                 Content::Reasoning { text: _, .. } => {
                     // OpenAI doesn't natively expose reasoning text in the content field
@@ -380,6 +430,12 @@ impl EndpointCodec for ChatCompletionsCodec {
                         }
                     }));
                 }
+                Content::Refusal { text, .. } => {
+                    if !message_refusal.is_empty() {
+                        message_refusal.push('\n');
+                    }
+                    message_refusal.push_str(text);
+                }
                 _ => {}
             }
         }
@@ -391,6 +447,12 @@ impl EndpointCodec for ChatCompletionsCodec {
 
         if !tool_calls_json.is_empty() {
             message["tool_calls"] = json!(tool_calls_json);
+        }
+        if !message_refusal.is_empty() {
+            message["refusal"] = json!(message_refusal);
+        }
+        if !message_annotations.is_empty() {
+            message["annotations"] = json!(message_annotations);
         }
 
         choices.push(json!({
@@ -488,7 +550,7 @@ impl EndpointCodec for ChatCompletionsCodec {
 
             for content in &msg.content {
                 match content {
-                    Content::Text { text } => {
+                    Content::Text { text, .. } => {
                         text_parts.push(json!({"type": "text", "text": text}));
                     }
                     Content::Reasoning { text, .. } => {
@@ -549,6 +611,9 @@ impl EndpointCodec for ChatCompletionsCodec {
                             "tool_call_id": tool_call_id,
                             "content": content,
                         }));
+                    }
+                    Content::Refusal { text, .. } => {
+                        text_parts.push(json!({"type": "text", "text": text}));
                     }
                 }
             }
@@ -640,6 +705,28 @@ impl EndpointCodec for ChatCompletionsCodec {
         if !ir.params.stop.is_empty() {
             body["stop"] = json!(ir.params.stop);
         }
+        // Thinking config: output reasoning_effort from params.thinking.effort
+        if let Some(ref thinking) = ir.params.thinking {
+            if let Some(effort) = thinking.effort {
+                body["reasoning_effort"] = json!(match effort {
+                    tiygate_core::ThinkingEffort::Low => "low",
+                    tiygate_core::ThinkingEffort::Medium => "medium",
+                    tiygate_core::ThinkingEffort::High => "high",
+                    tiygate_core::ThinkingEffort::Max => "high",
+                });
+            }
+        }
+
+        // Metadata: output from ir.metadata as JSON object
+        if let Some(ref metadata) = ir.metadata {
+            if !metadata.is_empty() {
+                let mut meta = serde_json::Map::new();
+                for (k, v) in metadata {
+                    meta.insert(k.clone(), json!(v));
+                }
+                body["metadata"] = json!(meta);
+            }
+        }
 
         // Response format
         match &ir.response_format {
@@ -722,8 +809,10 @@ impl EndpointCodec for ChatCompletionsCodec {
                 // Text content
                 if let Some(text) = msg["content"].as_str() {
                     if !text.is_empty() {
+                        let annotations = parse_openai_annotations(&msg["annotations"]);
                         content.push(Content::Text {
                             text: text.to_string(),
+                            annotations,
                         });
                     }
                 }
@@ -732,8 +821,9 @@ impl EndpointCodec for ChatCompletionsCodec {
                 // https://platform.openai.com/docs/api-reference/chat/object
                 if let Some(refusal_text) = msg["refusal"].as_str() {
                     if !refusal_text.is_empty() {
-                        content.push(Content::Text {
+                        content.push(Content::Refusal {
                             text: refusal_text.to_string(),
+                            category: None,
                         });
                     }
                 }
@@ -752,6 +842,7 @@ impl EndpointCodec for ChatCompletionsCodec {
                         text: text.to_string(),
                         signature: None,
                         id: None,
+                        encrypted_content: None,
                     });
                 }
 
@@ -781,6 +872,7 @@ impl EndpointCodec for ChatCompletionsCodec {
                                 ),
                                 signature: None,
                                 id: None,
+                                encrypted_content: None,
                             });
                         }
                     }
@@ -816,6 +908,25 @@ impl EndpointCodec for ChatCompletionsCodec {
                 }
             });
 
+        // Populate stop_details when the upstream signals a content filter
+        // or refusal, so cross-protocol targets can surface the reason.
+        let stop_details = if has_refusal {
+            Some(tiygate_core::ir::StopDetails {
+                stop_reason: "refusal".to_string(),
+                kind: Some("refusal".to_string()),
+                ..Default::default()
+            })
+        } else {
+            body["choices"][0]["finish_reason"]
+                .as_str()
+                .filter(|&s| s == "content_filter")
+                .map(|_| tiygate_core::ir::StopDetails {
+                    stop_reason: "content_filter".to_string(),
+                    kind: Some("content_filter".to_string()),
+                    ..Default::default()
+                })
+        };
+
         let usage = body.get("usage").map(|u| {
             let cache_read = u["prompt_tokens_details"]["cached_tokens"].as_u64();
             // OpenAI's `prompt_tokens` INCLUDES the cached portion. The IR
@@ -840,7 +951,7 @@ impl EndpointCodec for ChatCompletionsCodec {
             usage,
             finish_reason,
             response_id,
-            stop_details: None,
+            stop_details,
             extensions: Default::default(),
         })
     }
@@ -1346,6 +1457,7 @@ fn parse_content_array(arr: &[Value], role: &Role) -> Vec<Content> {
         parts.push(match item["type"].as_str() {
             Some("text") => Content::Text {
                 text: item["text"].as_str().unwrap_or("").to_string(),
+                annotations: None,
             },
             Some("image_url") => {
                 let raw_url = item["image_url"]["url"].as_str().unwrap_or("");
@@ -1367,15 +1479,48 @@ fn parse_content_array(arr: &[Value], role: &Role) -> Vec<Content> {
                 } else {
                     Content::Text {
                         text: item["content"].as_str().unwrap_or("").to_string(),
+                        annotations: None,
                     }
                 }
             }
             _ => Content::Text {
                 text: item["text"].as_str().unwrap_or("").to_string(),
+                annotations: None,
             },
         });
     }
     parts
+}
+
+/// Parse OpenAI-style annotations array into IR annotations.
+fn parse_openai_annotations(annotations: &Value) -> Option<Vec<tiygate_core::Annotation>> {
+    let arr = annotations.as_array()?;
+    let result: Vec<tiygate_core::Annotation> = arr
+        .iter()
+        .filter_map(|a| {
+            let type_str = a["type"].as_str()?;
+            let kind = match type_str {
+                "url_citation" => tiygate_core::AnnotationKind::UrlCitation,
+                "file_citation" => tiygate_core::AnnotationKind::FileCitation,
+                _ => return None,
+            };
+            Some(tiygate_core::Annotation {
+                kind,
+                start_index: a["start_index"].as_u64().map(|v| v as u32),
+                end_index: a["end_index"].as_u64().map(|v| v as u32),
+                title: a["url_citation"]["title"]
+                    .as_str()
+                    .or_else(|| a["file_citation"]["filename"].as_str())
+                    .map(String::from),
+                url: a["url_citation"]["url"].as_str().map(String::from),
+            })
+        })
+        .collect();
+    if result.is_empty() {
+        None
+    } else {
+        Some(result)
+    }
 }
 
 inventory::submit! {
@@ -1559,7 +1704,7 @@ mod tests {
             .expect("assistant message present");
         // Expect both the text and the tool call, in order.
         assert_eq!(asst.content.len(), 2);
-        assert!(matches!(&asst.content[0], Content::Text { text } if text == "Let me check."));
+        assert!(matches!(&asst.content[0], Content::Text { text , ..} if text == "Let me check."));
         match &asst.content[1] {
             Content::ToolCall { id, name, .. } => {
                 assert_eq!(id, "call_xyz");
@@ -1621,6 +1766,7 @@ mod tests {
         let ir = IrResponse {
             content: vec![Content::Text {
                 text: "Hello!".to_string(),
+                annotations: None,
             }],
             usage: Some(Usage {
                 prompt_tokens: 10,
@@ -1833,6 +1979,7 @@ mod tests {
         let ir = IrResponse {
             content: vec![Content::Text {
                 text: "ok".to_string(),
+                annotations: None,
             }],
             usage: Some(Usage {
                 prompt_tokens: 100,
@@ -1895,6 +2042,7 @@ mod tests {
                     role: Role::User,
                     content: vec![Content::Text {
                         text: "天气?".to_string(),
+                        annotations: None,
                     }],
                 },
                 // 含 tool_calls 的轮:reasoning_content 应回传
@@ -1905,6 +2053,7 @@ mod tests {
                             text: "先查天气工具".to_string(),
                             signature: None,
                             id: None,
+                            encrypted_content: None,
                         },
                         Content::ToolCall {
                             id: "call_1".to_string(),
@@ -1929,9 +2078,11 @@ mod tests {
                             text: "整理答案".to_string(),
                             signature: None,
                             id: None,
+                            encrypted_content: None,
                         },
                         Content::Text {
                             text: "杭州今天晴。".to_string(),
+                            annotations: None,
                         },
                     ],
                 },
@@ -1945,6 +2096,7 @@ mod tests {
                 "chat-completions",
                 "v1",
             ),
+            metadata: None,
             extensions: Default::default(),
         };
 
