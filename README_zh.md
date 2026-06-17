@@ -258,20 +258,6 @@ cargo tree -p tiygate-server -e features --depth 1
 >
 > **CI 冒烟**:`bash scripts/verify-deps.sh` 在任意 feature 组合下都应通过,因为依赖隔离守在 `core` / `providers` 层,与 `server` 的编译矩阵相互独立。
 
-## 项目状态
-
-TiyGate 处于 **v0.1.0**,公开 API 尚未稳定。完整架构已在 [`docs/ai-gateway-architecture-design.md`](docs/ai-gateway-architecture-design.md) 中设计完成,拆为 5 个阶段:
-
-| 阶段 | 主题 | 退出标志 |
-|---|---|---|
-| 1 | 内核 + 最小代理 | 跨协议打通、零配置可跑 |
-| 2 | 稳定性层 | 熔断 / 转移 / 超时 / 入口防护 |
-| 3 | 接入广度 | 5 协议、多 provider、Executor 逃生舱 |
-| 4 | 产品化 | 动态配置、日志仪表盘、配额、密钥加密 |
-| 5 | 规模化 | 多副本、两档部署、探针、优雅排空 |
-
-每个阶段都可独立验收、独立演示。完整交付物、验收标准与风险见架构设计文档。
-
 ## 贡献
 
 欢迎 Issue 与 PR。涉及非平凡变更前请先阅读架构设计文档 —— 设计是有立场的,与分层对抗的贡献(例如给 `core` 加具体 provider 依赖、引入 `allow_lossy`)会被拒。

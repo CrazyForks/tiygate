@@ -258,20 +258,6 @@ cargo tree -p tiygate-server -e features --depth 1
 >
 > **CI smoke matrix** — `bash scripts/verify-deps.sh` will still pass under any feature combination, because dependency isolation lives in `core` / `providers` and is enforced separately from the `server` build matrix.
 
-## Project Status
-
-TiyGate is at **v0.1.0** and the public API is not yet stable. The architecture is fully designed in [`docs/ai-gateway-architecture-design.md`](docs/ai-gateway-architecture-design.md), broken into 5 phases:
-
-| Phase | Theme | Exit signal |
-|---|---|---|
-| 1 | Core kernel + minimal proxy | Cross-protocol translation works, zero-config boots |
-| 2 | Reliability layer | Circuit breaker, failover, timeouts, ingress guards |
-| 3 | Breadth | 5 protocols, multi-provider, Executor escape hatch |
-| 4 | Productization | Dynamic config, log dashboards, quotas, key encryption |
-| 5 | Scale | Multi-replica, split deployment, probes, graceful drain |
-
-Each phase is independently demonstrable. See the design doc for the full delivery list, acceptance criteria, and risks.
-
 ## Contributing
 
 Issues and pull requests are welcome. For non-trivial changes, please read the architecture doc first — the design is opinionated, and contributions that fight the layering (e.g. adding a concrete provider dependency to `core`, or introducing `allow_lossy`) will be declined.
