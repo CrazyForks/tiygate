@@ -12,7 +12,7 @@
 //! * `/admin/ui/` returns `index.html`.
 //! * `/admin/ui/<asset>` returns the embedded asset when it exists.
 //! * Any other path under `/admin/ui/` falls back to `index.html` so
-//!   the client-side router (react-router with `basename="/admin/ui"`)
+//!   the client-side router (react-router with `basename="/admin/ui/"`)
 //!   can resolve deep links on reload.
 //!
 //! The routes are registered directly on the main router with explicit

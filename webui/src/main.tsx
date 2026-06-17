@@ -30,7 +30,7 @@ ReactDOM.createRoot(rootEl).render(
       <QueryClientProvider client={queryClient}>
         <TooltipProvider delayDuration={200}>
           <ToastProvider>
-            <BrowserRouter basename="/admin/ui">
+            <BrowserRouter basename="/admin/ui/">
               <AuthProvider>
                 <App />
               </AuthProvider>

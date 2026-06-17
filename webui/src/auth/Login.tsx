@@ -1,6 +1,5 @@
 import { useState, type FormEvent } from "react";
 import { useTranslation } from "react-i18next";
-import { useNavigate } from "react-router-dom";
 import { probeToken, ApiError } from "@/api/client";
 import { useAuth } from "./AuthContext";
 import { Button, Card, ErrorBox, Field, PasswordInput, Switch } from "@/components/ui";
@@ -10,7 +9,6 @@ import { cn } from "@/lib/cn";
 export default function Login() {
   const { t } = useTranslation();
   const { login } = useAuth();
-  const navigate = useNavigate();
   const [token, setToken] = useState("");
   const [remember, setRemember] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -24,7 +22,7 @@ export default function Login() {
     try {
       await probeToken(token.trim());
       login(token.trim(), remember);
-      navigate("/", { replace: true });
+      window.location.replace("/admin/ui/");
     } catch (err) {
       if (err instanceof ApiError) {
         if (err.status === 401) setError(t("login.invalid"));
