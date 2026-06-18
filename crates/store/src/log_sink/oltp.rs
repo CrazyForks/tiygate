@@ -1463,22 +1463,24 @@ fn extract_usage_from_sse(raw: &str) -> Option<Usage> {
                     // Official Anthropic streams normally report input/cache
                     // tokens on `message_start.message.usage`, but some
                     // compatible proxies emit a complete usage object on
-                    // `message_delta.usage` instead. Merge those fields here
-                    // so prompt/cache accounting is not silently reduced to
-                    // output-only totals.
+                    // `message_delta.usage` instead. Treat fields that appear
+                    // on the later delta as authoritative rather than taking a
+                    // max: compatible proxies may report an early cache value
+                    // using OpenAI-style prompt-including-cache semantics, while
+                    // the terminal delta carries the Anthropic-native split
+                    // (`input_tokens` plus `cache_read_input_tokens`). Fields
+                    // omitted from the delta still fall back to message_start.
                     if let Some(i) = u.get("input_tokens").and_then(|v| v.as_u64()) {
-                        anthropic_input = Some(anthropic_input.map(|n| n.max(i)).unwrap_or(i));
+                        anthropic_input = Some(i);
                     }
                     if let Some(cc) = u
                         .get("cache_creation_input_tokens")
                         .and_then(|v| v.as_u64())
                     {
-                        anthropic_cache_creation =
-                            Some(anthropic_cache_creation.map(|n| n.max(cc)).unwrap_or(cc));
+                        anthropic_cache_creation = Some(cc);
                     }
                     if let Some(cr) = u.get("cache_read_input_tokens").and_then(|v| v.as_u64()) {
-                        anthropic_cache_read =
-                            Some(anthropic_cache_read.map(|n| n.max(cr)).unwrap_or(cr));
+                        anthropic_cache_read = Some(cr);
                     }
                     if let Some(rt) = u
                         .get("output_tokens_details")
@@ -3496,6 +3498,19 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"
         assert_eq!(u.cache_read_tokens, Some(217148));
         assert_eq!(u.cache_write_tokens, Some(1288));
         assert_eq!(u.total_tokens, 1 + 1288 + 217148 + 526);
+    }
+
+    #[test]
+    fn extract_usage_sse_anthropic_delta_cache_overrides_prompt_inclusive_start_cache() {
+        let raw = "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"usage\":{\"input_tokens\":1647,\"cache_read_input_tokens\":17445,\"cache_creation_input_tokens\":0}}}\n\
+                   data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"x\"}}\n\
+                   data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":1647,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":15798,\"output_tokens\":145}}\n";
+        let u = extract_usage_from_sse(raw).expect("usage");
+        assert_eq!(u.prompt_tokens, 1647);
+        assert_eq!(u.completion_tokens, 145);
+        assert_eq!(u.cache_read_tokens, Some(15798));
+        assert_eq!(u.cache_write_tokens, Some(0));
+        assert_eq!(u.total_tokens, 1647 + 15798 + 145);
     }
 
     #[test]
