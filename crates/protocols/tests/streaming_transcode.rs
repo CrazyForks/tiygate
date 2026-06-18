@@ -560,3 +560,84 @@ fn gemini_tool_call_finish_before_usage_keeps_cache_read_in_messages_terminal_de
     assert_eq!(terminal_delta["usage"]["input_tokens"], 4927);
     assert_eq!(terminal_delta["usage"]["output_tokens"], 62);
 }
+
+#[test]
+fn chat_finish_before_usage_keeps_cache_read_when_ingress_is_gemini() {
+    let upstream = br#"data: {"id":"chat_1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"id":"chat_1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":null}],"usage":{"prompt_tokens":146050,"completion_tokens":62,"total_tokens":146112,"prompt_tokens_details":{"cached_tokens":141123}}}
+
+data: [DONE]
+
+"#;
+    let client = transcode(
+        ProtocolSuite::OpenAiCompatible,
+        ProtocolSuite::GoogleGemini,
+        upstream,
+    );
+    let events = sse_json_events(&client);
+    let usage_event = events
+        .iter()
+        .find(|ev| ev.get("usageMetadata").is_some())
+        .expect("Gemini usageMetadata");
+    assert_eq!(
+        usage_event["usageMetadata"]["cachedContentTokenCount"],
+        141123
+    );
+    assert_eq!(usage_event["usageMetadata"]["promptTokenCount"], 146050);
+    assert_eq!(usage_event["usageMetadata"]["candidatesTokenCount"], 62);
+    assert_eq!(usage_event["usageMetadata"]["totalTokenCount"], 146112);
+}
+
+#[test]
+fn responses_completed_usage_keeps_cache_read_when_ingress_is_gemini() {
+    let upstream = br#"data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","usage":{"input_tokens":146050,"output_tokens":62,"total_tokens":146112,"input_tokens_details":{"cached_tokens":141123}}}}
+
+"#;
+    let client = transcode(
+        ProtocolSuite::OpenAiResponses,
+        ProtocolSuite::GoogleGemini,
+        upstream,
+    );
+    let events = sse_json_events(&client);
+    let usage_event = events
+        .iter()
+        .find(|ev| ev.get("usageMetadata").is_some())
+        .expect("Gemini usageMetadata");
+    assert_eq!(
+        usage_event["usageMetadata"]["cachedContentTokenCount"],
+        141123
+    );
+    assert_eq!(usage_event["usageMetadata"]["promptTokenCount"], 146050);
+    assert_eq!(usage_event["usageMetadata"]["candidatesTokenCount"], 62);
+    assert_eq!(usage_event["usageMetadata"]["totalTokenCount"], 146112);
+}
+
+#[test]
+fn messages_split_usage_keeps_cache_read_when_ingress_is_gemini() {
+    let upstream = br#"data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude","content":[],"usage":{"input_tokens":4927,"output_tokens":0,"cache_read_input_tokens":141123}}}
+
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":62}}
+
+data: {"type":"message_stop"}
+
+"#;
+    let client = transcode(
+        ProtocolSuite::AnthropicMessages,
+        ProtocolSuite::GoogleGemini,
+        upstream,
+    );
+    let events = sse_json_events(&client);
+    let usage_event = events
+        .iter()
+        .rev()
+        .find(|ev| ev.get("usageMetadata").is_some())
+        .expect("Gemini usageMetadata");
+    assert_eq!(
+        usage_event["usageMetadata"]["cachedContentTokenCount"],
+        141123
+    );
+    assert_eq!(usage_event["usageMetadata"]["promptTokenCount"], 146050);
+    assert_eq!(usage_event["usageMetadata"]["candidatesTokenCount"], 62);
+    assert_eq!(usage_event["usageMetadata"]["totalTokenCount"], 146112);
+}

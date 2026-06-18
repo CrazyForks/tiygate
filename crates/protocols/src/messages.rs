@@ -1165,6 +1165,12 @@ pub struct MessagesStreamDecoder {
     /// truncated tool-call turn would make the client stop instead of running
     /// the tool.
     saw_tool_use: bool,
+    /// Accumulated usage from `message_start` plus later `message_delta`.
+    /// Anthropic streams usually split input/cache on message_start and final
+    /// output on message_delta; emitting each delta independently would make a
+    /// downstream encoder (Gemini/Chat/Responses) see a later zero-input usage
+    /// that hides cache reads.
+    usage_acc: Option<Usage>,
 }
 
 impl Default for MessagesStreamDecoder {
@@ -1181,6 +1187,7 @@ impl MessagesStreamDecoder {
             tool_use_ids: Vec::new(),
             saw_finish: false,
             saw_tool_use: false,
+            usage_acc: None,
         }
     }
 
@@ -1195,6 +1202,31 @@ impl MessagesStreamDecoder {
     /// Look up the tool_use id previously recorded for a content block `index`.
     fn tool_use_id(&self, index: usize) -> String {
         self.tool_use_ids.get(index).cloned().unwrap_or_default()
+    }
+
+    fn merge_usage(&mut self, incoming: Usage) -> Usage {
+        let mut merged = self.usage_acc.clone().unwrap_or_default();
+        if incoming.prompt_tokens > 0 || merged.prompt_tokens == 0 {
+            merged.prompt_tokens = incoming.prompt_tokens;
+        }
+        if incoming.completion_tokens > 0 || merged.completion_tokens == 0 {
+            merged.completion_tokens = incoming.completion_tokens;
+        }
+        if incoming.reasoning_tokens.is_some() {
+            merged.reasoning_tokens = incoming.reasoning_tokens;
+        }
+        if incoming.cache_read_tokens.is_some() {
+            merged.cache_read_tokens = incoming.cache_read_tokens;
+        }
+        if incoming.cache_write_tokens.is_some() {
+            merged.cache_write_tokens = incoming.cache_write_tokens;
+        }
+        let cache_read = merged.cache_read_tokens.unwrap_or(0);
+        let cache_write = merged.cache_write_tokens.unwrap_or(0);
+        merged.total_tokens =
+            merged.prompt_tokens + cache_write + cache_read + merged.completion_tokens;
+        self.usage_acc = Some(merged.clone());
+        merged
     }
 }
 
@@ -1236,20 +1268,19 @@ impl StreamDecoder for MessagesStreamDecoder {
                         .get("output_tokens_details")
                         .and_then(|v| v.get("thinking_tokens"))
                         .and_then(|v| v.as_u64());
-                    parts.push(StreamPart::Usage {
-                        usage: Usage {
-                            prompt_tokens: input,
-                            completion_tokens: output,
-                            total_tokens: input + cache_creation + cache_read + output,
-                            reasoning_tokens: reasoning,
-                            cache_read_tokens: if has_cr_field { Some(cache_read) } else { None },
-                            cache_write_tokens: if has_cc_field {
-                                Some(cache_creation)
-                            } else {
-                                None
-                            },
+                    let usage = self.merge_usage(Usage {
+                        prompt_tokens: input,
+                        completion_tokens: output,
+                        total_tokens: input + cache_creation + cache_read + output,
+                        reasoning_tokens: reasoning,
+                        cache_read_tokens: if has_cr_field { Some(cache_read) } else { None },
+                        cache_write_tokens: if has_cc_field {
+                            Some(cache_creation)
+                        } else {
+                            None
                         },
                     });
+                    parts.push(StreamPart::Usage { usage });
                 }
             }
             Some("content_block_start") => {
@@ -1365,23 +1396,19 @@ impl StreamDecoder for MessagesStreamDecoder {
                         .get("output_tokens_details")
                         .and_then(|v| v.get("thinking_tokens"))
                         .and_then(|v| v.as_u64());
-                    parts.push(StreamPart::Usage {
-                        usage: Usage {
-                            prompt_tokens: input_tokens,
-                            completion_tokens: output_tokens,
-                            total_tokens: input_tokens
-                                + cache_creation
-                                + cache_read
-                                + output_tokens,
-                            reasoning_tokens: reasoning,
-                            cache_read_tokens: if has_cr_field { Some(cache_read) } else { None },
-                            cache_write_tokens: if has_cc_field {
-                                Some(cache_creation)
-                            } else {
-                                None
-                            },
+                    let usage = self.merge_usage(Usage {
+                        prompt_tokens: input_tokens,
+                        completion_tokens: output_tokens,
+                        total_tokens: input_tokens + cache_creation + cache_read + output_tokens,
+                        reasoning_tokens: reasoning,
+                        cache_read_tokens: if has_cr_field { Some(cache_read) } else { None },
+                        cache_write_tokens: if has_cc_field {
+                            Some(cache_creation)
+                        } else {
+                            None
                         },
                     });
+                    parts.push(StreamPart::Usage { usage });
                 }
                 if let Some(reason) = event["delta"]["stop_reason"].as_str() {
                     let fr = match reason {
