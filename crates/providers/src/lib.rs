@@ -10,6 +10,7 @@ pub mod moonshot;
 pub mod ollama;
 pub mod openai;
 pub mod openai_compatible;
+pub mod opencode;
 pub mod openrouter;
 pub mod xai;
 pub mod zenmux;
