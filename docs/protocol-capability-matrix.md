@@ -84,12 +84,21 @@
 
 | 维度 | chat_completions | messages | responses | gemini | embeddings |
 |------|:---:|:---:|:---:|:---:|:---:|
-| `effort` (low/medium/high) | ✅ (`reasoning_effort`) | ⚠️ → 丢弃（Anthropic 用 budget_tokens） | ✅ (`reasoning.effort`) | ⚠️ → 丢弃 | N/A |
-| `budget_tokens` | ⚠️ → 丢弃 | ✅ (`thinking.budget_tokens`) | ⚠️ → 丢弃 | ✅ (`thinkingConfig.thinkingBudget`) | N/A |
-| `display` (summarized/omitted) | ⚠️ → 丢弃 | ✅ (`thinking.display`) | ⚠️ → 丢弃 | ⚠️ → 丢弃 | N/A |
-| `include_thoughts` | ⚠️ → 丢弃 | ⚠️ → 丢弃 | ⚠️ → 丢弃 | ✅ (`thinkingConfig.includeThoughts`) | N/A |
+| `effort` (minimal/low/medium/high/xhigh/max) | ✅ (`reasoning_effort`) | ✅ (`thinking.output_config.effort`，adaptive 类型) | ✅ (`reasoning.effort`) | ✅ (`thinkingConfig.thinkingLevel`) | N/A |
+| `budget_tokens` | ✅ → 推导 effort（`budget_to_effort`） | ✅ (`thinking.budget_tokens`，enabled 类型) | ✅ → 推导 effort（`budget_to_effort`） | ✅ (`thinkingConfig.thinkingBudget`) | N/A |
+| `display` (summarized/omitted) | ⚠️ → 丢弃 | ✅ (`thinking.display`) | ⚠️ → 丢弃 | ✅ → 推导 `includeThoughts` | N/A |
+| `include_thoughts` | ⚠️ → 丢弃 | ✅ → 推导 `display`（需同时有 effort 或 budget_tokens） | ⚠️ → 丢弃 | ✅ (`thinkingConfig.includeThoughts`) | N/A |
 
 **跨协议策略**：thinking 配置跨协议时映射或丢弃，不拒绝（thinking 配置不影响语义正确性，只影响模型行为质量）。
+
+**effort 级别映射**：IR 使用 6 级枚举（Minimal/Low/Medium/High/XHigh/Max）。各协议支持级别不同，超出部分 clamp：
+- OpenAI: minimal/low/medium/high/xhigh（Max → xhigh）
+- Anthropic: low/medium/high/xhigh/max（Minimal → low，使用 adaptive thinking + `output_config.effort`）
+- Gemini: minimal/low/medium/high（XHigh/Max → high，同时输出 `thinkingBudget`）
+
+**effort ↔ budget_tokens 双向映射**：`ThinkingConfig::effort_to_budget` / `budget_to_effort` 提供数值映射，各协议 encode 时自动推导缺失字段。
+
+**display ↔ include_thoughts 映射**：Summarized ↔ true，Omitted ↔ false。Anthropic encode 时从 `include_thoughts` 推导 `display`；Gemini encode 时从 `display` 推导 `includeThoughts`。注意 Anthropic 的 `enabled` thinking 类型必须有 `budget_tokens`，仅 `include_thoughts` 无法单独表达。
 
 ## 7. Metadata
 

@@ -264,19 +264,43 @@ impl EndpointCodec for MessagesCodec {
                 })
                 .unwrap_or_default(),
             thinking: body.get("thinking").and_then(|t| {
+                // Parse effort from the adaptive thinking mechanism
+                // (thinking.output_config.effort). Anthropic supports
+                // low/medium/high/xhigh/max; we also accept "minimal"
+                // leniently for cross-protocol symmetry.
+                let effort = t["output_config"]["effort"].as_str().map(|s| {
+                    use tiygate_core::ThinkingEffort;
+                    match s {
+                        "minimal" => ThinkingEffort::Minimal,
+                        "low" => ThinkingEffort::Low,
+                        "medium" => ThinkingEffort::Medium,
+                        "high" => ThinkingEffort::High,
+                        "xhigh" => ThinkingEffort::XHigh,
+                        "max" => ThinkingEffort::Max,
+                        _ => ThinkingEffort::High,
+                    }
+                });
                 let budget_tokens = t["budget_tokens"].as_u64().map(|v| v as u32);
                 let display = t["display"].as_str().map(|s| match s {
                     "summarized" => tiygate_core::ThinkingDisplay::Summarized,
                     "omitted" => tiygate_core::ThinkingDisplay::Omitted,
                     _ => tiygate_core::ThinkingDisplay::Summarized,
                 });
-                if budget_tokens.is_none() && display.is_none() {
+                // Derive include_thoughts from display for cross-protocol
+                // consistency (Gemini's includeThoughts is the semantic
+                // equivalent of Anthropic's display).
+                let include_thoughts = display.map(|d| match d {
+                    tiygate_core::ThinkingDisplay::Summarized => true,
+                    tiygate_core::ThinkingDisplay::Omitted => false,
+                });
+                if effort.is_none() && budget_tokens.is_none() && display.is_none() {
                     None
                 } else {
                     Some(tiygate_core::ThinkingConfig {
+                        effort,
                         budget_tokens,
                         display,
-                        ..Default::default()
+                        include_thoughts,
                     })
                 }
             }),
@@ -625,15 +649,58 @@ impl EndpointCodec for MessagesCodec {
         if !ir.params.stop.is_empty() {
             body["stop_sequences"] = json!(ir.params.stop);
         }
-        // Thinking config: output Anthropic thinking block from params.thinking
+        // Thinking config: output Anthropic thinking block from params.thinking.
+        //
+        // Cross-protocol derivation:
+        // - effort → adaptive thinking with output_config.effort (new mechanism)
+        // - budget_tokens (without effort) → enabled thinking with budget_tokens
+        // - display ← include_thoughts (derived when display is missing)
+        //
+        // When effort is present (e.g. from OpenAI reasoning_effort), use the
+        // adaptive thinking type so the effort level is expressed natively on
+        // Anthropic. When only budget_tokens is present (e.g. same-protocol
+        // round-trip), keep the traditional enabled type.
         if let Some(ref thinking) = ir.params.thinking {
-            if thinking.budget_tokens.is_some() || thinking.display.is_some() {
-                let mut t = json!({"type": "enabled"});
-                if let Some(budget) = thinking.budget_tokens {
-                    t["budget_tokens"] = json!(budget);
+            // Derive display from include_thoughts when display is not set.
+            let display = thinking.display.or_else(|| {
+                thinking.include_thoughts.map(|i| match i {
+                    true => tiygate_core::ThinkingDisplay::Summarized,
+                    false => tiygate_core::ThinkingDisplay::Omitted,
+                })
+            });
+
+            if let Some(effort) = thinking.effort {
+                // Effort-based adaptive thinking (new Anthropic mechanism).
+                // Anthropic supports low/medium/high/xhigh/max; Minimal clamps
+                // to "low" since Anthropic has no "minimal" effort level.
+                let mut t = json!({
+                    "type": "adaptive",
+                    "output_config": {
+                        "effort": match effort {
+                            tiygate_core::ThinkingEffort::Minimal => "low",
+                            tiygate_core::ThinkingEffort::Low => "low",
+                            tiygate_core::ThinkingEffort::Medium => "medium",
+                            tiygate_core::ThinkingEffort::High => "high",
+                            tiygate_core::ThinkingEffort::XHigh => "xhigh",
+                            tiygate_core::ThinkingEffort::Max => "max",
+                        }
+                    }
+                });
+                if let Some(d) = display {
+                    t["display"] = json!(match d {
+                        tiygate_core::ThinkingDisplay::Summarized => "summarized",
+                        tiygate_core::ThinkingDisplay::Omitted => "omitted",
+                    });
                 }
-                if let Some(display) = thinking.display {
-                    t["display"] = json!(match display {
+                body["thinking"] = t;
+            } else if let Some(budget) = thinking.budget_tokens {
+                // Budget-based enabled thinking (traditional mechanism).
+                // Anthropic's enabled type requires budget_tokens; when only
+                // display/include_thoughts is set without a budget, we skip
+                // emitting the block rather than sending an invalid request.
+                let mut t = json!({"type": "enabled", "budget_tokens": budget});
+                if let Some(d) = display {
+                    t["display"] = json!(match d {
                         tiygate_core::ThinkingDisplay::Summarized => "summarized",
                         tiygate_core::ThinkingDisplay::Omitted => "omitted",
                     });

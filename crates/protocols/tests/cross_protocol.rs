@@ -13,7 +13,7 @@ use serde_json::json;
 use std::collections::HashMap;
 use tiygate_core::{
     Content, EndpointCodec, GenerationParams, IrRequest, IrResponse, Message, PassThroughPolicy,
-    ProtocolEndpoint, ProtocolSuite, Role,
+    ProtocolEndpoint, ProtocolSuite, Role, ThinkingConfig, ThinkingEffort,
 };
 
 fn make_env() -> tiygate_core::RawEnvelope {
@@ -845,6 +845,8 @@ fn gemini_thinking_config_roundtrip() {
 
 #[test]
 fn chat_thinking_effort_cross_to_anthropic() {
+    // Chat reasoning_effort="medium" must now map to Anthropic's adaptive
+    // thinking with output_config.effort="medium" (cross-protocol derivation).
     let chat = find_codec(ProtocolSuite::OpenAiCompatible, "chat-completions");
     let anthropic = find_codec(ProtocolSuite::AnthropicMessages, "messages");
     let env = make_env();
@@ -854,10 +856,286 @@ fn chat_thinking_effort_cross_to_anthropic() {
         "reasoning_effort": "medium",
     });
     let ir = chat.decode_request(body, &env).unwrap();
+    assert_eq!(
+        ir.params.thinking.as_ref().unwrap().effort,
+        Some(ThinkingEffort::Medium)
+    );
     let (encoded, _) = anthropic.encode_request(&ir).unwrap();
-    // Cross-protocol: effort maps to nothing on Anthropic (no effort field)
-    // but the IR carries the thinking config
-    assert!(encoded.get("thinking").is_none() || encoded.get("reasoning_effort").is_none());
+    // Effort must be expressed as adaptive thinking with output_config.effort.
+    assert_eq!(encoded["thinking"]["type"], "adaptive");
+    assert_eq!(encoded["thinking"]["output_config"]["effort"], "medium");
+}
+
+// ── Cross-protocol thinking config mapping tests ───────────────────
+
+/// Helper: build a minimal IR request with a given thinking config.
+fn thinking_ir(thinking: ThinkingConfig) -> IrRequest {
+    IrRequest {
+        model: "test-model".to_string(),
+        system: Some("You are helpful.".to_string()),
+        messages: vec![Message {
+            role: Role::User,
+            content: vec![Content::Text {
+                text: "Hello".to_string(),
+                annotations: None,
+            }],
+        }],
+        tools: vec![],
+        params: GenerationParams {
+            max_tokens: Some(100),
+            thinking: Some(thinking),
+            ..Default::default()
+        },
+        response_format: None,
+        stream: false,
+        ingress_protocol: ProtocolEndpoint::new(
+            ProtocolSuite::OpenAiCompatible,
+            "chat-completions",
+            "v1",
+        ),
+        metadata: None,
+        extensions: HashMap::new(),
+    }
+}
+
+#[test]
+fn cross_thinking_chat_effort_to_anthropic_adaptive() {
+    // Chat effort → Anthropic adaptive thinking with output_config.effort
+    let anthropic = find_codec(ProtocolSuite::AnthropicMessages, "messages");
+    let ir = thinking_ir(ThinkingConfig {
+        effort: Some(ThinkingEffort::High),
+        ..Default::default()
+    });
+    let (out, _) = anthropic.encode_request(&ir).unwrap();
+    assert_eq!(out["thinking"]["type"], "adaptive");
+    assert_eq!(out["thinking"]["output_config"]["effort"], "high");
+}
+
+#[test]
+fn cross_thinking_chat_effort_to_gemini_thinking_level() {
+    // Chat effort → Gemini thinkingLevel + thinkingBudget
+    let gemini = find_codec(ProtocolSuite::GoogleGemini, "generateContent");
+    let ir = thinking_ir(ThinkingConfig {
+        effort: Some(ThinkingEffort::Medium),
+        ..Default::default()
+    });
+    let (out, _) = gemini.encode_request(&ir).unwrap();
+    assert_eq!(
+        out["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+        "medium"
+    );
+    // thinkingBudget is derived from effort, clamped to Gemini's 0-24576 range.
+    assert_eq!(
+        out["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+        ThinkingConfig::effort_to_budget(ThinkingEffort::Medium)
+    );
+}
+
+#[test]
+fn cross_thinking_anthropic_budget_to_chat_effort() {
+    // Anthropic budget_tokens → Chat reasoning_effort (derived via budget_to_effort)
+    let chat = find_codec(ProtocolSuite::OpenAiCompatible, "chat-completions");
+    let ir = thinking_ir(ThinkingConfig {
+        budget_tokens: Some(32_000),
+        ..Default::default()
+    });
+    let (out, _) = chat.encode_request(&ir).unwrap();
+    // 32000 falls in the High range (16384-39999)
+    assert_eq!(out["reasoning_effort"], "high");
+}
+
+#[test]
+fn cross_thinking_anthropic_budget_to_gemini_thinking_level() {
+    // Anthropic budget_tokens → Gemini thinkingLevel + thinkingBudget
+    let gemini = find_codec(ProtocolSuite::GoogleGemini, "generateContent");
+    let ir = thinking_ir(ThinkingConfig {
+        budget_tokens: Some(10_000),
+        ..Default::default()
+    });
+    let (out, _) = gemini.encode_request(&ir).unwrap();
+    // 10000 falls in the Medium range (6144-16383)
+    assert_eq!(
+        out["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+        "medium"
+    );
+    // thinkingBudget should be the explicit value
+    assert_eq!(
+        out["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+        10_000
+    );
+}
+
+#[test]
+fn cross_thinking_gemini_thinking_level_to_chat_effort() {
+    // Gemini thinkingLevel → Chat reasoning_effort
+    let chat = find_codec(ProtocolSuite::OpenAiCompatible, "chat-completions");
+    let gemini = find_codec(ProtocolSuite::GoogleGemini, "generateContent");
+    let env = make_env();
+    let body = json!({
+        "model": "gemini-3.0-pro",
+        "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+        "generationConfig": {
+            "thinkingConfig": {"thinkingLevel": "high"}
+        },
+    });
+    let ir = gemini.decode_request(body, &env).unwrap();
+    assert_eq!(
+        ir.params.thinking.as_ref().unwrap().effort,
+        Some(ThinkingEffort::High)
+    );
+    let (out, _) = chat.encode_request(&ir).unwrap();
+    assert_eq!(out["reasoning_effort"], "high");
+}
+
+#[test]
+fn cross_thinking_gemini_thinking_level_to_anthropic_adaptive() {
+    // Gemini thinkingLevel → Anthropic adaptive thinking with output_config.effort
+    let anthropic = find_codec(ProtocolSuite::AnthropicMessages, "messages");
+    let gemini = find_codec(ProtocolSuite::GoogleGemini, "generateContent");
+    let env = make_env();
+    let body = json!({
+        "model": "gemini-3.0-pro",
+        "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+        "generationConfig": {
+            "thinkingConfig": {"thinkingLevel": "low"}
+        },
+    });
+    let ir = gemini.decode_request(body, &env).unwrap();
+    assert_eq!(
+        ir.params.thinking.as_ref().unwrap().effort,
+        Some(ThinkingEffort::Low)
+    );
+    let (out, _) = anthropic.encode_request(&ir).unwrap();
+    assert_eq!(out["thinking"]["type"], "adaptive");
+    assert_eq!(out["thinking"]["output_config"]["effort"], "low");
+}
+
+#[test]
+fn cross_thinking_anthropic_adaptive_decode_to_chat() {
+    // Anthropic adaptive thinking with output_config.effort → Chat reasoning_effort
+    let chat = find_codec(ProtocolSuite::OpenAiCompatible, "chat-completions");
+    let anthropic = find_codec(ProtocolSuite::AnthropicMessages, "messages");
+    let env = make_env();
+    let body = json!({
+        "model": "claude-sonnet-4",
+        "max_tokens": 4096,
+        "messages": [{"role": "user", "content": "hi"}],
+        "thinking": {
+            "type": "adaptive",
+            "output_config": {"effort": "xhigh"}
+        },
+    });
+    let ir = anthropic.decode_request(body, &env).unwrap();
+    assert_eq!(
+        ir.params.thinking.as_ref().unwrap().effort,
+        Some(ThinkingEffort::XHigh)
+    );
+    let (out, _) = chat.encode_request(&ir).unwrap();
+    assert_eq!(out["reasoning_effort"], "xhigh");
+}
+
+#[test]
+fn cross_thinking_anthropic_adaptive_decode_to_gemini() {
+    // Anthropic adaptive thinking → Gemini thinkingLevel (XHigh clamps to "high")
+    let gemini = find_codec(ProtocolSuite::GoogleGemini, "generateContent");
+    let anthropic = find_codec(ProtocolSuite::AnthropicMessages, "messages");
+    let env = make_env();
+    let body = json!({
+        "model": "claude-sonnet-4",
+        "max_tokens": 4096,
+        "messages": [{"role": "user", "content": "hi"}],
+        "thinking": {
+            "type": "adaptive",
+            "output_config": {"effort": "max"}
+        },
+    });
+    let ir = anthropic.decode_request(body, &env).unwrap();
+    assert_eq!(
+        ir.params.thinking.as_ref().unwrap().effort,
+        Some(ThinkingEffort::Max)
+    );
+    let (out, _) = gemini.encode_request(&ir).unwrap();
+    // Gemini only has 4 levels; Max clamps to "high"
+    assert_eq!(
+        out["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+        "high"
+    );
+}
+
+#[test]
+fn cross_thinking_display_to_include_thoughts_anthropic_to_gemini() {
+    // Anthropic display=Omitted → Gemini includeThoughts=false
+    let gemini = find_codec(ProtocolSuite::GoogleGemini, "generateContent");
+    let ir = thinking_ir(ThinkingConfig {
+        display: Some(tiygate_core::ThinkingDisplay::Omitted),
+        ..Default::default()
+    });
+    let (out, _) = gemini.encode_request(&ir).unwrap();
+    assert_eq!(
+        out["generationConfig"]["thinkingConfig"]["includeThoughts"],
+        false
+    );
+}
+
+#[test]
+fn cross_thinking_include_thoughts_to_display_gemini_to_anthropic() {
+    // Gemini includeThoughts=true alone (no effort, no budget_tokens) cannot
+    // be expressed on Anthropic without a budget_tokens. The encoder must NOT
+    // emit an invalid enabled-thinking block without budget_tokens.
+    let anthropic = find_codec(ProtocolSuite::AnthropicMessages, "messages");
+    let ir = thinking_ir(ThinkingConfig {
+        include_thoughts: Some(true),
+        ..Default::default()
+    });
+    let (out, _) = anthropic.encode_request(&ir).unwrap();
+    // No thinking block should be emitted when only include_thoughts is set,
+    // since Anthropic's enabled type requires budget_tokens.
+    assert!(
+        out.get("thinking").is_none(),
+        "expected no thinking block when only include_thoughts is set, got: {out}"
+    );
+}
+
+#[test]
+fn cross_thinking_minimal_effort_clamping() {
+    // Minimal effort: Anthropic clamps to "low", Gemini supports "minimal"
+    let anthropic = find_codec(ProtocolSuite::AnthropicMessages, "messages");
+    let gemini = find_codec(ProtocolSuite::GoogleGemini, "generateContent");
+    let ir = thinking_ir(ThinkingConfig {
+        effort: Some(ThinkingEffort::Minimal),
+        ..Default::default()
+    });
+    let (anth_out, _) = anthropic.encode_request(&ir).unwrap();
+    // Anthropic doesn't support "minimal", clamps to "low"
+    assert_eq!(anth_out["thinking"]["output_config"]["effort"], "low");
+
+    let (gem_out, _) = gemini.encode_request(&ir).unwrap();
+    // Gemini supports "minimal"
+    assert_eq!(
+        gem_out["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+        "minimal"
+    );
+}
+
+#[test]
+fn cross_thinking_max_effort_clamping() {
+    // Max effort: OpenAI clamps to "xhigh", Gemini clamps to "high"
+    let chat = find_codec(ProtocolSuite::OpenAiCompatible, "chat-completions");
+    let gemini = find_codec(ProtocolSuite::GoogleGemini, "generateContent");
+    let ir = thinking_ir(ThinkingConfig {
+        effort: Some(ThinkingEffort::Max),
+        ..Default::default()
+    });
+    let (chat_out, _) = chat.encode_request(&ir).unwrap();
+    // OpenAI has no "max", clamps to "xhigh"
+    assert_eq!(chat_out["reasoning_effort"], "xhigh");
+
+    let (gem_out, _) = gemini.encode_request(&ir).unwrap();
+    // Gemini only has 4 levels, clamps to "high"
+    assert_eq!(
+        gem_out["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+        "high"
+    );
 }
 
 // ── Refusal tests ───────────────────────────────────────────────────

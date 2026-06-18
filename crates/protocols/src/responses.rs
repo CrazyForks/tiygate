@@ -277,9 +277,12 @@ impl EndpointCodec for ResponsesCodec {
                 r.get("effort").and_then(|v| v.as_str()).map(|s| {
                     use tiygate_core::ThinkingEffort;
                     let effort = match s {
+                        "minimal" => ThinkingEffort::Minimal,
                         "low" => ThinkingEffort::Low,
                         "medium" => ThinkingEffort::Medium,
                         "high" => ThinkingEffort::High,
+                        "xhigh" => ThinkingEffort::XHigh,
+                        "max" => ThinkingEffort::Max,
                         _ => ThinkingEffort::High,
                     };
                     tiygate_core::ThinkingConfig {
@@ -640,14 +643,25 @@ impl EndpointCodec for ResponsesCodec {
         }
         // Thinking config: output reasoning.effort from params.thinking
         // or from the legacy extensions["reasoning_effort"] fallback.
+        // Cross-protocol derivation: when effort is missing but budget_tokens
+        // is present (e.g. from Anthropic/Gemini), derive effort from budget.
         if body.get("reasoning").is_none() {
             if let Some(ref thinking) = ir.params.thinking {
-                if let Some(effort) = thinking.effort {
+                let effort = thinking.effort.or_else(|| {
+                    thinking
+                        .budget_tokens
+                        .map(tiygate_core::ThinkingConfig::budget_to_effort)
+                });
+                if let Some(effort) = effort {
+                    // OpenAI supports minimal/low/medium/high/xhigh; Max clamps
+                    // to "xhigh" since OpenAI has no "max" effort level.
                     body["reasoning"] = json!({"effort": match effort {
+                        tiygate_core::ThinkingEffort::Minimal => "minimal",
                         tiygate_core::ThinkingEffort::Low => "low",
                         tiygate_core::ThinkingEffort::Medium => "medium",
                         tiygate_core::ThinkingEffort::High => "high",
-                        tiygate_core::ThinkingEffort::Max => "high",
+                        tiygate_core::ThinkingEffort::XHigh => "xhigh",
+                        tiygate_core::ThinkingEffort::Max => "xhigh",
                     }});
                 }
             } else if let Some(effort) = ir

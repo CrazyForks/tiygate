@@ -10,6 +10,9 @@ use tiygate_core::{
     Tool, Usage,
 };
 
+/// Maximum value for Gemini's `thinkingBudget` field (0–24576).
+const GEMINI_THINKING_BUDGET_MAX: u32 = 24576;
+
 /// Synthesize a deterministic tool-call id for Gemini function calls.
 ///
 /// Gemini's `functionCall` / `functionResponse` parts have no explicit call
@@ -232,17 +235,39 @@ impl EndpointCodec for GeminiCodec {
             ..Default::default()
         };
 
-        // Parse thinkingConfig from generationConfig
+        // Parse thinkingConfig from generationConfig.
+        // Supports both the legacy numeric fields (thinkingBudget,
+        // includeThoughts) and the newer thinkingLevel (Gemini 3.x).
         let thinking = gc.get("thinkingConfig").and_then(|tc| {
             let include_thoughts = tc["includeThoughts"].as_bool();
             let budget_tokens = tc["thinkingBudget"].as_u64().map(|v| v as u32);
-            if include_thoughts.is_none() && budget_tokens.is_none() {
+            // Parse thinkingLevel → effort (Gemini 3.x).
+            // Gemini supports minimal/low/medium/high (4 levels).
+            let effort = tc["thinkingLevel"].as_str().map(|s| {
+                use tiygate_core::ThinkingEffort;
+                match s {
+                    "minimal" => ThinkingEffort::Minimal,
+                    "low" => ThinkingEffort::Low,
+                    "medium" => ThinkingEffort::Medium,
+                    "high" => ThinkingEffort::High,
+                    _ => ThinkingEffort::High,
+                }
+            });
+            // Derive display from include_thoughts for cross-protocol
+            // consistency (Anthropic's display is the semantic equivalent
+            // of Gemini's includeThoughts).
+            let display = include_thoughts.map(|i| match i {
+                true => tiygate_core::ThinkingDisplay::Summarized,
+                false => tiygate_core::ThinkingDisplay::Omitted,
+            });
+            if include_thoughts.is_none() && budget_tokens.is_none() && effort.is_none() {
                 None
             } else {
                 Some(tiygate_core::ThinkingConfig {
                     include_thoughts,
                     budget_tokens,
-                    ..Default::default()
+                    effort,
+                    display,
                 })
             }
         });
@@ -475,14 +500,53 @@ impl EndpointCodec for GeminiCodec {
             gc["stopSequences"] = json!(ir.params.stop);
             has_gc = true;
         }
-        // Thinking config: output thinkingConfig from params.thinking
+        // Thinking config: output thinkingConfig from params.thinking.
+        //
+        // Cross-protocol derivation:
+        // - effort → thinkingLevel (Gemini 3.x) + thinkingBudget (derived)
+        // - budget_tokens → thinkingBudget (when effort is absent)
+        // - include_thoughts ← display (derived when include_thoughts is missing)
+        //
+        // Gemini supports minimal/low/medium/high for thinkingLevel (4 levels);
+        // XHigh/Max clamp to "high". Gemini's thinkingBudget range is 0–24576,
+        // so derived budgets are clamped to that range.
         if let Some(ref thinking) = ir.params.thinking {
+            // Derive include_thoughts from display when not set.
+            let include_thoughts = thinking.include_thoughts.or_else(|| {
+                thinking.display.map(|d| match d {
+                    tiygate_core::ThinkingDisplay::Summarized => true,
+                    tiygate_core::ThinkingDisplay::Omitted => false,
+                })
+            });
+            // Derive effort from budget_tokens when not set.
+            let effort = thinking.effort.or_else(|| {
+                thinking
+                    .budget_tokens
+                    .map(tiygate_core::ThinkingConfig::budget_to_effort)
+            });
+
             let mut tc = json!({});
-            if let Some(include) = thinking.include_thoughts {
+            if let Some(include) = include_thoughts {
                 tc["includeThoughts"] = json!(include);
             }
+            if let Some(effort) = effort {
+                // Gemini supports minimal/low/medium/high; XHigh/Max clamp to "high".
+                tc["thinkingLevel"] = json!(match effort {
+                    tiygate_core::ThinkingEffort::Minimal => "minimal",
+                    tiygate_core::ThinkingEffort::Low => "low",
+                    tiygate_core::ThinkingEffort::Medium => "medium",
+                    tiygate_core::ThinkingEffort::High => "high",
+                    tiygate_core::ThinkingEffort::XHigh => "high",
+                    tiygate_core::ThinkingEffort::Max => "high",
+                });
+            }
+            // thinkingBudget: prefer explicit budget_tokens; otherwise derive
+            // from effort (clamped to Gemini's 0–24576 range).
             if let Some(budget) = thinking.budget_tokens {
                 tc["thinkingBudget"] = json!(budget);
+            } else if let Some(effort) = effort {
+                let derived = tiygate_core::ThinkingConfig::effort_to_budget(effort);
+                tc["thinkingBudget"] = json!(derived.min(GEMINI_THINKING_BUDGET_MAX));
             }
             if tc.as_object().map(|m| !m.is_empty()).unwrap_or(false) {
                 gc["thinkingConfig"] = tc;

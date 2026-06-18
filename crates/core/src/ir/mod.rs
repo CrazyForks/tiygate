@@ -267,12 +267,22 @@ pub struct GenerationParams {
 }
 
 /// Reasoning / thinking effort level.
+///
+/// Six canonical levels that map across all protocols:
+/// - **OpenAI Chat/Responses**: `reasoning_effort` / `reasoning.effort`
+///   (minimal/low/medium/high/xhigh; Max clamps to xhigh)
+/// - **Anthropic**: `thinking.output_config.effort` (low/medium/high/xhigh/max;
+///   Minimal clamps to low) or `thinking.budget_tokens` (numeric)
+/// - **Gemini**: `thinkingConfig.thinkingLevel` (minimal/low/medium/high;
+///   XHigh/Max clamp to high) and `thinkingConfig.thinkingBudget` (numeric)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ThinkingEffort {
+    Minimal,
     Low,
     Medium,
     High,
+    XHigh,
     Max,
 }
 
@@ -308,6 +318,39 @@ pub struct ThinkingConfig {
     /// `includeThoughts`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub include_thoughts: Option<bool>,
+}
+
+impl ThinkingConfig {
+    /// Map an effort level to a canonical token budget.
+    ///
+    /// The values are chosen to span the union of all protocols' budget
+    /// ranges (Anthropic 1024–64000+, Gemini 0–24576). Each protocol
+    /// clamps as needed at encode time.
+    pub fn effort_to_budget(effort: ThinkingEffort) -> u32 {
+        match effort {
+            ThinkingEffort::Minimal => 1024,
+            ThinkingEffort::Low => 4096,
+            ThinkingEffort::Medium => 10_000,
+            ThinkingEffort::High => 32_000,
+            ThinkingEffort::XHigh => 48_000,
+            ThinkingEffort::Max => 64_000,
+        }
+    }
+
+    /// Map a token budget back to the nearest effort level.
+    ///
+    /// The inverse of [`effort_to_budget`](Self::effort_to_budget), using
+    /// range boundaries so that `budget_to_effort(effort_to_budget(e)) == e`.
+    pub fn budget_to_effort(budget: u32) -> ThinkingEffort {
+        match budget {
+            0..=2047 => ThinkingEffort::Minimal,
+            2048..=6143 => ThinkingEffort::Low,
+            6144..=16383 => ThinkingEffort::Medium,
+            16384..=39999 => ThinkingEffort::High,
+            40000..=55999 => ThinkingEffort::XHigh,
+            _ => ThinkingEffort::Max,
+        }
+    }
 }
 
 /// Citation or file-citation annotation attached to text content.
@@ -537,6 +580,69 @@ impl UsageAccumulator {
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thinking_effort_budget_roundtrip() {
+        // effort_to_budget → budget_to_effort must be identity for all levels.
+        for effort in [
+            ThinkingEffort::Minimal,
+            ThinkingEffort::Low,
+            ThinkingEffort::Medium,
+            ThinkingEffort::High,
+            ThinkingEffort::XHigh,
+            ThinkingEffort::Max,
+        ] {
+            let budget = ThinkingConfig::effort_to_budget(effort);
+            assert_eq!(
+                ThinkingConfig::budget_to_effort(budget),
+                effort,
+                "roundtrip failed for {effort:?} (budget={budget})"
+            );
+        }
+    }
+
+    #[test]
+    fn thinking_effort_budget_ordering() {
+        // Budget must monotonically increase with effort level.
+        let budgets: Vec<u32> = [
+            ThinkingEffort::Minimal,
+            ThinkingEffort::Low,
+            ThinkingEffort::Medium,
+            ThinkingEffort::High,
+            ThinkingEffort::XHigh,
+            ThinkingEffort::Max,
+        ]
+        .iter()
+        .map(|e| ThinkingConfig::effort_to_budget(*e))
+        .collect();
+        for w in budgets.windows(2) {
+            assert!(
+                w[0] < w[1],
+                "budgets must be strictly increasing: {budgets:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn thinking_effort_serde_lowercase() {
+        // serde rename_all = "lowercase" must produce the expected wire forms.
+        assert_eq!(
+            serde_json::to_string(&ThinkingEffort::Minimal).unwrap(),
+            "\"minimal\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ThinkingEffort::XHigh).unwrap(),
+            "\"xhigh\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ThinkingEffort::Max).unwrap(),
+            "\"max\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ThinkingEffort>("\"xhigh\"").unwrap(),
+            ThinkingEffort::XHigh
+        );
+    }
 
     #[test]
     fn from_data_url_standard_base64_png() {
