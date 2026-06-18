@@ -349,6 +349,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sqlite_and_postgres_migration_versions_stay_aligned() {
+        let sqlite_cfg = read_migration_dir("migrations/config").expect("sqlite config migrations");
+        let sqlite_log = read_migration_dir("migrations/log").expect("sqlite log migrations");
+        let pg_cfg = read_migration_dir("migrations/postgres/config").expect("pg config migrations");
+        let pg_log = read_migration_dir("migrations/postgres/log").expect("pg log migrations");
+
+        let sqlite_cfg_versions = sqlite_cfg.iter().map(|m| m.version).collect::<Vec<_>>();
+        let sqlite_log_versions = sqlite_log.iter().map(|m| m.version).collect::<Vec<_>>();
+        let pg_cfg_versions = pg_cfg.iter().map(|m| m.version).collect::<Vec<_>>();
+        let pg_log_versions = pg_log.iter().map(|m| m.version).collect::<Vec<_>>();
+
+        assert_eq!(sqlite_cfg_versions, pg_cfg_versions, "config migration versions differ");
+        assert_eq!(sqlite_log_versions, pg_log_versions, "log migration versions differ");
+    }
+
     #[tokio::test]
     async fn sqlite_open_pool_and_migrate() {
         let pool = open_pool("sqlite::memory:").await.expect("open pool");

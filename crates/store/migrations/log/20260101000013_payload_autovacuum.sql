@@ -1,0 +1,3 @@
+-- No-op migration to keep the SQLite log migration version sequence aligned
+-- with PostgreSQL. The matching PostgreSQL migration only tunes table-local
+-- autovacuum reloptions, which SQLite does not support.
