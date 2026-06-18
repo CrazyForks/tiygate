@@ -900,10 +900,13 @@ pub struct MessagesStreamEncoder {
     /// Last seen usage from an upstream `StreamPart::Usage`. The Anthropic
     /// streaming protocol carries the final usage on the `message_delta`
     /// event that also sets `stop_reason`. When `Usage` arrives before
-    /// `Finish` (the common case when upstream puts both on the same chunk),
-    /// the `Finish` handler reuses this usage instead of overwriting it with
-    /// `{output_tokens: 0}` — which would clobber the real token counts.
+    /// `Finish`, the `Finish` handler reuses this usage instead of overwriting
+    /// it with `{output_tokens: 0}`. When `Finish` arrives before `Usage`
+    /// (Gemini can decode `finishReason` before same-frame `usageMetadata`),
+    /// the stop reason is deferred until usage arrives so the terminal delta
+    /// still carries real cache/read token counts.
     last_usage: Option<Usage>,
+    pending_stop_reason: Option<&'static str>,
 }
 
 impl Default for MessagesStreamEncoder {
@@ -920,6 +923,7 @@ impl MessagesStreamEncoder {
             current_kind: None,
             next_index: 0,
             last_usage: None,
+            pending_stop_reason: None,
         }
     }
 
@@ -965,6 +969,27 @@ impl MessagesStreamEncoder {
         });
         format!(
             "event: content_block_start\ndata: {}\n\n",
+            serde_json::to_string(&data).unwrap_or_default()
+        )
+    }
+    fn usage_delta(&self, usage: &Usage, stop_reason: Option<&str>) -> String {
+        let mut usage_obj = json!({"output_tokens": usage.completion_tokens});
+        if usage.prompt_tokens > 0 {
+            usage_obj["input_tokens"] = json!(usage.prompt_tokens);
+        }
+        if let Some(cw) = usage.cache_write_tokens {
+            usage_obj["cache_creation_input_tokens"] = json!(cw);
+        }
+        if let Some(cr) = usage.cache_read_tokens {
+            usage_obj["cache_read_input_tokens"] = json!(cr);
+        }
+        let data = json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": stop_reason, "stop_sequence": null},
+            "usage": usage_obj,
+        });
+        format!(
+            "event: message_delta\ndata: {}\n\n",
             serde_json::to_string(&data).unwrap_or_default()
         )
     }
@@ -1049,25 +1074,8 @@ impl StreamEncoder for MessagesStreamEncoder {
             }
             StreamPart::Usage { usage } => {
                 self.last_usage = Some(usage.clone());
-                let mut usage_obj = json!({"output_tokens": usage.completion_tokens});
-                if usage.prompt_tokens > 0 {
-                    usage_obj["input_tokens"] = json!(usage.prompt_tokens);
-                }
-                if let Some(cw) = usage.cache_write_tokens {
-                    usage_obj["cache_creation_input_tokens"] = json!(cw);
-                }
-                if let Some(cr) = usage.cache_read_tokens {
-                    usage_obj["cache_read_input_tokens"] = json!(cr);
-                }
-                let data = json!({
-                    "type": "message_delta",
-                    "delta": {"stop_reason": null, "stop_sequence": null},
-                    "usage": usage_obj,
-                });
-                format!(
-                    "event: message_delta\ndata: {}\n\n",
-                    serde_json::to_string(&data).unwrap_or_default()
-                )
+                let stop_reason = self.pending_stop_reason.take();
+                self.usage_delta(usage, stop_reason)
             }
             StreamPart::Finish { reason } => {
                 let stop_reason = match reason {
@@ -1079,38 +1087,29 @@ impl StreamEncoder for MessagesStreamEncoder {
                 // Close any open content block before signalling the stop
                 // reason, per the Anthropic streaming contract.
                 let mut out = self.close_block();
-                // Reuse the last seen usage so the terminal `message_delta`
-                // carries real token counts. Without this, a hardcoded
-                // `{output_tokens: 0}` would overwrite the usage emitted by
-                // the preceding `StreamPart::Usage` event.
-                let usage_obj = if let Some(u) = &self.last_usage {
-                    let mut obj = json!({"output_tokens": u.completion_tokens});
-                    if u.prompt_tokens > 0 {
-                        obj["input_tokens"] = json!(u.prompt_tokens);
-                    }
-                    if let Some(cw) = u.cache_write_tokens {
-                        obj["cache_creation_input_tokens"] = json!(cw);
-                    }
-                    if let Some(cr) = u.cache_read_tokens {
-                        obj["cache_read_input_tokens"] = json!(cr);
-                    }
-                    obj
+                if let Some(u) = &self.last_usage {
+                    out.push_str(&self.usage_delta(u, Some(stop_reason)));
                 } else {
-                    json!({"output_tokens": 0})
-                };
-                let data = json!({
-                    "type": "message_delta",
-                    "delta": {"stop_reason": stop_reason},
-                    "usage": usage_obj,
-                });
-                out.push_str(&format!(
-                    "event: message_delta\ndata: {}\n\n",
-                    serde_json::to_string(&data).unwrap_or_default()
-                ));
+                    // Defer the terminal message_delta until Usage arrives so
+                    // Gemini/other sources that emit Finish before Usage do not
+                    // produce a zero-token terminal delta that hides cache reads.
+                    self.pending_stop_reason = Some(stop_reason);
+                }
                 out
             }
             StreamPart::ResponseCompleted { .. } => {
                 let mut out = self.close_block();
+                if let Some(stop_reason) = self.pending_stop_reason.take() {
+                    let data = json!({
+                        "type": "message_delta",
+                        "delta": {"stop_reason": stop_reason, "stop_sequence": null},
+                        "usage": {"output_tokens": 0},
+                    });
+                    out.push_str(&format!(
+                        "event: message_delta\ndata: {}\n\n",
+                        serde_json::to_string(&data).unwrap_or_default()
+                    ));
+                }
                 let data = json!({"type": "message_stop"});
                 out.push_str(&format!(
                     "event: message_stop\ndata: {}\n\n",

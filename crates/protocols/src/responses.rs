@@ -1138,10 +1138,20 @@ impl StreamEncoder for ResponsesStreamEncoder {
             }
             StreamPart::Usage { usage } => {
                 // Stash usage for the terminal response.completed instead of
-                // emitting it now — emitting response.completed early would
-                // terminate the stream before the model finished.
+                // emitting it early. If a Finish already arrived first (Gemini
+                // can decode `finishReason` before same-frame `usageMetadata`,
+                // and OpenAI-compatible streams may send finish before usage),
+                // we now have both pieces and can safely complete immediately.
                 self.pending_usage = Some(usage.clone());
-                String::new()
+                if !self.completed_sent {
+                    if let Some(status) = self.pending_finish_status.take() {
+                        self.completed_event(&status)
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                }
             }
             StreamPart::Finish { reason } => {
                 if self.completed_sent || self.pending_finish_status.is_some() {
@@ -1546,6 +1556,37 @@ mod tests {
         assert!(s.contains("response.completed"));
         assert!(s.contains("\"input_tokens\":10"));
         assert!(s.contains("sequence_number"));
+    }
+
+    #[test]
+    fn test_stream_encoder_usage_after_finish_completes_with_cache_read() {
+        let mut enc = ResponsesStreamEncoder::new();
+        let finish_bytes = enc
+            .encode_part(&StreamPart::Finish {
+                reason: FinishReason::ToolCalls,
+            })
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&finish_bytes).contains("response.completed"),
+            "Finish before Usage must defer completed so usage can be included"
+        );
+
+        let usage_bytes = enc
+            .encode_part(&StreamPart::Usage {
+                usage: Usage {
+                    prompt_tokens: 4927,
+                    completion_tokens: 62,
+                    total_tokens: 146112,
+                    cache_read_tokens: Some(141123),
+                    ..Default::default()
+                },
+            })
+            .unwrap();
+        let s = String::from_utf8_lossy(&usage_bytes);
+        assert!(s.contains("\"type\":\"response.completed\""), "{s}");
+        assert!(s.contains("\"input_tokens\":146050"), "{s}");
+        assert!(s.contains("\"cached_tokens\":141123"), "{s}");
+        assert!(s.contains("\"output_tokens\":62"), "{s}");
     }
 
     #[test]

@@ -482,3 +482,81 @@ fn matrix_usage_roundtrip_incremental_protocols() {
         }
     }
 }
+
+#[test]
+fn gemini_tool_call_finish_before_usage_keeps_cache_read_in_responses_completed() {
+    // Real Gemini chunks can contain `finishReason` before `usageMetadata` in
+    // the same JSON object. The Gemini decoder emits Finish first, then Usage;
+    // Responses must still delay/complete with the usage so cache read is not
+    // shown as zero in response.completed.
+    let upstream = br#"data: {"responseId":"resp_g","candidates":[{"content":{"parts":[{"functionCall":{"name":"shell","args":{"command":"echo ok"}}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":146050,"candidatesTokenCount":62,"totalTokenCount":146112,"cachedContentTokenCount":141123}}
+
+"#;
+    let client = transcode(
+        ProtocolSuite::GoogleGemini,
+        ProtocolSuite::OpenAiResponses,
+        upstream,
+    );
+    let events = sse_json_events(&client);
+    let completed = events
+        .iter()
+        .find(|ev| ev.get("type").and_then(|t| t.as_str()) == Some("response.completed"))
+        .expect("response.completed");
+    assert_eq!(
+        completed["response"]["usage"]["input_tokens_details"]["cached_tokens"],
+        141123
+    );
+    assert_eq!(completed["response"]["usage"]["input_tokens"], 146050);
+    assert_eq!(completed["response"]["usage"]["output_tokens"], 62);
+    assert_eq!(completed["response"]["usage"]["total_tokens"], 146112);
+}
+
+#[test]
+fn gemini_tool_call_finish_before_usage_keeps_cache_read_in_chat_usage_chunk() {
+    let upstream = br#"data: {"responseId":"resp_g","candidates":[{"content":{"parts":[{"functionCall":{"name":"shell","args":{"command":"echo ok"}}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":146050,"candidatesTokenCount":62,"totalTokenCount":146112,"cachedContentTokenCount":141123}}
+
+"#;
+    let client = transcode(
+        ProtocolSuite::GoogleGemini,
+        ProtocolSuite::OpenAiCompatible,
+        upstream,
+    );
+    let events = sse_json_events(&client);
+    let usage_event = events
+        .iter()
+        .find(|ev| ev.get("usage").is_some())
+        .expect("chat usage chunk");
+    assert_eq!(
+        usage_event["usage"]["prompt_tokens_details"]["cached_tokens"],
+        141123
+    );
+    assert_eq!(usage_event["usage"]["prompt_tokens"], 146050);
+    assert_eq!(usage_event["usage"]["completion_tokens"], 62);
+    assert_eq!(usage_event["usage"]["total_tokens"], 146112);
+}
+
+#[test]
+fn gemini_tool_call_finish_before_usage_keeps_cache_read_in_messages_terminal_delta() {
+    let upstream = br#"data: {"responseId":"resp_g","candidates":[{"content":{"parts":[{"functionCall":{"name":"shell","args":{"command":"echo ok"}}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":146050,"candidatesTokenCount":62,"totalTokenCount":146112,"cachedContentTokenCount":141123}}
+
+"#;
+    let client = transcode(
+        ProtocolSuite::GoogleGemini,
+        ProtocolSuite::AnthropicMessages,
+        upstream,
+    );
+    let events = sse_json_events(&client);
+    let terminal_delta = events
+        .iter()
+        .find(|ev| {
+            ev.get("type").and_then(|t| t.as_str()) == Some("message_delta")
+                && ev["delta"]
+                    .get("stop_reason")
+                    .and_then(|s| s.as_str())
+                    .is_some()
+        })
+        .expect("messages terminal delta");
+    assert_eq!(terminal_delta["usage"]["cache_read_input_tokens"], 141123);
+    assert_eq!(terminal_delta["usage"]["input_tokens"], 4927);
+    assert_eq!(terminal_delta["usage"]["output_tokens"], 62);
+}
