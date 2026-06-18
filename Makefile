@@ -56,12 +56,12 @@ help: ## 显示所有可用目标
 WEBUI_INSTALLED := $(WEBUI_DIR)/node_modules/.package-lock.json
 
 .PHONY: webui-install
-webui-install: ## 安装 webui 依赖(若已安装则跳过,支持首次 make dev/build 一次成功)
+webui-install: ## Install webui dependencies (skip if already installed, so first make dev/build succeeds in one go)
 	@if [ ! -f "$(WEBUI_INSTALLED)" ]; then \
-		echo ">> webui 依赖未就绪,执行: $(NPM) install"; \
+		echo ">> webui deps not ready, running: $(NPM) install"; \
 		cd $(WEBUI_DIR) && $(NPM) install; \
 	else \
-		echo ">> webui 依赖已就绪($(WEBUI_INSTALLED)),跳过 install"; \
+		echo ">> webui deps already installed ($(WEBUI_INSTALLED)), skipping install"; \
 	fi
 
 .PHONY: webui-lint
