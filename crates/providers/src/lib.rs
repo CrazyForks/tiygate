@@ -11,6 +11,7 @@ pub mod oauth;
 pub mod ollama;
 pub mod openai;
 pub mod openai_compatible;
+pub mod openrouter;
 pub mod xai;
 pub mod zenmux;
 pub mod zhipu;

@@ -12,6 +12,7 @@ import moonshotBrand from "@/assets/brand/moonshot.svg?raw";
 import xaiBrand from "@/assets/brand/xai.svg?raw";
 import zhipuBrand from "@/assets/brand/zhipu.svg?raw";
 import ollamaBrand from "@/assets/brand/ollama.svg?raw";
+import openrouterBrand from "@/assets/brand/openrouter.svg?raw";
 import awsBrand from "@/assets/brand/aws.svg?raw";
 import zenmuxBrand from "@/assets/brand/zenmux.svg?raw";
 
@@ -33,6 +34,7 @@ const BRAND_BY_ID: Record<string, string> = {
   xai: xaiBrand,
   zhipu: zhipuBrand,
   ollama: ollamaBrand,
+  openrouter: openrouterBrand,
   bedrock: awsBrand,
   aws: awsBrand,
   zenmux: zenmuxBrand,
