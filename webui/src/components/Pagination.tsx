@@ -51,7 +51,7 @@ export function Pagination({
         <span>{labels.pageSizeLabel}</span>
         <select
           aria-label={labels.pageSizeLabel}
-          className="h-9 rounded-md border border-border bg-surface px-2 text-sm text-text outline-none focus:border-accent"
+          className="h-9 rounded-md border border-border bg-surface px-2 text-sm text-text outline-none focus:border-primary"
           value={limit}
           onChange={(e) => onPageSizeChange(Number(e.target.value))}
         >
@@ -100,7 +100,7 @@ function PageNav({
   const baseBtn =
     "inline-flex h-8 min-w-[2rem] items-center justify-center rounded-md border border-border bg-surface px-2 text-xs text-text transition-colors hover:bg-surface-muted disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-surface";
   const activeBtn =
-    "inline-flex h-8 min-w-[2rem] items-center justify-center rounded-md border border-accent bg-accent/10 px-2 text-xs font-semibold text-accent";
+    "inline-flex h-8 min-w-[2rem] items-center justify-center rounded-md border border-primary bg-primary-soft px-2 text-xs font-semibold text-primary";
   return (
     <div className="flex flex-wrap items-center gap-1">
       <button
@@ -204,7 +204,7 @@ function GotoPage({
         value={draft}
         onChange={(e) => setDraft(e.target.value)}
         onBlur={commit}
-        className="h-8 w-14 rounded-md border border-border bg-surface px-2 text-xs text-text outline-none focus:border-accent tabular-nums"
+        className="h-8 w-14 rounded-md border border-border bg-surface px-2 text-xs text-text outline-none focus:border-primary tabular-nums"
       />
       <button
         type="submit"
