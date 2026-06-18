@@ -62,29 +62,50 @@ tiygate/
 ### Prerequisites
 
 - **Rust 1.88+** (`rustup update stable`)
+- **Node.js 20+** (for building the embedded WebUI)
 - An upstream provider key, e.g. `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`
 
-### Build and run (zero-config bootstrap)
+### Build and run
 
 ```bash
-# Clone and build
 git clone https://github.com/tiylabs/tiygate.git
 cd tiygate
-cargo build --release
-
-# Set a provider key — gateway will auto-detect on first request
-export OPENAI_API_KEY="sk-..."
-
-# Start the gateway (default mode: all-in-one, default port: 8080)
-./target/release/tiygate
 ```
 
-You should see structured JSON logs including `TiyGate AI Gateway v0.1.0` and `Listening on ...`.
+Configure environment variables by copying the template, then fill in the required values:
+
+```bash
+cp .env.example .env
+```
+
+Edit `.env` — the two variables you must set for a working WebUI:
+
+```bash
+# SQLite is the easiest local backend (file is created on first run)
+TIYGATE_DATABASE_URL=sqlite://./tiygate.db?mode=rwc
+
+# Admin API token — the WebUI login screen asks for this exact value
+TIYGATE_ADMIN_TOKEN=dev-admin-token-change-me
+```
+
+See `.env.example` for the full list of knobs (listen address, mode, logging, streaming timeouts, etc.). The server loads `.env` automatically at startup when the `dotenv` feature is on.
+
+Start the gateway with the embedded WebUI:
+
+```bash
+make dev
+```
+
+`make dev` builds the frontend first (so `rust-embed` can embed it), then runs the server with the `webui` feature. The default listen address is `0.0.0.0:3000`.
+
+### Open the Admin Console
+
+Once the server is running, open **`http://localhost:3000/admin/ui`** in your browser. Paste your `TIYGATE_ADMIN_TOKEN` on the login screen to enter the console. From there you can manage providers, routes, API keys, and view analytics.
 
 ### Smoke test
 
 ```bash
-curl -sS http://localhost:8080/v1/chat/completions \
+curl -sS http://localhost:3000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gpt-4o-mini",
@@ -143,7 +164,7 @@ All TiyGate knobs are read from environment variables. Unknown keys are ignored.
 | `TIYGATE_MODE` | `all` | Deployment mode. `all` (data + control in one process), `proxy` (data plane only), `admin` (control plane only). |
 | `TIYGATE_MAX_BODY_BYTES` | `10485760` (10 MiB) | Per-request body size limit for plain text / JSON. |
 | `TIYGATE_MAX_INFLIGHT` | `1024` | Maximum concurrent in-flight requests. Beyond this, additional requests queue and are eventually rejected with `503 + Retry-After`. |
-| `TIYGATE_ROUTING_STRATEGY` | `weighted` | Routing strategy across targets. `weighted` (default §3.4), `priority`, `cooldown`, `latency`. |
+| `TIYGATE_ROUTING_STRATEGY` | `weighted` | Routing strategy across targets. `weighted` (default), `priority`, `cooldown`, `latency`. |
 
 #### Streaming lifecycle (see `crates/server/src/ingress.rs::drive_upstream_stream`)
 
@@ -151,15 +172,6 @@ All TiyGate knobs are read from environment variables. Unknown keys are ignored.
 | --- | --- | --- |
 | `TIYGATE_UPSTREAM_STREAM_IDLE_TIMEOUT_SECS` | `120` | Idle window for upstream streaming responses. If no chunk arrives for this long, the stream is closed with a protocol-native end frame. |
 | `TIYGATE_UPSTREAM_STREAM_TOTAL_TIMEOUT_SECS` | `0` (disabled) | Wall-clock budget for upstream streaming responses. When it elapses, the stream is closed with a protocol-native error frame. Set to `0` to opt out. |
-
-#### Providers — auto-routing on first boot
-
-| Variable | Purpose |
-| --- | --- |
-| `OPENAI_API_KEY` | If set, auto-registers routes for `gpt-4o`, `gpt-4o-mini`, and `gpt-3.5-turbo` pointing at `https://api.openai.com/v1`. |
-| `ANTHROPIC_API_KEY` | If set, auto-registers a route for `claude-sonnet-4-20250514` pointing at `https://api.anthropic.com/v1`. |
-| `OPENAI_COMPATIBLE_BASE_URL` | Base URL of a generic OpenAI-compatible provider (Ollama, vLLM, DeepSeek, Moonshot, etc.). Required for the openai-compatible provider to register. |
-| `OPENAI_COMPATIBLE_API_KEY` | API key for the generic provider above. Defaults to `not-needed` when omitted (suitable for local / unauthenticated endpoints). |
 
 #### Security
 
@@ -176,7 +188,6 @@ All TiyGate knobs are read from environment variables. Unknown keys are ignored.
 
 ### Configuration
 
-- **Zero-config bootstrap**: env vars like `OPENAI_API_KEY` are auto-detected
 - **DB-driven config** (OLTP): provider / route / API key CRUD via Admin API, no restart required
 - **Epoch versioning**: data plane polls for config changes, atomically switches to the new snapshot; in-flight requests keep the old epoch until they finish — no half-old, half-new state mid-request
 - **Secret encryption**: provider keys/tokens are AES-GCM encrypted at rest; the master key is read from `TIYGATE_MASTER_KEY`
@@ -184,6 +195,16 @@ All TiyGate knobs are read from environment variables. Unknown keys are ignored.
 ### Caching
 
 Only **embedding** requests are cached. LLM chat/completion is **not** cached — by design (non-determinism makes response caching value-low and risk-high). The cache is pluggable: process-local LRU by default, Redis shared backend for multi-replica deployments.
+
+### Payload archive to S3
+
+When enabled, a background worker gzip-compresses the full request/response payload detail of each request (8 objects per request — raw body + parsed metadata for each of the 4 hops: client→gateway, gateway→provider, provider→gateway, gateway→client), uploads them to S3-compatible object storage, verifies sha256/size, and then clears the payload text from the database in the same transaction. This keeps the DB lean for high-volume deployments while preserving full replay fidelity.
+
+The Admin Console's request replay feature transparently hydrates archived objects back from S3 on demand (verify → decompress → return), so the user experience is unchanged whether a request's payloads live in the DB or in object storage.
+
+Object lifecycle is decoupled from DB retention — the worker never deletes from S3; use bucket lifecycle policies for expiry.
+
+Set `TIYGATE_PAYLOAD_ARCHIVE_ENABLED=true` and configure the S3 endpoint / credentials in `.env`. Full variable list in `.env.example` (`TIYGATE_PAYLOAD_ARCHIVE_*`).
 
 ### Distributed tracing
 
