@@ -897,6 +897,13 @@ pub struct MessagesStreamEncoder {
     current_kind: Option<&'static str>,
     /// Next content-block index to allocate.
     next_index: usize,
+    /// Last seen usage from an upstream `StreamPart::Usage`. The Anthropic
+    /// streaming protocol carries the final usage on the `message_delta`
+    /// event that also sets `stop_reason`. When `Usage` arrives before
+    /// `Finish` (the common case when upstream puts both on the same chunk),
+    /// the `Finish` handler reuses this usage instead of overwriting it with
+    /// `{output_tokens: 0}` — which would clobber the real token counts.
+    last_usage: Option<Usage>,
 }
 
 impl Default for MessagesStreamEncoder {
@@ -912,6 +919,7 @@ impl MessagesStreamEncoder {
             current_index: None,
             current_kind: None,
             next_index: 0,
+            last_usage: None,
         }
     }
 
@@ -1040,6 +1048,7 @@ impl StreamEncoder for MessagesStreamEncoder {
                 }
             }
             StreamPart::Usage { usage } => {
+                self.last_usage = Some(usage.clone());
                 let mut usage_obj = json!({"output_tokens": usage.completion_tokens});
                 if usage.prompt_tokens > 0 {
                     usage_obj["input_tokens"] = json!(usage.prompt_tokens);
@@ -1070,10 +1079,29 @@ impl StreamEncoder for MessagesStreamEncoder {
                 // Close any open content block before signalling the stop
                 // reason, per the Anthropic streaming contract.
                 let mut out = self.close_block();
+                // Reuse the last seen usage so the terminal `message_delta`
+                // carries real token counts. Without this, a hardcoded
+                // `{output_tokens: 0}` would overwrite the usage emitted by
+                // the preceding `StreamPart::Usage` event.
+                let usage_obj = if let Some(u) = &self.last_usage {
+                    let mut obj = json!({"output_tokens": u.completion_tokens});
+                    if u.prompt_tokens > 0 {
+                        obj["input_tokens"] = json!(u.prompt_tokens);
+                    }
+                    if let Some(cw) = u.cache_write_tokens {
+                        obj["cache_creation_input_tokens"] = json!(cw);
+                    }
+                    if let Some(cr) = u.cache_read_tokens {
+                        obj["cache_read_input_tokens"] = json!(cr);
+                    }
+                    obj
+                } else {
+                    json!({"output_tokens": 0})
+                };
                 let data = json!({
                     "type": "message_delta",
                     "delta": {"stop_reason": stop_reason},
-                    "usage": {"output_tokens": 0},
+                    "usage": usage_obj,
                 });
                 out.push_str(&format!(
                     "event: message_delta\ndata: {}\n\n",
@@ -1764,6 +1792,59 @@ mod tests {
         for variant in variants {
             assert!(encoder.encode_part(variant).is_ok());
         }
+    }
+
+    #[test]
+    fn test_stream_encoder_finish_preserves_usage() {
+        // 回归:OpenAI 兼容上游常将 usage 和 finish_reason 放在同一个 chunk。
+        // 解码器先发 StreamPart::Usage,再发 StreamPart::Finish。
+        // MessagesStreamEncoder 的 Finish handler 之前硬编码
+        // `usage: {output_tokens: 0}`,覆盖了 Usage handler 刚发出的真实
+        // token 计数。客户端取最后一个 message_delta 的 usage,得到 0。
+        // 修复后 Finish 应复用上次看到的 usage。
+        let mut encoder = MessagesStreamEncoder::new();
+
+        // Usage 先到
+        let usage_bytes = encoder
+            .encode_part(&StreamPart::Usage {
+                usage: Usage {
+                    prompt_tokens: 28,
+                    completion_tokens: 45,
+                    total_tokens: 13385,
+                    cache_read_tokens: Some(13312),
+                    ..Default::default()
+                },
+            })
+            .unwrap();
+        let usage_str = String::from_utf8_lossy(&usage_bytes);
+        assert!(
+            usage_str.contains("\"output_tokens\":45"),
+            "Usage event should carry output_tokens=45, got: {}",
+            usage_str
+        );
+
+        // Finish 后到 — 不应覆盖 usage 为 0
+        let finish_bytes = encoder
+            .encode_part(&StreamPart::Finish {
+                reason: FinishReason::ToolCalls,
+            })
+            .unwrap();
+        let finish_str = String::from_utf8_lossy(&finish_bytes);
+        assert!(
+            finish_str.contains("\"output_tokens\":45"),
+            "Finish event must preserve output_tokens=45, got: {}",
+            finish_str
+        );
+        assert!(
+            finish_str.contains("\"stop_reason\":\"tool_use\""),
+            "Finish event must carry stop_reason=tool_use, got: {}",
+            finish_str
+        );
+        assert!(
+            finish_str.contains("\"cache_read_input_tokens\":13312"),
+            "Finish event must preserve cache_read_input_tokens=13312, got: {}",
+            finish_str
+        );
     }
 
     #[test]

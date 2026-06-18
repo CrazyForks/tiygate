@@ -1340,7 +1340,10 @@ impl StreamDecoder for ChatCompletionsStreamDecoder {
                                         self.slot(index).0 = tc_id.to_string();
                                     }
                                 }
-                                let tc_name = tc["function"]["name"].as_str().map(String::from);
+                                let tc_name = tc["function"]["name"]
+                                    .as_str()
+                                    .filter(|s| !s.is_empty())
+                                    .map(String::from);
                                 if let Some(ref n) = tc_name {
                                     self.slot(index).1 = n.clone();
                                 }
@@ -1935,6 +1938,77 @@ mod tests {
         });
         assert_eq!(arg0, Some(("call_a".to_string(), "{\"x\":1}".to_string())));
         assert_eq!(arg1, Some(("call_b".to_string(), "{\"y\":2}".to_string())));
+    }
+
+    #[test]
+    fn test_stream_decoder_tool_call_empty_name_in_arg_deltas() {
+        // 回归:部分 OpenAI 兼容上游(如 GLM)在每个参数 delta 中都带
+        // `name: ""`(空字符串)而非省略 name 字段。解码器必须将空字符串
+        // 视为"无 name"(argument fragment),否则每个 delta 都被当作
+        // opener,导致跨协议编码器为每个碎片创建一个独立的 tool_use block。
+        let mut decoder = ChatCompletionsStreamDecoder::new();
+
+        // 第一个 delta: name="read", arguments="{\""
+        let p1 = decoder
+            .feed(r#"data: {"id":"r1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_x","function":{"name":"read","arguments":"{\""}}]}}]}"#)
+            .unwrap();
+
+        // 第二个 delta: name=""(空), arguments="\"path\""
+        let p2 = decoder
+            .feed(r#"data: {"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_x","function":{"name":"","arguments":"\"path\""}}]}}]}"#)
+            .unwrap();
+
+        // 第一个 delta 应产生 opener(name=Some) + arg fragment(name=None)
+        let openers1: Vec<_> = p1
+            .iter()
+            .filter_map(|p| match p {
+                StreamPart::ToolCallDelta {
+                    name: Some(n),
+                    ..
+                } => Some(n.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            openers1,
+            vec!["read".to_string()],
+            "第一个 delta 应有一个 opener(name=read)"
+        );
+
+        // 第二个 delta 不应产生任何 opener
+        let openers2: Vec<_> = p2
+            .iter()
+            .filter_map(|p| match p {
+                StreamPart::ToolCallDelta {
+                    name: Some(n),
+                    ..
+                } => Some(n.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            openers2.is_empty(),
+            "name=\"\" 的 delta 不应产生 opener,实际产生了: {:?}",
+            openers2
+        );
+
+        // 第二个 delta 应产生一个 argument fragment
+        let args2: Vec<_> = p2
+            .iter()
+            .filter_map(|p| match p {
+                StreamPart::ToolCallDelta {
+                    name: None,
+                    arguments,
+                    ..
+                } => Some(arguments.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            args2,
+            vec!["\"path\"".to_string()],
+            "第二个 delta 应产生一个 argument fragment"
+        );
     }
 
     #[test]
