@@ -488,7 +488,7 @@ impl DbConfigStore {
         let now = chrono::Utc::now().to_rfc3339();
         sqlx::query(
             "INSERT INTO config_epoch (id, epoch, updated_at) VALUES (1, 1, $1) \
-             ON CONFLICT(id) DO UPDATE SET epoch = epoch + 1, updated_at = excluded.updated_at",
+             ON CONFLICT(id) DO UPDATE SET epoch = config_epoch.epoch + 1, updated_at = excluded.updated_at",
         )
         .bind(now)
         .execute(self.pool.any())
