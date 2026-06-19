@@ -21,7 +21,9 @@ use uuid::Uuid;
 
 use tiygate_store::archive::{gzip_decompress, sha256_hex, PayloadArchiveManifest};
 use tiygate_store::config_store::StoreError;
-use tiygate_store::models::{AuthMode, ConfigExport, Provider, Route, RouteTarget};
+use tiygate_store::models::{
+    AuthMode, ConfigExport, ImportSelection, Provider, Route, RouteTarget,
+};
 
 use crate::state::AdminState;
 
@@ -1310,11 +1312,11 @@ async fn circuit_breakers(State(state): State<AdminState>) -> Result<Response, A
 // ---- config export / import ----
 
 /// GET /admin/v1/config/export — serializes all providers, routes,
-/// and api keys into a single JSON bundle. Provider secrets travel
-/// as their on-disk encrypted blobs; the response carries an
-/// `encrypted` flag so the importer knows whether a master key is
-/// required to decode them. A `Content-Disposition` header nudges
-/// browsers into a download flow.
+/// api keys, and settings into a single JSON bundle. Provider and
+/// encrypted-setting secrets travel as their on-disk encrypted
+/// blobs; the response carries an `encrypted` flag so the importer
+/// knows whether a master key is required to decode them. A
+/// `Content-Disposition` header nudges browsers into a download flow.
 async fn export_config(State(state): State<AdminState>) -> Result<Response, AdminError> {
     let bundle = state.store.export_config().await?;
     let body = Json(&bundle);
@@ -1335,10 +1337,16 @@ struct ImportRequest {
     /// ignored otherwise.
     master_key: String,
     config: ConfigExport,
+    /// Operator-selected subset of the bundle. Each vec carries the
+    /// ids (or setting keys) the user explicitly chose to import.
+    /// An empty selection imports nothing — the frontend pre-selects
+    /// new ids and leaves existing ids unchecked by default.
+    #[serde(default)]
+    selection: ImportSelection,
 }
 
-/// POST /admin/v1/config/import — inserts every entity from the
-/// supplied bundle that does not already exist by id. Provider
+/// POST /admin/v1/config/import — upserts every entity the
+/// operator selected from the supplied bundle. Provider and setting
 /// secrets are decrypted with `master_key` and re-encrypted with
 /// this instance's key. Returns an [`ImportReport`] summarizing the
 /// imported / skipped counts.
@@ -1348,7 +1356,7 @@ async fn import_config(
 ) -> Result<Response, AdminError> {
     let report = state
         .store
-        .import_config(&req.config, &req.master_key)
+        .import_config(&req.config, &req.master_key, &req.selection)
         .await?;
     let _ = tiygate_store::audit::record(
         state.pool.as_ref(),
@@ -1363,6 +1371,8 @@ async fn import_config(
             "routes_skipped": report.routes_skipped,
             "api_keys_imported": report.api_keys_imported,
             "api_keys_skipped": report.api_keys_skipped,
+            "settings_imported": report.settings_imported,
+            "settings_skipped": report.settings_skipped,
         }),
     )
     .await;

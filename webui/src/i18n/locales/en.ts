@@ -484,33 +484,51 @@ const en = {
   backup: {
     title: "Backup & Restore",
     subtitle:
-      "Export or import gateway configuration (providers, routes, API keys).",
+      "Export or import gateway configuration (providers, routes, API keys, settings).",
     exportTitle: "Export Backup",
     exportDesc:
-      "Export all configuration from this instance as a JSON file. Provider secrets are exported encrypted; API keys are exported as hashes only.",
+      "Export configuration from this instance as a JSON file. Select which categories to include. Provider secrets are exported encrypted; API keys are exported as hashes only.",
     exportNote:
-      "If the instance has a MASTER_KEY configured, provider secrets are exported encrypted. You will need the same MASTER_KEY to import them.",
+      "If the instance has a MASTER_KEY configured, provider secrets and encrypted settings are exported encrypted. You will need the same MASTER_KEY to import them.",
+    exportScope: "Export Scope",
+    scope: {
+      providers: "Providers",
+      routes: "Routes",
+      api_keys: "API Keys",
+      settings: "Settings",
+    },
     exportBtn: "Export Backup",
     exportSuccess: "Backup exported.",
     importTitle: "Restore Backup",
     importDesc:
-      "Upload an exported JSON file along with the source instance's MASTER_KEY to restore configuration. Items with existing IDs are skipped, not overwritten.",
+      "Upload an exported JSON file, preview its contents, then select which items to restore. Existing items are unchecked by default — check them to overwrite.",
     selectFile: "Select backup file",
     noFileSelected: "No file selected",
     noFile: "Please select a backup file first.",
     invalidFormat:
       "Invalid file format. Please select a backup file exported by TiyGate.",
     fileSummary:
-      "Providers {{providers}} · Routes {{routes}} · API keys {{apiKeys}} · Encrypted: {{encrypted}}",
+      "Providers {{providers}} · Routes {{routes}} · API keys {{apiKeys}} · Settings {{settings}} · Encrypted: {{encrypted}}",
     masterKey: "MASTER_KEY",
     masterKeyHint:
       "The source instance's TIYGATE_MASTER_KEY. Leave blank if the export file is not encrypted.",
-    importBtn: "Restore Backup",
+    importBtn: "Restore Selected",
     importSuccess: "Backup restored.",
     importResultTitle: "Restore Result",
     providersResult: "Providers: imported {{imported}}, skipped {{skipped}}",
     routesResult: "Routes: imported {{imported}}, skipped {{skipped}}",
     apiKeysResult: "API keys: imported {{imported}}, skipped {{skipped}}",
+    settingsResult: "Settings: imported {{imported}}, skipped {{skipped}}",
+    loadingPreview: "Loading current instance data for preview…",
+    previewLoadError: "Failed to load current instance data for preview.",
+    previewHint:
+      "New items are checked by default. Existing items are unchecked — check them to overwrite the current data.",
+    routeTargets: "{{count}} targets",
+    selectedCount: "{{selected}} / {{total}} selected",
+    overwriteBadge: "Overwrite",
+    existsBadge: "Exists",
+    encryptedBadge: "Encrypted",
+    encryptedSetting: "Encrypted value",
   },
   settings: {
     title: "Settings",

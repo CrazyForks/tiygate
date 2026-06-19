@@ -973,6 +973,9 @@ async fn config_import_inserts_and_returns_report() {
             }],
             "routes": [],
             "api_keys": []
+        },
+        "selection": {
+            "providers": ["p-import-test"]
         }
     });
     let resp = router
@@ -1007,6 +1010,8 @@ async fn config_import_skips_existing_ids() {
         .await
         .expect("upsert");
 
+    // The selection does NOT include "p-dup", so the import skips it
+    // and leaves the existing row untouched.
     let import_body = json!({
         "master_key": "",
         "config": {
@@ -1028,7 +1033,8 @@ async fn config_import_skips_existing_ids() {
             }],
             "routes": [],
             "api_keys": []
-        }
+        },
+        "selection": {}
     });
     let resp = router
         .oneshot(json_request("POST", "/admin/v1/config/import", import_body))
@@ -1049,4 +1055,67 @@ async fn config_import_skips_existing_ids() {
         .expect("get")
         .expect("exists");
     assert_eq!(p.name, "Original");
+}
+
+#[tokio::test]
+async fn config_import_overwrites_when_selected() {
+    let (router, store, _pool) = boot_no_auth().await;
+    store
+        .upsert_provider(
+            "p-overwrite",
+            "Original",
+            "openai",
+            "https://api.openai.com/v1",
+            Some("sk-original"),
+            AuthMode::ApiKey,
+            None,
+            json!({}),
+            true,
+        )
+        .await
+        .expect("upsert");
+
+    let import_body = json!({
+        "master_key": "",
+        "config": {
+            "schema_version": 1,
+            "exported_at": "2025-01-01T00:00:00Z",
+            "encrypted": false,
+            "providers": [{
+                "id": "p-overwrite",
+                "name": "Overwritten",
+                "vendor": "openai",
+                "api_base": "https://api.openai.com/v1",
+                "encrypted_api_key": "sk-new",
+                "auth_mode": "api_key",
+                "encrypted_oauth_meta": "",
+                "metadata_json": {},
+                "enabled": true,
+                "created_at": "2025-01-01T00:00:00Z",
+                "updated_at": "2025-01-01T00:00:00Z"
+            }],
+            "routes": [],
+            "api_keys": []
+        },
+        "selection": {
+            "providers": ["p-overwrite"]
+        }
+    });
+    let resp = router
+        .oneshot(json_request("POST", "/admin/v1/config/import", import_body))
+        .await
+        .expect("response");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .expect("body");
+    let report: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(report["providers_imported"], 1);
+
+    let p = store
+        .get_provider("p-overwrite")
+        .await
+        .expect("get")
+        .expect("exists");
+    assert_eq!(p.name, "Overwritten");
 }

@@ -170,6 +170,35 @@ impl Default for ConfigEpoch {
     }
 }
 
+/// A single setting row from the `settings` table, carried in a
+/// config export/import bundle. `encrypted` indicates whether the
+/// `value` is an AES-GCM ciphertext blob (when the source instance
+/// had a master key configured for that key) or plaintext.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportSetting {
+    pub key: String,
+    pub value: String,
+    pub encrypted: bool,
+}
+
+/// Operator-selected subset of an import bundle. Each vec carries
+/// the ids (or setting keys) the user explicitly chose to import.
+/// Items present in the bundle but absent from the selection are
+/// skipped. An empty selection imports nothing — the frontend is
+/// responsible for pre-selecting new ids and leaving existing ids
+/// unchecked by default.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ImportSelection {
+    #[serde(default)]
+    pub providers: Vec<String>,
+    #[serde(default)]
+    pub routes: Vec<String>,
+    #[serde(default)]
+    pub api_keys: Vec<String>,
+    #[serde(default)]
+    pub settings: Vec<String>,
+}
+
 /// A serializable bundle of all configurable entities, used by the
 /// config export / import endpoints. Provider secrets are carried as
 /// their on-disk encrypted blobs; the `encrypted` flag tells the
@@ -189,6 +218,11 @@ pub struct ConfigExport {
     pub providers: Vec<Provider>,
     pub routes: Vec<Route>,
     pub api_keys: Vec<ApiKey>,
+    /// Settings table rows. Absent on exports produced before this
+    /// field was added; `#[serde(default)]` makes old bundles
+    /// deserialize cleanly to an empty vec.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub settings: Vec<ExportSetting>,
 }
 
 /// Summary of an import operation, returned to the caller so the UI
@@ -202,6 +236,8 @@ pub struct ImportReport {
     pub routes_skipped: usize,
     pub api_keys_imported: usize,
     pub api_keys_skipped: usize,
+    pub settings_imported: usize,
+    pub settings_skipped: usize,
 }
 
 /// The full in-memory snapshot used by the data plane. Built from

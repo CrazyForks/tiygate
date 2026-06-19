@@ -355,6 +355,12 @@ export interface ExportApiKey {
   updated_at: string;
 }
 
+export interface ExportSetting {
+  key: string;
+  value: string;
+  encrypted: boolean;
+}
+
 export interface ConfigExport {
   schema_version: number;
   exported_at: string;
@@ -362,6 +368,14 @@ export interface ConfigExport {
   providers: ExportProvider[];
   routes: ExportRoute[];
   api_keys: ExportApiKey[];
+  settings?: ExportSetting[];
+}
+
+export interface ImportSelection {
+  providers: string[];
+  routes: string[];
+  api_keys: string[];
+  settings: string[];
 }
 
 export interface ImportReport {
@@ -371,6 +385,8 @@ export interface ImportReport {
   routes_skipped: number;
   api_keys_imported: number;
   api_keys_skipped: number;
+  settings_imported: number;
+  settings_skipped: number;
 }
 
 // ---- Settings ----

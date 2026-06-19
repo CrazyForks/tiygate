@@ -7,6 +7,7 @@ import type {
   ConfigExport,
   CreateApiKeyResponse,
   ImportReport,
+  ImportSelection,
   OAuthStartResponse,
   OAuthTokenResponse,
   Provider,
@@ -159,10 +160,14 @@ export const serverInfoApi = {
 // ---- config export / import ----
 export const configApi = {
   export: () => apiRequest<ConfigExport>("/config/export"),
-  import: (masterKey: string, config: ConfigExport) =>
+  import: (
+    masterKey: string,
+    config: ConfigExport,
+    selection: ImportSelection,
+  ) =>
     apiRequest<ImportReport>("/config/import", {
       method: "POST",
-      body: { master_key: masterKey, config },
+      body: { master_key: masterKey, config, selection },
     }),
 };
 

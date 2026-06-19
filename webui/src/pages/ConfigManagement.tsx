@@ -1,11 +1,30 @@
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useMutation } from "@tanstack/react-query";
-import { Download, Upload, FileJson, Info } from "lucide-react";
-import { configApi } from "@/api/resources";
-import type { ConfigExport, ImportReport } from "@/api/types";
+import { useMutation, useQuery } from "@tanstack/react-query";
+import {
+  Download,
+  Upload,
+  FileJson,
+  Info,
+  AlertTriangle,
+  CheckCircle2,
+} from "lucide-react";
+import {
+  configApi,
+  providersApi,
+  routesApi,
+  apiKeysApi,
+  settingsApi,
+} from "@/api/resources";
+import type {
+  ConfigExport,
+  ExportSetting,
+  ImportReport,
+  ImportSelection,
+} from "@/api/types";
 import {
   Alert,
+  Badge,
   Button,
   Card,
   CardBody,
@@ -17,20 +36,48 @@ import {
 } from "@/components/ui";
 import { PageHeader } from "@/components/PageHeader";
 
+type ScopeKey = "providers" | "routes" | "api_keys" | "settings";
+
+const ALL_SCOPES: ScopeKey[] = ["providers", "routes", "api_keys", "settings"];
+
+/** A single item shown in the restore preview list. */
+interface PreviewItem {
+  /** Stable identifier within its category (provider/route id or setting key). */
+  id: string;
+  /** Human-readable label (name / virtual_model / key). */
+  label: string;
+  /** Secondary info shown next to the label. */
+  sub: string;
+  /** Whether this id/key already exists in the current instance. */
+  exists: boolean;
+  /** Whether the value is an encrypted blob (settings only). */
+  encrypted: boolean;
+}
+
 export default function ConfigManagement() {
   const { t } = useTranslation();
   const toast = useToast();
 
-  const [masterKey, setMasterKey] = useState("");
-  const [fileName, setFileName] = useState<string | null>(null);
-  const [parsedBackup, setParsedBackup] = useState<ConfigExport | null>(null);
-  const [parseError, setParseError] = useState<string | null>(null);
-  const [restoreResult, setRestoreResult] = useState<ImportReport | null>(null);
+  // --- Export state ---
+  const [exportScope, setExportScope] = useState<Record<ScopeKey, boolean>>({
+    providers: true,
+    routes: true,
+    api_keys: true,
+    settings: true,
+  });
 
   const exportMutation = useMutation({
     mutationFn: () => configApi.export(),
     onSuccess: (bundle) => {
-      const json = JSON.stringify(bundle, null, 2);
+      // Filter the bundle by the selected scopes before downloading.
+      const filtered: ConfigExport = {
+        ...bundle,
+        providers: exportScope.providers ? bundle.providers : [],
+        routes: exportScope.routes ? bundle.routes : [],
+        api_keys: exportScope.api_keys ? bundle.api_keys : [],
+        settings: exportScope.settings ? (bundle.settings ?? []) : [],
+      };
+      const json = JSON.stringify(filtered, null, 2);
       const blob = new Blob([json], { type: "application/json" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
@@ -48,26 +95,127 @@ export default function ConfigManagement() {
     },
   });
 
-  const restoreMutation = useMutation({
-    mutationFn: () => {
-      if (!parsedBackup) {
-        throw new Error(t("backup.noFile"));
-      }
-      return configApi.import(masterKey, parsedBackup);
+  // --- Restore state ---
+  const [masterKey, setMasterKey] = useState("");
+  const [fileName, setFileName] = useState<string | null>(null);
+  const [parsedBackup, setParsedBackup] = useState<ConfigExport | null>(null);
+  const [parseError, setParseError] = useState<string | null>(null);
+  const [restoreResult, setRestoreResult] = useState<ImportReport | null>(null);
+  // Per-item checkbox state, keyed by `"<scope>:<id>"`.
+  const [checked, setChecked] = useState<Record<string, boolean>>({});
+
+  // Fetch the current instance's existing ids/keys so we can mark
+  // existing items and default them to unchecked. This only runs
+  // when a backup file has been parsed.
+  const existingQuery = useQuery({
+    queryKey: ["config-restore-existing"],
+    queryFn: async () => {
+      const [providers, routes, apiKeys, settingsResp] = await Promise.all([
+        providersApi.list(),
+        routesApi.list(),
+        apiKeysApi.list(),
+        settingsApi.list(),
+      ]);
+      return {
+        providerIds: new Set(providers.map((p) => p.id)),
+        routeIds: new Set(routes.map((r) => r.id)),
+        apiKeyIds: new Set(apiKeys.map((k) => k.id)),
+        settingKeys: new Set(Object.keys(settingsResp.settings)),
+      };
     },
-    onSuccess: (report) => {
-      setRestoreResult(report);
-      toast.success(t("backup.importSuccess"));
-      // Reset the form so the operator cannot accidentally re-import
-      // the same file.
-      setParsedBackup(null);
-      setFileName(null);
-      setMasterKey("");
-    },
-    onError: (e: Error) => {
-      toast.error(e.message);
-    },
+    enabled: parsedBackup !== null,
   });
+
+  // Build the preview items grouped by category. Recomputed when the
+  // parsed backup or the existing-id set changes.
+  const preview = useMemo(() => {
+    if (!parsedBackup) return null;
+    const existing = existingQuery.data;
+    const buildItems = (
+      entries: {
+        id: string;
+        label: string;
+        sub: string;
+        encrypted?: boolean;
+      }[],
+      existingIds: Set<string> | undefined,
+    ): PreviewItem[] =>
+      entries.map((e) => ({
+        id: e.id,
+        label: e.label,
+        sub: e.sub,
+        encrypted: e.encrypted ?? false,
+        exists: existingIds?.has(e.id) ?? false,
+      }));
+    return {
+      providers: buildItems(
+        parsedBackup.providers.map((p) => ({
+          id: p.id,
+          label: p.name,
+          sub: `${p.vendor} · ${p.api_base}`,
+        })),
+        existing?.providerIds,
+      ),
+      routes: buildItems(
+        parsedBackup.routes.map((r) => ({
+          id: r.id,
+          label: r.virtual_model,
+          sub: t("backup.routeTargets", { count: r.targets.length }),
+        })),
+        existing?.routeIds,
+      ),
+      api_keys: buildItems(
+        parsedBackup.api_keys.map((k) => ({
+          id: k.id,
+          label: k.name,
+          sub: k.status,
+        })),
+        existing?.apiKeyIds,
+      ),
+      settings: buildItems(
+        (parsedBackup.settings ?? []).map((s: ExportSetting) => ({
+          id: s.key,
+          label: s.key,
+          sub: s.encrypted ? t("backup.encryptedSetting") : s.value,
+          encrypted: s.encrypted,
+        })),
+        existing?.settingKeys,
+      ),
+    };
+  }, [parsedBackup, existingQuery.data, t]);
+
+  // Initialize checkbox defaults when preview becomes available:
+  // existing items default unchecked, new items default checked.
+  // Runs as an effect (not during render) so StrictMode double-invocation
+  // and re-renders do not silently overwrite the user's manual toggles.
+  const previewReady = parsedBackup !== null && existingQuery.isSuccess;
+  useEffect(() => {
+    if (!previewReady || !preview) return;
+    const next: Record<string, boolean> = {};
+    for (const scope of ALL_SCOPES) {
+      for (const item of preview[scope]) {
+        next[`${scope}:${item.id}`] = !item.exists;
+      }
+    }
+    setChecked(next);
+    // Seed exactly once per parsed backup + existing-id snapshot.
+  }, [previewReady, preview]);
+
+  function toggleItem(scope: ScopeKey, id: string) {
+    const key = `${scope}:${id}`;
+    setChecked((prev) => ({ ...prev, [key]: !prev[key] }));
+  }
+
+  function toggleAll(scope: ScopeKey, value: boolean) {
+    if (!preview) return;
+    setChecked((prev) => {
+      const next = { ...prev };
+      for (const item of preview[scope]) {
+        next[`${scope}:${item.id}`] = value;
+      }
+      return next;
+    });
+  }
 
   function handleFileChange(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
@@ -75,11 +223,13 @@ export default function ConfigManagement() {
       setParsedBackup(null);
       setFileName(null);
       setParseError(null);
+      setChecked({});
       return;
     }
     setFileName(file.name);
     setParseError(null);
     setRestoreResult(null);
+    setChecked({});
     const reader = new FileReader();
     reader.onload = () => {
       try {
@@ -95,6 +245,10 @@ export default function ConfigManagement() {
           setParsedBackup(null);
           return;
         }
+        // Normalize optional settings to an array.
+        if (!Array.isArray(parsed.settings)) {
+          parsed.settings = [];
+        }
         setParsedBackup(parsed);
       } catch {
         setParseError(t("backup.invalidFormat"));
@@ -106,6 +260,126 @@ export default function ConfigManagement() {
       setParsedBackup(null);
     };
     reader.readAsText(file);
+  }
+
+  function buildSelection(): ImportSelection {
+    if (!preview) {
+      return { providers: [], routes: [], api_keys: [], settings: [] };
+    }
+    const sel: ImportSelection = {
+      providers: [],
+      routes: [],
+      api_keys: [],
+      settings: [],
+    };
+    for (const scope of ALL_SCOPES) {
+      for (const item of preview[scope]) {
+        if (checked[`${scope}:${item.id}`]) {
+          sel[scope].push(item.id);
+        }
+      }
+    }
+    return sel;
+  }
+
+  const hasAnyChecked = Object.values(checked).some(Boolean);
+
+  const restoreMutation = useMutation({
+    mutationFn: () => {
+      if (!parsedBackup) {
+        throw new Error(t("backup.noFile"));
+      }
+      const selection = buildSelection();
+      return configApi.import(masterKey, parsedBackup, selection);
+    },
+    onSuccess: (report) => {
+      setRestoreResult(report);
+      toast.success(t("backup.importSuccess"));
+      setParsedBackup(null);
+      setFileName(null);
+      setMasterKey("");
+      setChecked({});
+    },
+    onError: (e: Error) => {
+      toast.error(e.message);
+    },
+  });
+
+  function renderPreviewGroup(
+    scope: ScopeKey,
+    title: string,
+    items: PreviewItem[],
+  ) {
+    if (items.length === 0) return null;
+    const checkedCount = items.filter(
+      (i) => checked[`${scope}:${i.id}`],
+    ).length;
+    return (
+      <div className="space-y-1.5">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <label className="flex cursor-pointer items-center gap-1.5 text-sm font-medium text-text">
+              <input
+                type="checkbox"
+                className="h-4 w-4 rounded border-border-strong accent-primary"
+                checked={checkedCount === items.length}
+                ref={(el) => {
+                  if (el)
+                    el.indeterminate =
+                      checkedCount > 0 && checkedCount < items.length;
+                }}
+                onChange={(e) => toggleAll(scope, e.target.checked)}
+              />
+              {title}
+            </label>
+            <Badge tone="neutral">{items.length}</Badge>
+          </div>
+          <span className="text-xs text-text-muted">
+            {t("backup.selectedCount", {
+              selected: checkedCount,
+              total: items.length,
+            })}
+          </span>
+        </div>
+        <div className="max-h-48 space-y-1 overflow-y-auto rounded-sm border border-border bg-surface-muted">
+          {items.map((item) => {
+            const key = `${scope}:${item.id}`;
+            const isChecked = checked[key] ?? false;
+            return (
+              <label
+                key={key}
+                className="flex cursor-pointer items-start gap-2 px-3 py-1.5 text-xs hover:bg-surface"
+              >
+                <input
+                  type="checkbox"
+                  className="mt-0.5 h-4 w-4 rounded border-border-strong accent-primary"
+                  checked={isChecked}
+                  onChange={() => toggleItem(scope, item.id)}
+                />
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2">
+                    <span className="truncate font-medium text-text">
+                      {item.label}
+                    </span>
+                    {item.exists && (
+                      <Badge tone={isChecked ? "warning" : "neutral"}>
+                        {isChecked
+                          ? t("backup.overwriteBadge")
+                          : t("backup.existsBadge")}
+                      </Badge>
+                    )}
+                    {item.encrypted && (
+                      <Badge tone="info">{t("backup.encryptedBadge")}</Badge>
+                    )}
+                  </div>
+                  <div className="truncate text-text-muted">{item.sub}</div>
+                </div>
+              </label>
+            );
+          })}
+        </div>
+      </div>
+    );
   }
 
   return (
@@ -120,19 +394,43 @@ export default function ConfigManagement() {
         <Card>
           <CardHeader title={t("backup.exportTitle")} />
           <CardBody className="space-y-4">
-            <p className="text-sm text-text-muted">
-              {t("backup.exportDesc")}
-            </p>
+            <p className="text-sm text-text-muted">{t("backup.exportDesc")}</p>
             <Alert tone="info">
               <div className="flex items-start gap-2">
                 <Info size={16} className="mt-0.5 shrink-0" />
                 <span>{t("backup.exportNote")}</span>
               </div>
             </Alert>
+            <Field label={t("backup.exportScope")}>
+              <div className="flex flex-wrap gap-4">
+                {ALL_SCOPES.map((scope) => (
+                  <label
+                    key={scope}
+                    className="flex cursor-pointer items-center gap-2 text-sm text-text"
+                  >
+                    <input
+                      type="checkbox"
+                      className="h-4 w-4 rounded border-border-strong accent-primary"
+                      checked={exportScope[scope]}
+                      onChange={(e) =>
+                        setExportScope((prev) => ({
+                          ...prev,
+                          [scope]: e.target.checked,
+                        }))
+                      }
+                    />
+                    {t(`backup.scope.${scope}`)}
+                  </label>
+                ))}
+              </div>
+            </Field>
             <Button
               variant="primary"
               onClick={() => exportMutation.mutate()}
-              disabled={exportMutation.isPending}
+              disabled={
+                exportMutation.isPending ||
+                !Object.values(exportScope).some(Boolean)
+              }
             >
               <Download size={16} />
               {exportMutation.isPending
@@ -146,9 +444,7 @@ export default function ConfigManagement() {
         <Card>
           <CardHeader title={t("backup.importTitle")} />
           <CardBody className="space-y-4">
-            <p className="text-sm text-text-muted">
-              {t("backup.importDesc")}
-            </p>
+            <p className="text-sm text-text-muted">{t("backup.importDesc")}</p>
 
             <Field label={t("backup.selectFile")}>
               <label className="flex cursor-pointer items-center gap-2 rounded-sm border border-dashed border-border-strong bg-surface px-3 py-2 text-sm text-text-muted transition-colors hover:border-primary hover:text-text">
@@ -173,10 +469,54 @@ export default function ConfigManagement() {
                   providers: parsedBackup.providers.length,
                   routes: parsedBackup.routes.length,
                   apiKeys: parsedBackup.api_keys.length,
+                  settings: parsedBackup.settings?.length ?? 0,
                   encrypted: parsedBackup.encrypted
                     ? t("common.yes")
                     : t("common.no"),
                 })}
+              </div>
+            )}
+
+            {/* Preview panel */}
+            {parsedBackup && existingQuery.isLoading && (
+              <p className="text-xs text-text-muted">
+                {t("backup.loadingPreview")}
+              </p>
+            )}
+            {parsedBackup && existingQuery.isError && (
+              <ErrorBox message={t("backup.previewLoadError")} />
+            )}
+            {parsedBackup && preview && existingQuery.isSuccess && (
+              <div className="space-y-3">
+                <div className="flex items-start gap-2 rounded-sm border border-border bg-surface px-3 py-2">
+                  <AlertTriangle
+                    size={14}
+                    className="mt-0.5 shrink-0 text-warning"
+                  />
+                  <p className="text-xs text-text-muted">
+                    {t("backup.previewHint")}
+                  </p>
+                </div>
+                {renderPreviewGroup(
+                  "providers",
+                  t("backup.scope.providers"),
+                  preview.providers,
+                )}
+                {renderPreviewGroup(
+                  "routes",
+                  t("backup.scope.routes"),
+                  preview.routes,
+                )}
+                {renderPreviewGroup(
+                  "api_keys",
+                  t("backup.scope.api_keys"),
+                  preview.api_keys,
+                )}
+                {renderPreviewGroup(
+                  "settings",
+                  t("backup.scope.settings"),
+                  preview.settings,
+                )}
               </div>
             )}
 
@@ -199,6 +539,7 @@ export default function ConfigManagement() {
               disabled={
                 restoreMutation.isPending ||
                 !parsedBackup ||
+                !hasAnyChecked ||
                 (parsedBackup?.encrypted && !masterKey)
               }
             >
@@ -210,9 +551,12 @@ export default function ConfigManagement() {
 
             {restoreResult && (
               <div className="space-y-2 rounded-sm border border-border bg-surface-muted px-3 py-2">
-                <p className="text-sm font-medium text-text">
-                  {t("backup.importResultTitle")}
-                </p>
+                <div className="flex items-center gap-2">
+                  <CheckCircle2 size={16} className="text-success" />
+                  <p className="text-sm font-medium text-text">
+                    {t("backup.importResultTitle")}
+                  </p>
+                </div>
                 <ul className="space-y-1 text-xs text-text-muted">
                   <li>
                     {t("backup.providersResult", {
@@ -230,6 +574,12 @@ export default function ConfigManagement() {
                     {t("backup.apiKeysResult", {
                       imported: restoreResult.api_keys_imported,
                       skipped: restoreResult.api_keys_skipped,
+                    })}
+                  </li>
+                  <li>
+                    {t("backup.settingsResult", {
+                      imported: restoreResult.settings_imported,
+                      skipped: restoreResult.settings_skipped,
                     })}
                   </li>
                 </ul>

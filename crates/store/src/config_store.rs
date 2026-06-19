@@ -26,9 +26,10 @@ use crate::db::DbPool;
 use crate::encryption::KeyEncryption;
 use crate::keys;
 use crate::models::{
-    ApiKey, ApiKeyStatus, AuthMode, ConfigEpoch, ConfigExport, ConfigSnapshot, ImportReport,
-    Provider, Route, RouteTarget,
+    ApiKey, ApiKeyStatus, AuthMode, ConfigEpoch, ConfigExport, ConfigSnapshot, ExportSetting,
+    ImportReport, ImportSelection, Provider, Route, RouteTarget,
 };
+use crate::settings_keys::is_encrypted_key;
 
 /// Convenience error for store operations.
 #[derive(Debug, Error)]
@@ -969,6 +970,19 @@ impl DbConfigStore {
         }
         let routes = self.load_routes().await?;
         let api_keys = self.list_api_keys().await?;
+        // Read the settings table. Each row is tagged with whether it
+        // is an encrypted key so the importer knows whether the value
+        // is a ciphertext blob that needs the source master key.
+        let settings = self
+            .list_settings()
+            .await?
+            .into_iter()
+            .map(|(key, value)| ExportSetting {
+                encrypted: is_encrypted_key(&key),
+                key,
+                value,
+            })
+            .collect();
         Ok(ConfigExport {
             schema_version: 1,
             exported_at: chrono::Utc::now().to_rfc3339(),
@@ -976,23 +990,27 @@ impl DbConfigStore {
             providers,
             routes,
             api_keys,
+            settings,
         })
     }
 
     /// Import a config bundle produced by [`Self::export_config`].
-    /// Each entity is inserted only when its id does not already
-    /// exist (`INSERT … ON CONFLICT(id) DO NOTHING`); existing rows
-    /// are left untouched. Provider secrets are decrypted with the
+    /// Only items whose id/key appears in `selection` are touched;
+    /// everything else is skipped. Selected items are upserted — an
+    /// existing row with the same id is overwritten, a new id is
+    /// inserted. Provider and OAuth secrets are decrypted with the
     /// supplied `master_key` (the source instance's key) and
     /// re-encrypted with this instance's key before insertion. When
     /// the export was produced without a master key (`encrypted ==
-    /// false`), provider secret columns hold cleartext and are
-    /// encrypted directly. The whole import runs in a single
-    /// transaction that rolls back on any failure.
+    /// false`), secret columns hold cleartext and are encrypted
+    /// directly. Encrypted settings are handled the same way. The
+    /// whole import runs in a single transaction that rolls back on
+    /// any failure.
     pub async fn import_config(
         &self,
         data: &ConfigExport,
         master_key: &str,
+        selection: &ImportSelection,
     ) -> Result<ImportReport, StoreError> {
         // Guard against a future incompatible export format. The
         // exporter currently emits `1`; bumping the version on the
@@ -1020,6 +1038,16 @@ impl DbConfigStore {
             None
         };
 
+        // Pre-compute selection membership sets for O(1) lookup.
+        let sel_providers: std::collections::HashSet<&str> =
+            selection.providers.iter().map(String::as_str).collect();
+        let sel_routes: std::collections::HashSet<&str> =
+            selection.routes.iter().map(String::as_str).collect();
+        let sel_api_keys: std::collections::HashSet<&str> =
+            selection.api_keys.iter().map(String::as_str).collect();
+        let sel_settings: std::collections::HashSet<&str> =
+            selection.settings.iter().map(String::as_str).collect();
+
         let mut tx = self.pool.any().begin().await?;
         let mut report = ImportReport {
             providers_imported: 0,
@@ -1028,9 +1056,15 @@ impl DbConfigStore {
             routes_skipped: 0,
             api_keys_imported: 0,
             api_keys_skipped: 0,
+            settings_imported: 0,
+            settings_skipped: 0,
         };
 
         for p in &data.providers {
+            if !sel_providers.contains(p.id.as_str()) {
+                report.providers_skipped += 1;
+                continue;
+            }
             // Re-encrypt provider secrets so they are readable by
             // this instance. When the source had encryption, decrypt
             // with the source key first; otherwise the column holds
@@ -1067,11 +1101,19 @@ impl DbConfigStore {
             let enabled_int: i32 = if p.enabled { 1 } else { 0 };
             let created_at = p.created_at.to_rfc3339();
             let updated_at = chrono::Utc::now().to_rfc3339();
-            let res = sqlx::query(
+            // Upsert: overwrite an existing row with the same id so
+            // the operator's explicit "overwrite" selection takes
+            // effect.
+            sqlx::query(
                 "INSERT INTO providers (id, name, vendor, api_base, encrypted_api_key, auth_mode, \
                  encrypted_oauth_meta, metadata_json, enabled, created_at, updated_at) \
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
-                 ON CONFLICT(id) DO NOTHING",
+                 ON CONFLICT(id) DO UPDATE SET \
+                    name=excluded.name, vendor=excluded.vendor, api_base=excluded.api_base, \
+                    encrypted_api_key=excluded.encrypted_api_key, auth_mode=excluded.auth_mode, \
+                    encrypted_oauth_meta=excluded.encrypted_oauth_meta, \
+                    metadata_json=excluded.metadata_json, \
+                    enabled=excluded.enabled, updated_at=excluded.updated_at",
             )
             .bind(&p.id)
             .bind(&p.name)
@@ -1086,24 +1128,27 @@ impl DbConfigStore {
             .bind(&updated_at)
             .execute(&mut *tx)
             .await?;
-            if res.rows_affected() == 1 {
-                report.providers_imported += 1;
-            } else {
-                report.providers_skipped += 1;
-            }
+            report.providers_imported += 1;
         }
 
         for r in &data.routes {
+            if !sel_routes.contains(r.id.as_str()) {
+                report.routes_skipped += 1;
+                continue;
+            }
             let targets_json = serde_json::to_string(&r.targets)?;
             let strategy_str = r.routing_strategy.map(|s| s.as_str());
             let enabled_int: i32 = if r.enabled { 1 } else { 0 };
             let created_at = r.created_at.to_rfc3339();
             let updated_at = chrono::Utc::now().to_rfc3339();
-            let res = sqlx::query(
+            sqlx::query(
                 "INSERT INTO routes (id, virtual_model, targets_json, routing_strategy, enabled, \
                  created_at, updated_at) \
                  VALUES ($1, $2, $3, $4, $5, $6, $7) \
-                 ON CONFLICT(id) DO NOTHING",
+                 ON CONFLICT(id) DO UPDATE SET \
+                    virtual_model=excluded.virtual_model, targets_json=excluded.targets_json, \
+                    routing_strategy=excluded.routing_strategy, \
+                    enabled=excluded.enabled, updated_at=excluded.updated_at",
             )
             .bind(&r.id)
             .bind(&r.virtual_model)
@@ -1114,11 +1159,7 @@ impl DbConfigStore {
             .bind(&updated_at)
             .execute(&mut *tx)
             .await?;
-            if res.rows_affected() == 1 {
-                report.routes_imported += 1;
-            } else {
-                report.routes_skipped += 1;
-            }
+            report.routes_imported += 1;
         }
 
         // The api_keys table has a UNIQUE constraint on key_hash in
@@ -1128,6 +1169,10 @@ impl DbConfigStore {
         // rows rather than letting the INSERT fail and roll back the
         // whole transaction.
         for k in &data.api_keys {
+            if !sel_api_keys.contains(k.id.as_str()) {
+                report.api_keys_skipped += 1;
+                continue;
+            }
             let existing_hash: Option<(String,)> =
                 sqlx::query_as("SELECT key_hash FROM api_keys WHERE key_hash = $1")
                     .bind(&k.key_hash)
@@ -1140,9 +1185,14 @@ impl DbConfigStore {
             let quota_str = serde_json::to_string(&k.quota_json)?;
             let created_at = k.created_at.to_rfc3339();
             let updated_at = chrono::Utc::now().to_rfc3339();
-            let res = sqlx::query(
+            // Upsert by id: overwrite when the operator explicitly
+            // selected an existing id.
+            sqlx::query(
                 "INSERT INTO api_keys (id, name, key_hash, quota_json, status, created_at, \
-                 updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT(id) DO NOTHING",
+                 updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                    name=excluded.name, key_hash=excluded.key_hash, quota_json=excluded.quota_json, \
+                    status=excluded.status, updated_at=excluded.updated_at",
             )
             .bind(&k.id)
             .bind(&k.name)
@@ -1153,11 +1203,56 @@ impl DbConfigStore {
             .bind(&updated_at)
             .execute(&mut *tx)
             .await?;
-            if res.rows_affected() == 1 {
-                report.api_keys_imported += 1;
-            } else {
-                report.api_keys_skipped += 1;
+            report.api_keys_imported += 1;
+        }
+
+        // Settings: re-encrypt encrypted rows with this instance's
+        // key (decrypting with the source key first when the export
+        // was encrypted), and store plain rows verbatim.
+        for s in &data.settings {
+            if !sel_settings.contains(s.key.as_str()) {
+                report.settings_skipped += 1;
+                continue;
             }
+            if s.encrypted {
+                // Decrypt the source ciphertext blob, then re-encrypt
+                // with this instance's key. When the export was not
+                // encrypted, the value is already cleartext.
+                let plain = match &source_enc {
+                    Some(src) => keys::decrypt_settings(src, &s.value)
+                        .map_err(|e| StoreError::Decrypt(e.to_string()))?,
+                    None => s.value.clone(),
+                };
+                let stored = match self.encryption.as_ref() {
+                    Some(enc) => keys::encrypt_settings(enc, &plain)
+                        .map_err(|e| StoreError::Decrypt(e.to_string()))?,
+                    None => plain,
+                };
+                let now = chrono::Utc::now().to_rfc3339();
+                sqlx::query(
+                    "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, $3) \
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value, \
+                     updated_at = excluded.updated_at",
+                )
+                .bind(&s.key)
+                .bind(&stored)
+                .bind(&now)
+                .execute(&mut *tx)
+                .await?;
+            } else {
+                let now = chrono::Utc::now().to_rfc3339();
+                sqlx::query(
+                    "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, $3) \
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value, \
+                     updated_at = excluded.updated_at",
+                )
+                .bind(&s.key)
+                .bind(&s.value)
+                .bind(&now)
+                .execute(&mut *tx)
+                .await?;
+            }
+            report.settings_imported += 1;
         }
 
         tx.commit().await?;
@@ -1712,9 +1807,20 @@ mod tests {
             ],
             routes: vec![],
             api_keys: vec![],
+            settings: vec![],
         };
 
-        let report = store.import_config(&bundle, "").await.expect("import");
+        // Select only the new provider; the existing one stays
+        // untouched (matching the old skip-on-conflict behaviour
+        // for a default-unchecked existing id).
+        let selection = ImportSelection {
+            providers: vec!["p-new".to_string()],
+            ..Default::default()
+        };
+        let report = store
+            .import_config(&bundle, "", &selection)
+            .await
+            .expect("import");
         assert_eq!(report.providers_imported, 1);
         assert_eq!(report.providers_skipped, 1);
 
@@ -1772,8 +1878,13 @@ mod tests {
         let key_b = KeyEncryption::from_secret(&key_b_hex).expect("key B");
         let target_store = boot_store(Some(Arc::new(key_b))).await;
 
+        // Select the provider for import.
+        let selection = ImportSelection {
+            providers: vec!["p-enc".to_string()],
+            ..Default::default()
+        };
         let report = target_store
-            .import_config(&bundle, &master_key_hex())
+            .import_config(&bundle, &master_key_hex(), &selection)
             .await
             .expect("import");
         assert_eq!(report.providers_imported, 1);
@@ -1803,8 +1914,11 @@ mod tests {
             providers: vec![],
             routes: vec![],
             api_keys: vec![],
+            settings: vec![],
         };
-        let err = store.import_config(&bundle, "").await;
+        let err = store
+            .import_config(&bundle, "", &ImportSelection::default())
+            .await;
         assert!(
             matches!(err, Err(StoreError::Invalid(_))),
             "encrypted export without master key must be rejected"
@@ -1837,11 +1951,208 @@ mod tests {
                 created_at: now,
                 updated_at: now,
             }],
+            settings: vec![],
         };
 
-        let report = store.import_config(&bundle, "").await.expect("import");
+        let selection = ImportSelection {
+            api_keys: vec!["imported-key".to_string()],
+            ..Default::default()
+        };
+        let report = store
+            .import_config(&bundle, "", &selection)
+            .await
+            .expect("import");
         assert_eq!(report.api_keys_imported, 0);
         assert_eq!(report.api_keys_skipped, 1);
+    }
+
+    #[tokio::test]
+    async fn import_config_overwrites_existing_provider_when_selected() {
+        let store = boot_store(None).await;
+        store
+            .upsert_provider(
+                "p-dup",
+                "Original",
+                "openai",
+                "https://api.openai.com/v1",
+                Some("sk-old"),
+                AuthMode::ApiKey,
+                None,
+                serde_json::json!({}),
+                true,
+            )
+            .await
+            .expect("upsert existing provider");
+
+        let now = chrono::Utc::now();
+        let bundle = ConfigExport {
+            schema_version: 1,
+            exported_at: now.to_rfc3339(),
+            encrypted: false,
+            providers: vec![Provider {
+                id: "p-dup".into(),
+                name: "Overwritten".into(),
+                vendor: "openai".into(),
+                api_base: "https://api.openai.com/v1".into(),
+                encrypted_api_key: "sk-new".into(),
+                auth_mode: AuthMode::ApiKey,
+                encrypted_oauth_meta: String::new(),
+                metadata_json: serde_json::json!({}),
+                enabled: true,
+                created_at: now,
+                updated_at: now,
+                api_key_cleartext: None,
+            }],
+            routes: vec![],
+            api_keys: vec![],
+            settings: vec![],
+        };
+
+        // Explicitly select the existing id → upsert overwrites it.
+        let selection = ImportSelection {
+            providers: vec!["p-dup".to_string()],
+            ..Default::default()
+        };
+        let report = store
+            .import_config(&bundle, "", &selection)
+            .await
+            .expect("import");
+        assert_eq!(report.providers_imported, 1);
+        assert_eq!(report.providers_skipped, 0);
+
+        let p = store
+            .get_provider("p-dup")
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(p.name, "Overwritten");
+    }
+
+    #[tokio::test]
+    async fn import_config_empty_selection_imports_nothing() {
+        let store = boot_store(None).await;
+        let now = chrono::Utc::now();
+        let bundle = ConfigExport {
+            schema_version: 1,
+            exported_at: now.to_rfc3339(),
+            encrypted: false,
+            providers: vec![Provider {
+                id: "p-x".into(),
+                name: "X".into(),
+                vendor: "openai".into(),
+                api_base: "https://api.openai.com/v1".into(),
+                encrypted_api_key: "sk-x".into(),
+                auth_mode: AuthMode::ApiKey,
+                encrypted_oauth_meta: String::new(),
+                metadata_json: serde_json::json!({}),
+                enabled: true,
+                created_at: now,
+                updated_at: now,
+                api_key_cleartext: None,
+            }],
+            routes: vec![],
+            api_keys: vec![],
+            settings: vec![],
+        };
+
+        let report = store
+            .import_config(&bundle, "", &ImportSelection::default())
+            .await
+            .expect("import");
+        assert_eq!(report.providers_imported, 0);
+        assert_eq!(report.providers_skipped, 1);
+        assert!(store.get_provider("p-x").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn export_then_import_round_trips_plain_settings() {
+        let store = boot_store(None).await;
+        store
+            .set_setting("gateway.test.plain", "hello")
+            .await
+            .expect("set");
+
+        let bundle = store.export_config().await.expect("export");
+        assert_eq!(bundle.settings.len(), 1);
+        let s = &bundle.settings[0];
+        assert_eq!(s.key, "gateway.test.plain");
+        assert_eq!(s.value, "hello");
+        assert!(!s.encrypted);
+
+        // Wipe and re-import.
+        let pool = crate::db::open_pool("sqlite::memory:").await.expect("pool");
+        crate::db::run_migrations(&pool).await.expect("migrate");
+        let target = DbConfigStore::new(pool, None);
+        target.refresh().await.expect("refresh");
+        let selection = ImportSelection {
+            settings: vec!["gateway.test.plain".to_string()],
+            ..Default::default()
+        };
+        let report = target
+            .import_config(&bundle, "", &selection)
+            .await
+            .expect("import");
+        assert_eq!(report.settings_imported, 1);
+        assert_eq!(report.settings_skipped, 0);
+        assert_eq!(
+            target
+                .get_setting("gateway.test.plain")
+                .await
+                .expect("get")
+                .expect("present"),
+            "hello"
+        );
+    }
+
+    #[tokio::test]
+    async fn export_then_import_round_trips_encrypted_settings() {
+        let source = settings_store().await;
+        let key = "gateway.archive.s3_secret_access_key";
+        source
+            .set_setting_encrypted(key, "super-secret")
+            .await
+            .expect("encrypt+set");
+
+        let bundle = source.export_config().await.expect("export");
+        let s = bundle
+            .settings
+            .iter()
+            .find(|s| s.key == key)
+            .expect("encrypted setting present");
+        assert!(s.encrypted);
+        assert_ne!(s.value, "super-secret");
+
+        // Target with a different master key.
+        let pool = crate::db::open_pool("sqlite::memory:").await.expect("pool");
+        crate::db::run_migrations(&pool).await.expect("migrate");
+        let mut b = [0u8; 32];
+        for (i, slot) in b.iter_mut().enumerate() {
+            *slot = (i as u8).wrapping_add(99);
+        }
+        let target_enc = Arc::new(crate::encryption::KeyEncryption::from_bytes(b));
+        let target = DbConfigStore::new(pool, Some(target_enc));
+        target.refresh().await.expect("refresh");
+
+        // Decrypt with the source master key, re-encrypt with target key.
+        let source_key_hex: String = (0..32u8)
+            .map(|i| format!("{:02x}", i.wrapping_add(7)))
+            .collect();
+        let selection = ImportSelection {
+            settings: vec![key.to_string()],
+            ..Default::default()
+        };
+        let report = target
+            .import_config(&bundle, &source_key_hex, &selection)
+            .await
+            .expect("import");
+        assert_eq!(report.settings_imported, 1);
+
+        let decrypted = target
+            .get_setting_encrypted(key)
+            .await
+            .expect("decrypt")
+            .expect("present");
+        assert_eq!(decrypted, "super-secret");
     }
 
     // --- Settings CRUD + encryption tests ---
