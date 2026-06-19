@@ -129,28 +129,37 @@ impl App {
             "TiyGate initialized",
         );
 
-        let (payload_archive_client, payload_archive_handle) = build_payload_archive(
-            &server_config,
-            control_plane.as_ref().map(|cp| cp.pool.clone()),
-        );
+        let (payload_archive_client, payload_archive_handle) = match &control_plane {
+            Some(cp) => {
+                // Bootstrap settings from env on first start, then
+                // spawn the settings-driven archive worker.
+                bootstrap_settings(&cp.store, &server_config).await;
+                let handle =
+                    tiygate_store::archive::spawn_from_store(cp.pool.clone(), cp.store.clone());
+                // Build a one-time S3 client for the admin replay
+                // path. The worker owns its own internally-rebuilt
+                // client; this client is used only by the admin
+                // replay handler to fetch archived payloads. If the
+                // archive config is incomplete or disabled the
+                // client is `None` and replay falls back to the DB.
+                let replay_client = build_admin_archive_client(&cp.store).await;
+                (replay_client, Some(handle))
+            }
+            None => (None, None),
+        };
 
         // Spawn the epoch polling task and the log retention
         // task when the control plane is active. The epoch poll
         // rewrites the DbConfigStore's inner ConfigStore on every
         // admin write, so the data plane sees changes within
-        // `EpochPollConfig.interval` seconds.
+        // the configured poll interval seconds.
         let (epoch_poll, retention, token_stats) = match &control_plane {
             Some(cp) => {
                 let pool = cp.pool.clone();
                 let store = cp.store.clone();
-                let retention_cfg = tiygate_store::retention::RetentionConfig::from_env();
-                let retention_handle = tiygate_store::retention::spawn(pool.clone(), retention_cfg);
-                let epoch_handle = tiygate_store::retention::spawn_epoch_poll(
-                    store,
-                    tiygate_store::retention::EpochPollConfig::from_env(),
-                );
-                let token_stats_cfg = tiygate_store::token_stats::TokenStatsConfig::from_env();
-                let token_stats_handle = tiygate_store::token_stats::spawn(pool, token_stats_cfg);
+                let retention_handle = tiygate_store::retention::spawn(pool.clone(), store.clone());
+                let epoch_handle = tiygate_store::retention::spawn_epoch_poll(store.clone());
+                let token_stats_handle = tiygate_store::token_stats::spawn(pool, store);
                 (
                     Some(epoch_handle),
                     Some(retention_handle),
@@ -250,66 +259,291 @@ impl App {
     }
 }
 
-fn build_payload_archive(
-    cfg: &ServerConfig,
-    pool: Option<Arc<tiygate_store::db::DbPool>>,
-) -> (
-    Option<Arc<dyn tiygate_store::archive::PayloadArchiveClient>>,
-    Option<tiygate_store::archive::PayloadArchiveHandle>,
-) {
-    let archive_cfg = &cfg.payload_archive;
-    if !archive_cfg.enabled {
-        return (None, None);
+/// Seed the `settings` table from the env-derived `ServerConfig`
+/// on first start. For each migratable key, if the setting is
+/// absent in the DB the env value is written so the gateway
+/// starts with the operator's existing configuration. Subsequent
+/// runtime changes go through the admin API and persist in the
+/// `settings` table; env changes are only re-read if the table is
+/// cleared.
+///
+/// Sensitive S3 credentials are written through
+/// [`DbConfigStore::set_setting_encrypted`] so they are encrypted
+/// at rest with the master key.
+async fn bootstrap_settings(store: &Arc<DbConfigStore>, cfg: &ServerConfig) {
+    use tiygate_store::settings_keys as sk;
+
+    // Retention
+    let _ = ensure_setting(
+        store,
+        sk::RETENTION_INTERVAL_SECS,
+        &cfg_retention_interval_secs().to_string(),
+    )
+    .await;
+    let _ = ensure_setting(
+        store,
+        sk::RETENTION_LOG_RETENTION_DAYS,
+        &env_or("TIYGATE_LOG_RETENTION_DAYS", "30"),
+    )
+    .await;
+
+    // Epoch poll
+    let _ = ensure_setting(
+        store,
+        sk::EPOCH_POLL_INTERVAL_SECS,
+        &env_or("TIYGATE_EPOCH_POLL_INTERVAL_SECS", "2"),
+    )
+    .await;
+
+    // Token stats
+    let _ = ensure_setting(
+        store,
+        sk::TOKEN_STATS_INTERVAL_SECS,
+        &env_or("TIYGATE_TOKEN_STATS_INTERVAL_SECS", "300"),
+    )
+    .await;
+    let _ = ensure_setting(
+        store,
+        sk::TOKEN_STATS_LOOKBACK_DAYS,
+        &env_or("TIYGATE_TOKEN_STATS_LOOKBACK_DAYS", "400"),
+    )
+    .await;
+
+    // Payload archive
+    let archive = &cfg.payload_archive;
+    let _ = ensure_setting(store, sk::ARCHIVE_ENABLED, &archive.enabled.to_string()).await;
+    let _ = ensure_setting_opt(store, sk::ARCHIVE_S3_ENDPOINT, &archive.s3_endpoint).await;
+    let _ = ensure_setting(store, sk::ARCHIVE_S3_REGION, &archive.s3_region).await;
+    let _ = ensure_setting_opt(store, sk::ARCHIVE_S3_BUCKET, &archive.s3_bucket).await;
+    let _ = ensure_setting(store, sk::ARCHIVE_S3_PREFIX, &archive.s3_prefix).await;
+    let _ = ensure_setting(
+        store,
+        sk::ARCHIVE_S3_FORCE_PATH_STYLE,
+        &archive.s3_force_path_style.to_string(),
+    )
+    .await;
+    let _ = ensure_setting(
+        store,
+        sk::ARCHIVE_SCAN_INTERVAL_SECS,
+        &archive.scan_interval_secs.to_string(),
+    )
+    .await;
+    let _ = ensure_setting(
+        store,
+        sk::ARCHIVE_BATCH_SIZE,
+        &archive.batch_size.to_string(),
+    )
+    .await;
+    let _ = ensure_setting(
+        store,
+        sk::ARCHIVE_CONCURRENCY,
+        &archive.concurrency.to_string(),
+    )
+    .await;
+    let _ = ensure_setting(
+        store,
+        sk::ARCHIVE_TIMEOUT_SECS,
+        &archive.timeout_secs.to_string(),
+    )
+    .await;
+    let _ = ensure_setting(
+        store,
+        sk::ARCHIVE_MAX_RETRIES,
+        &archive.max_retries.to_string(),
+    )
+    .await;
+    // Encrypted S3 credentials — only seed when present in env.
+    if let Some(ak) = &archive.s3_access_key_id {
+        if store
+            .get_setting(sk::ARCHIVE_S3_ACCESS_KEY_ID)
+            .await
+            .ok()
+            .flatten()
+            .is_none()
+        {
+            let _ = store
+                .set_setting_encrypted(sk::ARCHIVE_S3_ACCESS_KEY_ID, ak)
+                .await;
+        }
     }
-    let Some(pool) = pool else {
-        warn!(
-            "payload archive enabled but control plane DB is unavailable; archive worker disabled"
-        );
-        return (None, None);
-    };
-    if !archive_cfg.is_complete() {
-        warn!(
-            "payload archive enabled but S3 configuration is incomplete; archive worker disabled"
-        );
-        return (None, None);
+    if let Some(sk_key) = &archive.s3_secret_access_key {
+        if store
+            .get_setting(sk::ARCHIVE_S3_SECRET_ACCESS_KEY)
+            .await
+            .ok()
+            .flatten()
+            .is_none()
+        {
+            let _ = store
+                .set_setting_encrypted(sk::ARCHIVE_S3_SECRET_ACCESS_KEY, sk_key)
+                .await;
+        }
     }
-    let Some(endpoint) = archive_cfg.s3_endpoint.clone() else {
-        return (None, None);
-    };
-    let Some(bucket) = archive_cfg.s3_bucket.clone() else {
-        return (None, None);
-    };
-    let Some(access_key_id) = archive_cfg.s3_access_key_id.clone() else {
-        return (None, None);
-    };
-    let Some(secret_access_key) = archive_cfg.s3_secret_access_key.clone() else {
-        return (None, None);
-    };
-    let client = match tiygate_store::archive::S3ArchiveClient::new(
+
+    // Routing
+    let _ = ensure_setting(
+        store,
+        sk::ROUTING_DEFAULT_STRATEGY,
+        cfg.routing_strategy.as_str(),
+    )
+    .await;
+
+    // Ingress
+    let _ = ensure_setting(
+        store,
+        sk::INGRESS_MAX_BODY_BYTES,
+        &cfg.max_request_body_bytes.to_string(),
+    )
+    .await;
+    let _ = ensure_setting(
+        store,
+        sk::INGRESS_MAX_INFLIGHT,
+        &cfg.max_inflight_requests.to_string(),
+    )
+    .await;
+    let _ = ensure_setting(
+        store,
+        sk::INGRESS_MAX_QUEUE_DEPTH,
+        &cfg.max_queue_depth.to_string(),
+    )
+    .await;
+    let _ = ensure_setting(
+        store,
+        sk::INGRESS_ACQUIRE_TIMEOUT_SECS,
+        &cfg.acquire_timeout_secs.to_string(),
+    )
+    .await;
+    let _ = ensure_setting(
+        store,
+        sk::INGRESS_RAW_ENVELOPE_CAPTURE_MEDIA,
+        &cfg.raw_envelope_capture_media.to_string(),
+    )
+    .await;
+
+    // Upstream
+    let _ = ensure_setting(
+        store,
+        sk::UPSTREAM_STREAM_IDLE_TIMEOUT_SECS,
+        &cfg.upstream_stream_idle_timeout_secs.to_string(),
+    )
+    .await;
+    let _ = ensure_setting(
+        store,
+        sk::UPSTREAM_STREAM_TOTAL_TIMEOUT_SECS,
+        &cfg.upstream_stream_total_timeout_secs.to_string(),
+    )
+    .await;
+    let _ = ensure_setting(
+        store,
+        sk::UPSTREAM_TCP_KEEPALIVE_SECS,
+        &cfg.upstream_tcp_keepalive_secs.to_string(),
+    )
+    .await;
+    let _ = ensure_setting(
+        store,
+        sk::UPSTREAM_POOL_IDLE_TIMEOUT_SECS,
+        &cfg.upstream_pool_idle_timeout_secs.to_string(),
+    )
+    .await;
+    let _ = ensure_setting(
+        store,
+        sk::UPSTREAM_TCP_NODELAY,
+        &cfg.upstream_tcp_nodelay.to_string(),
+    )
+    .await;
+
+    // Forward header deny lists
+    let _ = ensure_setting(
+        store,
+        sk::FORWARD_REQUEST_HEADER_DENY,
+        &cfg.forward_request_header_deny_extra.join(","),
+    )
+    .await;
+    let _ = ensure_setting(
+        store,
+        sk::FORWARD_RESPONSE_HEADER_DENY,
+        &cfg.forward_response_header_deny_extra.join(","),
+    )
+    .await;
+
+    tracing::info!("settings table bootstrapped from env defaults");
+}
+
+/// Write `value` to `key` only when the setting is currently
+/// absent. Existing settings are never overwritten by bootstrap.
+async fn ensure_setting(store: &DbConfigStore, key: &str, value: &str) {
+    if store.get_setting(key).await.ok().flatten().is_none() {
+        let _ = store.set_setting(key, value).await;
+    }
+}
+
+/// Like [`ensure_setting`] but for optional values — an empty
+/// `None` writes an empty string so the key exists.
+async fn ensure_setting_opt(store: &DbConfigStore, key: &str, value: &Option<String>) {
+    if store.get_setting(key).await.ok().flatten().is_none() {
+        let _ = store.set_setting(key, value.as_deref().unwrap_or("")).await;
+    }
+}
+
+/// Read an env var or return the default.
+fn env_or(key: &str, default: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+/// Compute the retention interval from env, mirroring the legacy
+/// `RetentionConfig::from_env` default logic.
+fn cfg_retention_interval_secs() -> u64 {
+    env_or("TIYGATE_LOG_RETENTION_INTERVAL_SECS", "3600")
+        .parse()
+        .unwrap_or(3600)
+}
+
+/// Build a one-time `S3ArchiveClient` from the current settings
+/// table for the admin replay path. Returns `None` when archiving is
+/// disabled or the S3 config is incomplete. The worker owns its own
+/// internally-rebuilt client for uploads; this client is only used
+/// by `hydrate_archived_replay` to fetch already-archived payloads.
+async fn build_admin_archive_client(
+    store: &Arc<DbConfigStore>,
+) -> Option<Arc<dyn tiygate_store::archive::PayloadArchiveClient>> {
+    use tiygate_store::settings_keys as sk;
+    let enabled = sk::get_bool(store.as_ref(), sk::ARCHIVE_ENABLED, false).await;
+    if !enabled {
+        return None;
+    }
+    let endpoint = sk::get_opt_string(store.as_ref(), sk::ARCHIVE_S3_ENDPOINT).await?;
+    let bucket = sk::get_opt_string(store.as_ref(), sk::ARCHIVE_S3_BUCKET).await?;
+    let access_key_id = store
+        .get_setting_encrypted(sk::ARCHIVE_S3_ACCESS_KEY_ID)
+        .await
+        .ok()
+        .flatten()?;
+    let secret_access_key = store
+        .get_setting_encrypted(sk::ARCHIVE_S3_SECRET_ACCESS_KEY)
+        .await
+        .ok()
+        .flatten()?;
+    let region = sk::get_string(store.as_ref(), sk::ARCHIVE_S3_REGION, "us-east-1").await;
+    let prefix = sk::get_string(store.as_ref(), sk::ARCHIVE_S3_PREFIX, "").await;
+    let force_path_style =
+        sk::get_bool(store.as_ref(), sk::ARCHIVE_S3_FORCE_PATH_STYLE, true).await;
+    let timeout_secs = sk::get_u64(store.as_ref(), sk::ARCHIVE_TIMEOUT_SECS, 30).await;
+    match tiygate_store::archive::S3ArchiveClient::new(
         endpoint,
-        archive_cfg.s3_region.clone(),
+        region,
         bucket,
-        tiygate_store::archive::normalize_prefix(&archive_cfg.s3_prefix),
-        archive_cfg.s3_force_path_style,
+        tiygate_store::archive::normalize_prefix(&prefix),
+        force_path_style,
         access_key_id,
         secret_access_key,
-        archive_cfg.timeout_secs,
+        timeout_secs,
     ) {
-        Ok(client) => Arc::new(client) as Arc<dyn tiygate_store::archive::PayloadArchiveClient>,
+        Ok(c) => Some(Arc::new(c) as Arc<dyn tiygate_store::archive::PayloadArchiveClient>),
         Err(e) => {
-            warn!(error = %e, "payload archive client init failed; archive worker disabled");
-            return (None, None);
+            warn!(error = %e, "failed to build admin archive replay client");
+            None
         }
-    };
-    let worker_cfg = tiygate_store::archive::PayloadArchiveWorkerConfig {
-        interval: std::time::Duration::from_secs(archive_cfg.scan_interval_secs.max(1)),
-        batch_size: archive_cfg.batch_size.max(1),
-        concurrency: archive_cfg.concurrency.max(1),
-        max_retries: archive_cfg.max_retries.max(1),
-        stale_after: std::time::Duration::from_secs(archive_cfg.timeout_secs.max(1) * 2),
-    };
-    let handle = tiygate_store::archive::spawn(pool, client.clone(), worker_cfg);
-    (Some(client), Some(handle))
+    }
 }
 
 /// Open the DB pool (if `TIYGATE_DATABASE_URL` is set), run

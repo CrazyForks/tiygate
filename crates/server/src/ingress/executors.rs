@@ -108,7 +108,11 @@ pub(super) async fn execute_upstream(
     //
     // First merge forwardable client request headers (denylist policy),
     // then apply auth so gateway-injected credentials always win.
-    merge_client_headers(client_headers, &mut upstream_headers, &state.header_policy);
+    merge_client_headers(
+        client_headers,
+        &mut upstream_headers,
+        &state.tunables().header_policy,
+    );
     apply_provider_auth(target, &mut upstream_headers).await?;
 
     // Capture the egress request (headers + body) for the request-log
@@ -127,7 +131,7 @@ pub(super) async fn execute_upstream(
         serde_json::to_string(&upstream_body).ok()
     };
 
-    let client = &state.http_client;
+    let client = &state.tunables().http_client;
     // Address the upstream by the *egress* protocol (the target provider's
     // protocol), not the ingress entrypoint. When a chat-completions request
     // is routed to an Anthropic provider, the body is converted above and
@@ -251,7 +255,7 @@ pub(super) async fn execute_upstream(
 
         let forwarded_resp_headers = forwarded_resp_headers_for_capture(
             &upstream_resp_headers_capture,
-            &state.header_policy,
+            &state.tunables().header_policy,
             request_id,
         );
         let upstream_resp_headers_for_forward = upstream_resp_headers_capture.clone();
@@ -261,8 +265,8 @@ pub(super) async fn execute_upstream(
             response,
             end_marker,
             error_marker,
-            Duration::from_secs(state.upstream_stream_idle_timeout_secs),
-            Duration::from_secs(state.upstream_stream_total_timeout_secs),
+            Duration::from_secs(state.tunables().upstream_stream_idle_timeout_secs),
+            Duration::from_secs(state.tunables().upstream_stream_total_timeout_secs),
             DEFAULT_SSE_KEEPALIVE_INTERVAL,
             Some(StreamCapture {
                 request_id: request_id.to_string(),
@@ -281,7 +285,7 @@ pub(super) async fn execute_upstream(
         forward_upstream_resp_headers(
             &mut response,
             &upstream_resp_headers_for_forward,
-            &state.header_policy,
+            &state.tunables().header_policy,
             request_id,
         );
         // Passthrough Retry-After if present
@@ -417,7 +421,7 @@ pub(super) async fn execute_upstream(
         forward_upstream_resp_headers(
             &mut response,
             &upstream_resp_headers_capture,
-            &state.header_policy,
+            &state.tunables().header_policy,
             request_id,
         );
         if let Some(ra) = retry_after {
@@ -530,7 +534,11 @@ pub(super) async fn execute_messages_upstream(
     //
     // Merge forwardable client request headers first, then auth so
     // gateway-injected credentials always win.
-    merge_client_headers(client_headers, &mut upstream_headers, &state.header_policy);
+    merge_client_headers(
+        client_headers,
+        &mut upstream_headers,
+        &state.tunables().header_policy,
+    );
     apply_provider_auth(target, &mut upstream_headers).await?;
 
     // Capture egress request (headers + body) for the detail view.
@@ -540,7 +548,7 @@ pub(super) async fn execute_messages_upstream(
         serde_json::to_string(&upstream_body).ok()
     };
 
-    let client = &state.http_client;
+    let client = &state.tunables().http_client;
     // Address the upstream by the *egress* protocol, not the ingress
     // entrypoint. A `/v1/messages` request routed to an OpenAI provider is
     // converted above and must be POSTed to `/chat/completions`. Gemini
@@ -643,7 +651,7 @@ pub(super) async fn execute_messages_upstream(
 
         let forwarded_resp_headers = forwarded_resp_headers_for_capture(
             &upstream_resp_headers_capture,
-            &state.header_policy,
+            &state.tunables().header_policy,
             request_id,
         );
         let upstream_resp_headers_for_forward = upstream_resp_headers_capture.clone();
@@ -653,8 +661,8 @@ pub(super) async fn execute_messages_upstream(
             response,
             end_marker,
             error_marker,
-            Duration::from_secs(state.upstream_stream_idle_timeout_secs),
-            Duration::from_secs(state.upstream_stream_total_timeout_secs),
+            Duration::from_secs(state.tunables().upstream_stream_idle_timeout_secs),
+            Duration::from_secs(state.tunables().upstream_stream_total_timeout_secs),
             DEFAULT_SSE_KEEPALIVE_INTERVAL,
             Some(StreamCapture {
                 request_id: request_id.to_string(),
@@ -673,7 +681,7 @@ pub(super) async fn execute_messages_upstream(
         forward_upstream_resp_headers(
             &mut response,
             &upstream_resp_headers_for_forward,
-            &state.header_policy,
+            &state.tunables().header_policy,
             request_id,
         );
         if let Some(ra) = retry_after {
@@ -791,7 +799,7 @@ pub(super) async fn execute_messages_upstream(
         forward_upstream_resp_headers(
             &mut response,
             &upstream_resp_headers_capture,
-            &state.header_policy,
+            &state.tunables().header_policy,
             request_id,
         );
         if let Some(ra) = retry_after {
@@ -977,21 +985,28 @@ pub(super) async fn execute_embeddings_upstream(
         })?;
 
     override_model_in_body(&mut upstream_body, &target.model_id);
-    merge_client_headers(client_headers, &mut upstream_headers, &state.header_policy);
+    merge_client_headers(
+        client_headers,
+        &mut upstream_headers,
+        &state.tunables().header_policy,
+    );
     apply_provider_auth(target, &mut upstream_headers).await?;
 
     let egress_body_capture = serde_json::to_string(&upstream_body).ok();
     let req_id_capture = request_id.to_string();
 
     let upstream_url = format!("{}/embeddings", target.effective_api_base());
-    let builder =
-        crate::ingress::observability::inject_trace(state.http_client.post(&upstream_url), trace)
-            .headers(upstream_headers)
-            .json(&upstream_body);
+    let builder = crate::ingress::observability::inject_trace(
+        state.tunables().http_client.post(&upstream_url),
+        trace,
+    )
+    .headers(upstream_headers)
+    .json(&upstream_body);
     let (req, egress_headers_capture, egress_method, egress_path) =
         crate::ingress::observability::finalize_egress(builder)?;
     let exec_started = std::time::Instant::now();
     let response = state
+        .tunables()
         .http_client
         .execute(req)
         .await
@@ -1042,7 +1057,7 @@ pub(super) async fn execute_embeddings_upstream(
     forward_upstream_resp_headers(
         &mut resp,
         &upstream_resp_headers_capture,
-        &state.header_policy,
+        &state.tunables().header_policy,
         &req_id_capture,
     );
     spawn_capture(
@@ -1130,7 +1145,11 @@ pub(super) async fn execute_responses_upstream(
     let model_was_overridden = override_model_in_body(&mut upstream_body, &target.model_id);
     maybe_inject_prompt_cache_key(&mut upstream_body, &egress_protocol.suite, api_key_id);
     let pass_through_verbatim = is_pass_through && !model_was_overridden;
-    merge_client_headers(client_headers, &mut upstream_headers, &state.header_policy);
+    merge_client_headers(
+        client_headers,
+        &mut upstream_headers,
+        &state.tunables().header_policy,
+    );
     apply_provider_auth(target, &mut upstream_headers).await?;
 
     let egress_body_capture = if pass_through_verbatim {
@@ -1158,6 +1177,7 @@ pub(super) async fn execute_responses_upstream(
     if is_stream {
         let mut stream_req = crate::ingress::observability::inject_trace(
             state
+                .tunables()
                 .http_client
                 .post(&upstream_url)
                 .headers(upstream_headers)
@@ -1178,10 +1198,12 @@ pub(super) async fn execute_responses_upstream(
         let (egress_req, egress_headers_capture, egress_method, egress_path) =
             crate::ingress::observability::finalize_egress(stream_req)?;
         let exec_started = std::time::Instant::now();
-        let response =
-            state.http_client.execute(egress_req).await.map_err(|e| {
-                AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {e}"))
-            })?;
+        let response = state
+            .tunables()
+            .http_client
+            .execute(egress_req)
+            .await
+            .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {e}")))?;
         let ttfb_ms = Some(exec_started.elapsed().as_millis() as u64);
         let retry_after = extract_retry_after(response.headers());
         let status = response.status();
@@ -1233,8 +1255,8 @@ pub(super) async fn execute_responses_upstream(
             response,
             end_marker,
             error_marker,
-            Duration::from_secs(state.upstream_stream_idle_timeout_secs),
-            Duration::from_secs(state.upstream_stream_total_timeout_secs),
+            Duration::from_secs(state.tunables().upstream_stream_idle_timeout_secs),
+            Duration::from_secs(state.tunables().upstream_stream_total_timeout_secs),
             DEFAULT_SSE_KEEPALIVE_INTERVAL,
             Some(StreamCapture {
                 request_id: req_id_capture.clone(),
@@ -1247,7 +1269,7 @@ pub(super) async fn execute_responses_upstream(
                 upstream_resp_headers: upstream_resp_headers_capture.clone(),
                 client_resp_headers: forwarded_resp_headers_for_capture(
                     &upstream_resp_headers_capture,
-                    &state.header_policy,
+                    &state.tunables().header_policy,
                     &req_id_capture,
                 ),
             }),
@@ -1256,7 +1278,7 @@ pub(super) async fn execute_responses_upstream(
         forward_upstream_resp_headers(
             &mut response,
             &upstream_resp_headers_capture,
-            &state.header_policy,
+            &state.tunables().header_policy,
             &req_id_capture,
         );
         if let Some(ra) = retry_after {
@@ -1278,6 +1300,7 @@ pub(super) async fn execute_responses_upstream(
     // Non-streaming path
     let mut nonstream_req = crate::ingress::observability::inject_trace(
         state
+            .tunables()
             .http_client
             .post(&upstream_url)
             .headers(upstream_headers),
@@ -1298,6 +1321,7 @@ pub(super) async fn execute_responses_upstream(
         crate::ingress::observability::finalize_egress(nonstream_req)?;
     let exec_started = std::time::Instant::now();
     let response = state
+        .tunables()
         .http_client
         .execute(egress_req)
         .await
@@ -1371,7 +1395,7 @@ pub(super) async fn execute_responses_upstream(
     forward_upstream_resp_headers(
         &mut resp,
         &upstream_resp_headers_capture,
-        &state.header_policy,
+        &state.tunables().header_policy,
         &req_id_capture,
     );
     if let Some(ra) = retry_after {
@@ -1491,7 +1515,11 @@ pub(super) async fn execute_gemini_upstream(
     let model_was_overridden = override_model_in_body(&mut upstream_body, &target.model_id);
     maybe_inject_prompt_cache_key(&mut upstream_body, &egress_protocol.suite, api_key_id);
     let pass_through_verbatim = is_pass_through && !model_was_overridden;
-    merge_client_headers(client_headers, &mut upstream_headers, &state.header_policy);
+    merge_client_headers(
+        client_headers,
+        &mut upstream_headers,
+        &state.tunables().header_policy,
+    );
     apply_provider_auth(target, &mut upstream_headers).await?;
 
     let egress_body_capture = if pass_through_verbatim {
@@ -1519,6 +1547,7 @@ pub(super) async fn execute_gemini_upstream(
     if is_stream {
         let mut stream_req = crate::ingress::observability::inject_trace(
             state
+                .tunables()
                 .http_client
                 .post(&upstream_url)
                 .headers(upstream_headers),
@@ -1538,10 +1567,12 @@ pub(super) async fn execute_gemini_upstream(
         let (egress_req, egress_headers_capture, egress_method, egress_path) =
             crate::ingress::observability::finalize_egress(stream_req)?;
         let exec_started = std::time::Instant::now();
-        let response =
-            state.http_client.execute(egress_req).await.map_err(|e| {
-                AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {e}"))
-            })?;
+        let response = state
+            .tunables()
+            .http_client
+            .execute(egress_req)
+            .await
+            .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {e}")))?;
         let ttfb_ms = Some(exec_started.elapsed().as_millis() as u64);
         let retry_after = extract_retry_after(response.headers());
         let status = response.status();
@@ -1593,8 +1624,8 @@ pub(super) async fn execute_gemini_upstream(
             response,
             end_marker,
             error_marker,
-            Duration::from_secs(state.upstream_stream_idle_timeout_secs),
-            Duration::from_secs(state.upstream_stream_total_timeout_secs),
+            Duration::from_secs(state.tunables().upstream_stream_idle_timeout_secs),
+            Duration::from_secs(state.tunables().upstream_stream_total_timeout_secs),
             DEFAULT_SSE_KEEPALIVE_INTERVAL,
             Some(StreamCapture {
                 request_id: req_id_capture.clone(),
@@ -1607,7 +1638,7 @@ pub(super) async fn execute_gemini_upstream(
                 upstream_resp_headers: upstream_resp_headers_capture.clone(),
                 client_resp_headers: forwarded_resp_headers_for_capture(
                     &upstream_resp_headers_capture,
-                    &state.header_policy,
+                    &state.tunables().header_policy,
                     &req_id_capture,
                 ),
             }),
@@ -1616,7 +1647,7 @@ pub(super) async fn execute_gemini_upstream(
         forward_upstream_resp_headers(
             &mut response,
             &upstream_resp_headers_capture,
-            &state.header_policy,
+            &state.tunables().header_policy,
             &req_id_capture,
         );
         if let Some(ra) = retry_after {
@@ -1638,6 +1669,7 @@ pub(super) async fn execute_gemini_upstream(
     // Non-streaming path
     let mut nonstream_req = crate::ingress::observability::inject_trace(
         state
+            .tunables()
             .http_client
             .post(&upstream_url)
             .headers(upstream_headers),
@@ -1658,6 +1690,7 @@ pub(super) async fn execute_gemini_upstream(
         crate::ingress::observability::finalize_egress(nonstream_req)?;
     let exec_started = std::time::Instant::now();
     let response = state
+        .tunables()
         .http_client
         .execute(egress_req)
         .await
@@ -1731,7 +1764,7 @@ pub(super) async fn execute_gemini_upstream(
     forward_upstream_resp_headers(
         &mut resp,
         &upstream_resp_headers_capture,
-        &state.header_policy,
+        &state.tunables().header_policy,
         &req_id_capture,
     );
     if let Some(ra) = retry_after {

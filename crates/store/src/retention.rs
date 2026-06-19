@@ -12,7 +12,9 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
+use crate::config_store::DbConfigStore;
 use crate::db::DbPool;
+use crate::settings_keys;
 
 #[derive(Clone)]
 pub struct RetentionConfig {
@@ -52,7 +54,6 @@ impl RetentionConfig {
 /// Handle for the spawned retention task.
 pub struct RetentionHandle {
     handle: JoinHandle<()>,
-    config: RetentionConfig,
 }
 
 impl RetentionHandle {
@@ -61,32 +62,47 @@ impl RetentionHandle {
         self.handle.abort();
         let _ = self.handle.await;
     }
-
-    pub fn config(&self) -> &RetentionConfig {
-        &self.config
-    }
 }
 
 /// Spawn a background task that periodically deletes log rows
-/// older than `config.retention_days` from `request_logs`.
-pub fn spawn(pool: Arc<DbPool>, config: RetentionConfig) -> RetentionHandle {
+/// older than the configured retention threshold. Both the interval
+/// and the retention-days threshold are read from the `settings`
+/// table on every loop iteration, so an operator can change them
+/// at runtime through the admin API without restarting the gateway.
+///
+/// The env-derived [`RetentionConfig`] is used only as the fallback
+/// default when a setting is absent (e.g. before bootstrap has run).
+pub fn spawn(pool: Arc<DbPool>, store: Arc<DbConfigStore>) -> RetentionHandle {
+    let fallback = RetentionConfig::from_env();
     let handle = tokio::spawn(async move {
-        if config.retention_days == 0 {
-            info!("log retention disabled (log_retention_days = 0)");
-            return;
-        }
-        let mut tick = tokio::time::interval(config.interval);
-        // The first tick fires immediately; that's a feature — we
-        // want startup-time cleanup for catch-up after a long
-        // downtime.
         loop {
-            tick.tick().await;
-            if let Err(e) = cleanup_once(pool.as_ref(), config.retention_days).await {
+            // Read the current retention threshold each iteration.
+            let retention_days = settings_keys::get_u64(
+                store.as_ref(),
+                settings_keys::RETENTION_LOG_RETENTION_DAYS,
+                fallback.retention_days as u64,
+            )
+            .await as u32;
+            let interval_secs = settings_keys::get_u64(
+                store.as_ref(),
+                settings_keys::RETENTION_INTERVAL_SECS,
+                fallback.interval.as_secs(),
+            )
+            .await;
+            if retention_days == 0 {
+                info!("log retention disabled (log_retention_days = 0)");
+                // Keep polling so a future settings change can
+                // re-enable cleanup without a restart.
+                tokio::time::sleep(Duration::from_secs(interval_secs.max(1))).await;
+                continue;
+            }
+            if let Err(e) = cleanup_once(pool.as_ref(), retention_days).await {
                 warn!(error = %e, "log retention cleanup failed");
             }
+            tokio::time::sleep(Duration::from_secs(interval_secs.max(1))).await;
         }
     });
-    RetentionHandle { handle, config }
+    RetentionHandle { handle }
 }
 
 /// Run a single cleanup pass. Public so tests can call it without
@@ -167,11 +183,21 @@ mod tests {
     #[tokio::test]
     async fn spawn_handle_stops_cleanly() {
         let pool = in_mem_pool().await;
-        let cfg = RetentionConfig {
-            interval: Duration::from_millis(50),
-            retention_days: 30,
-        };
-        let handle = spawn(pool.clone(), cfg);
+        let store = Arc::new(crate::config_store::DbConfigStore::new(
+            (*pool).clone(),
+            None,
+        ));
+        // Set a short interval and disable cleanup so the task is
+        // idle but alive.
+        store
+            .set_setting(settings_keys::RETENTION_INTERVAL_SECS, "1")
+            .await
+            .expect("set interval");
+        store
+            .set_setting(settings_keys::RETENTION_LOG_RETENTION_DAYS, "0")
+            .await
+            .expect("set days");
+        let handle = spawn(pool.clone(), store);
         tokio::time::sleep(Duration::from_millis(120)).await;
         handle.stop().await;
     }
@@ -223,19 +249,24 @@ impl EpochPollHandle {
 }
 
 /// Spawn a background task that polls `config_epoch` and refreshes
-/// the in-memory snapshot whenever the epoch advances.
-pub fn spawn_epoch_poll(
-    store: Arc<crate::config_store::DbConfigStore>,
-    config: EpochPollConfig,
-) -> EpochPollHandle {
+/// the in-memory snapshot whenever the epoch advances. The poll
+/// interval is read from the `settings` table each iteration so it
+/// can be tuned at runtime; the env-derived [`EpochPollConfig`] is
+/// only a fallback default.
+pub fn spawn_epoch_poll(store: Arc<crate::config_store::DbConfigStore>) -> EpochPollHandle {
+    let fallback = EpochPollConfig::from_env();
     let handle = tokio::spawn(async move {
-        let mut tick = tokio::time::interval(config.interval);
-        // Skip the immediate tick — `App::new()` already called
-        // `refresh()` once at startup.
-        tick.tick().await;
+        // First tick fires immediately — `App::new()` already called
+        // `refresh()` once at startup, so we skip it.
         let mut last_seen: Option<i64> = None;
         loop {
-            tick.tick().await;
+            let interval_secs = settings_keys::get_u64(
+                store.as_ref(),
+                settings_keys::EPOCH_POLL_INTERVAL_SECS,
+                fallback.interval.as_secs(),
+            )
+            .await;
+            tokio::time::sleep(Duration::from_secs(interval_secs.max(1))).await;
             let current = match store.current_epoch().await {
                 Ok(e) => e,
                 Err(e) => {

@@ -372,3 +372,14 @@ export interface ImportReport {
   api_keys_imported: number;
   api_keys_skipped: number;
 }
+
+// ---- Settings ----
+
+/** A flat map of setting key → string value. Sensitive (encrypted)
+ * keys are redacted by the server (e.g. `[encrypted: abc…]`). */
+export type Settings = Record<string, string>;
+
+/** Response body for `GET /admin/v1/settings` and `PUT /admin/v1/settings`. */
+export interface SettingsResponse {
+  settings: Settings;
+}

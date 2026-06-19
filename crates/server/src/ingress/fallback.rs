@@ -91,7 +91,7 @@ where
         .current_config()
         .routing_table
         .resolve_strategy(virtual_model)
-        .unwrap_or(state.routing_strategy);
+        .unwrap_or(state.tunables().routing_strategy);
     let (strategy, strategy_label) = build_strategy(effective_strategy, state.health.clone());
     let ordered_targets: Vec<&tiygate_core::RoutingTarget> = strategy.order(targets);
 

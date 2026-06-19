@@ -14,6 +14,9 @@ use crate::encryption::{EncryptionError, KeyEncryption};
 pub const PURPOSE_PROVIDER_API_KEY: &str = "provider-api-key";
 /// Purpose label used to derive the subkey for OAuth refresh tokens.
 pub const PURPOSE_OAUTH_REFRESH_TOKEN: &str = "oauth-refresh-token";
+/// Purpose label used to derive the subkey for sensitive settings
+/// stored in the `settings` table (e.g. S3 access keys).
+pub const PURPOSE_SETTINGS: &str = "settings";
 
 /// Encrypt a provider API key. Returns the base64-encoded blob
 /// suitable for storing in the `providers.encrypted_api_key` column.
@@ -34,6 +37,16 @@ pub fn encrypt_oauth_meta(enc: &KeyEncryption, meta_json: &str) -> Result<String
 /// Decrypt an OAuth refresh token JSON blob.
 pub fn decrypt_oauth_meta(enc: &KeyEncryption, blob: &str) -> Result<String, EncryptionError> {
     enc.decrypt(PURPOSE_OAUTH_REFRESH_TOKEN, blob)
+}
+
+/// Encrypt a sensitive setting value (e.g. an S3 access key).
+pub fn encrypt_settings(enc: &KeyEncryption, value: &str) -> Result<String, EncryptionError> {
+    enc.encrypt(PURPOSE_SETTINGS, value)
+}
+
+/// Decrypt a sensitive setting value.
+pub fn decrypt_settings(enc: &KeyEncryption, blob: &str) -> Result<String, EncryptionError> {
+    enc.decrypt(PURPOSE_SETTINGS, blob)
 }
 
 #[cfg(test)]

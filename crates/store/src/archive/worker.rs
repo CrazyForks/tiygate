@@ -10,9 +10,14 @@ use tokio::task::{JoinHandle, JoinSet};
 use tracing::{info, warn};
 
 use super::client::{ClientError, PayloadArchiveClient};
-use super::{build_object_meta, gzip_compress, ArchivePayload, PayloadArchiveManifest};
+use super::{
+    build_object_meta, gzip_compress, normalize_prefix, ArchivePayload, PayloadArchiveManifest,
+    S3ArchiveClient,
+};
 use crate::archive::ArchiveStatus;
+use crate::config_store::DbConfigStore;
 use crate::db::DbPool;
+use crate::settings_keys;
 
 #[derive(Debug, Clone)]
 pub struct PayloadArchiveWorkerConfig {
@@ -65,6 +70,168 @@ pub fn spawn(
             if let Err(e) = archive_once(pool.clone(), client.clone(), &config).await {
                 warn!(error = %e, "payload archive pass failed");
             }
+        }
+    });
+    PayloadArchiveHandle { handle }
+}
+
+/// Resolved archive configuration read from the `settings` table.
+/// This is compared between iterations to decide whether the S3
+/// client and worker config need to be rebuilt.
+#[derive(Debug, Clone, PartialEq)]
+struct ArchiveSettings {
+    enabled: bool,
+    s3_endpoint: Option<String>,
+    s3_region: String,
+    s3_bucket: Option<String>,
+    s3_access_key_id: Option<String>,
+    s3_secret_access_key: Option<String>,
+    s3_prefix: String,
+    s3_force_path_style: bool,
+    scan_interval_secs: u64,
+    batch_size: usize,
+    concurrency: usize,
+    timeout_secs: u64,
+    max_retries: i32,
+}
+
+impl ArchiveSettings {
+    /// Returns `true` when all required S3 fields are present.
+    fn is_complete(&self) -> bool {
+        self.s3_endpoint.is_some()
+            && self.s3_bucket.is_some()
+            && self.s3_access_key_id.is_some()
+            && self.s3_secret_access_key.is_some()
+    }
+}
+
+/// Read the full archive configuration from the `settings` table.
+/// Encrypted S3 credentials are decrypted via the store's master
+/// key (falling back to cleartext when no key is configured).
+async fn load_archive_settings(store: &DbConfigStore) -> ArchiveSettings {
+    ArchiveSettings {
+        enabled: settings_keys::get_bool(store, settings_keys::ARCHIVE_ENABLED, false).await,
+        s3_endpoint: settings_keys::get_opt_string(store, settings_keys::ARCHIVE_S3_ENDPOINT).await,
+        s3_region: settings_keys::get_string(store, settings_keys::ARCHIVE_S3_REGION, "us-east-1")
+            .await,
+        s3_bucket: settings_keys::get_opt_string(store, settings_keys::ARCHIVE_S3_BUCKET).await,
+        s3_access_key_id: store
+            .get_setting_encrypted(settings_keys::ARCHIVE_S3_ACCESS_KEY_ID)
+            .await
+            .ok()
+            .flatten(),
+        s3_secret_access_key: store
+            .get_setting_encrypted(settings_keys::ARCHIVE_S3_SECRET_ACCESS_KEY)
+            .await
+            .ok()
+            .flatten(),
+        s3_prefix: settings_keys::get_string(store, settings_keys::ARCHIVE_S3_PREFIX, "").await,
+        s3_force_path_style: settings_keys::get_bool(
+            store,
+            settings_keys::ARCHIVE_S3_FORCE_PATH_STYLE,
+            true,
+        )
+        .await,
+        scan_interval_secs: settings_keys::get_u64(
+            store,
+            settings_keys::ARCHIVE_SCAN_INTERVAL_SECS,
+            60,
+        )
+        .await,
+        batch_size: settings_keys::get_usize(store, settings_keys::ARCHIVE_BATCH_SIZE, 100).await,
+        concurrency: settings_keys::get_usize(store, settings_keys::ARCHIVE_CONCURRENCY, 4).await,
+        timeout_secs: settings_keys::get_u64(store, settings_keys::ARCHIVE_TIMEOUT_SECS, 30).await,
+        max_retries: settings_keys::get_i64(store, settings_keys::ARCHIVE_MAX_RETRIES, 5).await
+            as i32,
+    }
+}
+
+/// Build an `S3ArchiveClient` from resolved settings.
+fn build_client(cfg: &ArchiveSettings) -> Result<S3ArchiveClient, ClientError> {
+    S3ArchiveClient::new(
+        cfg.s3_endpoint.clone().unwrap_or_default(),
+        cfg.s3_region.clone(),
+        cfg.s3_bucket.clone().unwrap_or_default(),
+        normalize_prefix(&cfg.s3_prefix),
+        cfg.s3_force_path_style,
+        cfg.s3_access_key_id.clone().unwrap_or_default(),
+        cfg.s3_secret_access_key.clone().unwrap_or_default(),
+        cfg.timeout_secs,
+    )
+}
+
+/// Build a `PayloadArchiveWorkerConfig` from resolved settings.
+fn build_worker_config(cfg: &ArchiveSettings) -> PayloadArchiveWorkerConfig {
+    PayloadArchiveWorkerConfig {
+        interval: Duration::from_secs(cfg.scan_interval_secs.max(1)),
+        batch_size: cfg.batch_size.max(1),
+        concurrency: cfg.concurrency.max(1),
+        max_retries: cfg.max_retries.max(1),
+        stale_after: Duration::from_secs(cfg.timeout_secs.max(1) * 2),
+    }
+}
+
+/// Spawn the payload-archive worker driven entirely by the
+/// `settings` table. On every iteration the worker re-reads the
+/// archive configuration; when it differs from the previous
+/// iteration the `S3ArchiveClient` is rebuilt (the old client is
+/// dropped once any in-flight `Arc` references complete). When
+/// archiving is disabled the worker sleeps and polls again so a
+/// future settings change can re-enable it without a restart.
+pub fn spawn_from_store(pool: Arc<DbPool>, store: Arc<DbConfigStore>) -> PayloadArchiveHandle {
+    let handle = tokio::spawn(async move {
+        info!("payload archive worker (settings-driven) started");
+        let mut current_client: Option<Arc<dyn PayloadArchiveClient>> = None;
+        let mut current_config: Option<PayloadArchiveWorkerConfig> = None;
+        let mut last_settings: Option<ArchiveSettings> = None;
+        loop {
+            let cfg = load_archive_settings(store.as_ref()).await;
+            let sleep_secs = cfg.scan_interval_secs.max(1);
+            if !cfg.enabled {
+                // Disabled: clear any cached client and poll again.
+                if current_client.is_some() {
+                    info!("payload archive disabled; dropping S3 client");
+                    current_client = None;
+                    current_config = None;
+                }
+                last_settings = Some(cfg);
+                tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
+                continue;
+            }
+            if !cfg.is_complete() {
+                warn!(
+                    "payload archive enabled but S3 config incomplete; skipping until settings are filled"
+                );
+                last_settings = Some(cfg);
+                tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
+                continue;
+            }
+            // Rebuild the client + config when settings changed.
+            let changed = last_settings.as_ref() != Some(&cfg);
+            if changed {
+                match build_client(&cfg) {
+                    Ok(c) => {
+                        let arc: Arc<dyn PayloadArchiveClient> = Arc::new(c);
+                        current_client = Some(arc);
+                        current_config = Some(build_worker_config(&cfg));
+                        info!("payload archive S3 client rebuilt from settings");
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "failed to build S3 archive client from settings");
+                        last_settings = Some(cfg);
+                        tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
+                        continue;
+                    }
+                }
+                last_settings = Some(cfg);
+            }
+            if let (Some(client), Some(config)) = (current_client.clone(), current_config.as_ref())
+            {
+                if let Err(e) = archive_once(pool.clone(), client, config).await {
+                    warn!(error = %e, "payload archive pass failed");
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
         }
     });
     PayloadArchiveHandle { handle }

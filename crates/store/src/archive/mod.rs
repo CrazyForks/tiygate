@@ -11,7 +11,7 @@ pub mod client;
 pub mod worker;
 
 pub use client::{ClientError, PayloadArchiveClient, S3ArchiveClient};
-pub use worker::{spawn, PayloadArchiveHandle, PayloadArchiveWorkerConfig};
+pub use worker::{spawn, spawn_from_store, PayloadArchiveHandle, PayloadArchiveWorkerConfig};
 
 /// Manifest describing archived payload objects stored for a request.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]

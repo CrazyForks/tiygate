@@ -75,6 +75,10 @@ pub fn router() -> Router<AdminState> {
         .route("/admin/v1/health/circuit-breakers", get(circuit_breakers))
         .route("/admin/v1/config/export", get(export_config))
         .route("/admin/v1/config/import", post(import_config))
+        .route(
+            "/admin/v1/settings",
+            get(list_settings).put(update_settings),
+        )
         .route("/admin/v1/info", get(info))
 }
 
@@ -1363,6 +1367,84 @@ async fn import_config(
     )
     .await;
     Ok(Json(report).into_response())
+}
+
+// ---- settings ----
+
+/// GET /admin/v1/settings — returns every setting as a flat
+/// `{ "settings": { "<key>": "<value>", ... } }` object. Encrypted
+/// keys are redacted via [`KeyEncryption::redact`] so the response
+/// never leaks a secret, mirroring the provider API-key view path.
+async fn list_settings(State(state): State<AdminState>) -> Result<Response, AdminError> {
+    let rows = state.store.list_settings().await?;
+    let mut map = serde_json::Map::new();
+    for (k, v) in rows {
+        let value = if tiygate_store::settings_keys::is_encrypted_key(&k) {
+            serde_json::Value::String(tiygate_store::encryption::KeyEncryption::redact(&v))
+        } else {
+            serde_json::Value::String(v)
+        };
+        map.insert(k, value);
+    }
+    Ok(Json(json!({ "settings": map })).into_response())
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateSettingsRequest {
+    /// A flat map of `key → value`. Every value is treated as a
+    /// string (matching the `settings` table schema). Encrypted keys
+    /// with an empty value are skipped (leave unchanged).
+    settings: serde_json::Map<String, serde_json::Value>,
+}
+
+/// PUT /admin/v1/settings — bulk upsert settings. Encrypted keys are
+/// routed through [`DbConfigStore::set_setting_encrypted`]; an empty
+/// value for an encrypted key is treated as "leave unchanged". After
+/// the write the response returns the full redacted view (same shape
+/// as `GET`).
+async fn update_settings(
+    State(state): State<AdminState>,
+    Json(req): Json<UpdateSettingsRequest>,
+) -> Result<Response, AdminError> {
+    let mut changed_keys: Vec<String> = Vec::new();
+    for (key, val) in &req.settings {
+        let s = match val {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        let is_encrypted = tiygate_store::settings_keys::is_encrypted_key(key);
+        if is_encrypted && s.trim().is_empty() {
+            // Leave the stored secret untouched.
+            continue;
+        }
+        if is_encrypted {
+            state.store.set_setting_encrypted(key, &s).await?;
+        } else {
+            state.store.set_setting(key, &s).await?;
+        }
+        changed_keys.push(key.clone());
+    }
+    let _ = tiygate_store::audit::record(
+        state.pool.as_ref(),
+        "admin",
+        "upsert",
+        "settings",
+        "bulk",
+        &json!({ "changed_keys": changed_keys }),
+    )
+    .await;
+    // Return the fresh redacted view.
+    let rows = state.store.list_settings().await?;
+    let mut map = serde_json::Map::new();
+    for (k, v) in rows {
+        let value = if tiygate_store::settings_keys::is_encrypted_key(&k) {
+            serde_json::Value::String(tiygate_store::encryption::KeyEncryption::redact(&v))
+        } else {
+            serde_json::Value::String(v)
+        };
+        map.insert(k, value);
+    }
+    Ok(Json(json!({ "settings": map })).into_response())
 }
 
 // ---- error type ----

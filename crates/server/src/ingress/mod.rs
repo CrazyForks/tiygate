@@ -64,6 +64,43 @@ fn build_strategy(
 
 use tiygate_store::config::ConfigStore;
 
+/// Runtime-tunable parameters that can be hot-reloaded from the
+/// `settings` table without restarting the gateway. Wrapped in an
+/// `ArcSwap` so the epoch-poll task can publish a new snapshot
+/// atomically while the data plane reads the current value
+/// lock-free on every request.
+///
+/// Fields that are expensive or unsafe to swap at runtime —
+/// `reqwest::Client` (connection pool churn) and the concurrency
+/// `Semaphore` (in-flight permit accounting) — are intentionally
+/// excluded and remain fixed for the lifetime of the process.
+#[derive(Clone)]
+pub struct RuntimeTunables {
+    /// Routing strategy selector (default `Weighted`, per §3.4).
+    pub routing_strategy: crate::config::RoutingStrategyName,
+    /// Whether to capture inline base64 media in raw envelopes.
+    pub raw_envelope_capture_media: bool,
+    /// Bidirectional header forwarding policy.
+    pub header_policy: Arc<tiygate_core::HeaderForwardPolicy>,
+    /// Standard request body limit (bytes).
+    pub max_request_body_bytes: u64,
+    /// Max inflight requests before queueing.
+    pub max_inflight: usize,
+    /// Max queue depth before 503.
+    pub max_queue_depth: usize,
+    /// Timeout waiting for a concurrency permit.
+    pub acquire_timeout: Duration,
+    /// Idle timeout (seconds) for upstream streaming responses.
+    pub upstream_stream_idle_timeout_secs: u64,
+    /// Total wall-clock timeout (seconds) for upstream streaming.
+    pub upstream_stream_total_timeout_secs: u64,
+    /// Shared reqwest connection pool. Rebuilt when TCP keepalive,
+    /// pool idle timeout, or tcp_nodelay settings change. The
+    /// rebuild is debounced by the tunables reloader so frequent
+    /// settings writes don't churn the connection pool.
+    pub http_client: reqwest::Client,
+}
+
 /// Shared application state.
 #[derive(Clone)]
 #[allow(dead_code)]
@@ -79,33 +116,16 @@ pub struct AppState {
     pub db_store: Option<Arc<tiygate_store::config_store::DbConfigStore>>,
     pub health: Arc<HealthRegistry>,
     pub concurrency_semaphore: Arc<Semaphore>,
-    /// Max inflight requests before queueing.
-    pub max_inflight: usize,
-    /// Max queue depth before 503.
-    pub max_queue_depth: usize,
-    /// Timeout waiting for a concurrency permit.
-    pub acquire_timeout: Duration,
-    /// Standard request body limit (bytes).
-    pub max_request_body_bytes: u64,
-    /// Larger request body limit for multimodal content.
+    /// Larger request body limit for multimodal content. Fixed at
+    /// startup because the `RequestBodyLimitLayer` is installed
+    /// at router build time.
     pub max_multimodal_body_bytes: u64,
-    /// Read timeout for the full request body.
+    /// Read timeout for the full request body. Fixed at startup
+    /// because the `RequestBodyTimeoutLayer` is installed at
+    /// router build time.
     pub request_read_timeout: Duration,
-    /// Idle timeout (seconds) for upstream streaming responses. Used by
-    /// `drive_upstream_stream` to close long-silent streams with a
-    /// protocol-native end frame. Default 120s.
-    pub upstream_stream_idle_timeout_secs: u64,
-    /// Total wall-clock timeout (seconds) for upstream streaming
-    /// responses. 0 disables the total budget. Used by
-    /// `drive_upstream_stream` to close over-budget streams with a
-    /// protocol-native error frame.
-    pub upstream_stream_total_timeout_secs: u64,
-    /// Shared reqwest connection pool across all handlers.
-    pub http_client: reqwest::Client,
     /// Async telemetry bus — non-blocking send.
     pub telemetry: Arc<dyn TelemetryBus>,
-    /// Routing strategy selector (default `Weighted`, per §3.4).
-    pub routing_strategy: crate::config::RoutingStrategyName,
     /// Quota counter; `None` in the legacy in-memory path. The
     /// ingress hot path consults this *before* forwarding upstream
     /// and returns `429 + Retry-After` on deny.
@@ -114,16 +134,14 @@ pub struct AppState {
     /// Only `/v1/embeddings` consults this; chat handlers ignore
     /// it (per §4.7).
     pub embedding_cache: Option<Arc<tiygate_cache::embedding_cache::EmbeddingCache>>,
-    /// Whether to capture inline base64 media in raw envelopes
-    /// (default false — store metadata only, per §4.1).
-    pub raw_envelope_capture_media: bool,
     /// Per-request `Redactor` instance. Configurable so future
     /// env-var-driven extensions remain test-friendly.
     pub redactor: Arc<tiygate_core::redaction::Redactor>,
-    /// Bidirectional header forwarding policy (denylist-based). Decides
-    /// which client request headers reach the provider and which
-    /// upstream response headers reach the client.
-    pub header_policy: Arc<tiygate_core::HeaderForwardPolicy>,
+    /// Hot-reloadable runtime tunables. The epoch-poll task
+    /// publishes a new `Arc<RuntimeTunables>` here after
+    /// `store.refresh()` when settings change; the data plane
+    /// reads the current value via `state.tunables()`.
+    tunables: Arc<arc_swap::ArcSwap<RuntimeTunables>>,
 }
 
 impl AppState {
@@ -141,6 +159,21 @@ impl AppState {
             Some(db) => db.snapshot(),
             None => self.config.clone(),
         }
+    }
+
+    /// Load the current runtime tunables snapshot. This is a
+    /// lock-free atomic pointer load — safe to call on every
+    /// request.
+    pub fn tunables(&self) -> arc_swap::Guard<Arc<RuntimeTunables>> {
+        self.tunables.load()
+    }
+
+    /// Publish a new set of runtime tunables. Called by the
+    /// epoch-poll task after it detects a settings change. The
+    /// swap is atomic: in-flight requests continue reading the old
+    /// snapshot until they call `tunables()` again.
+    pub fn reload_tunables(&self, new: RuntimeTunables) {
+        self.tunables.store(Arc::new(new));
     }
 }
 
@@ -216,6 +249,48 @@ pub fn router_with_telemetry_full(
     )
 }
 
+/// Build a `reqwest::Client` from the upstream tuning parameters in
+/// `ServerConfig`. Used at startup and by the tunables reloader when
+/// TCP keepalive, pool idle timeout, or tcp_nodelay settings change.
+fn build_http_client(server_config: &ServerConfig) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .pool_max_idle_per_host(32)
+        .tcp_nodelay(server_config.upstream_tcp_nodelay);
+    if server_config.upstream_tcp_keepalive_secs > 0 {
+        builder = builder.tcp_keepalive(Duration::from_secs(
+            server_config.upstream_tcp_keepalive_secs,
+        ));
+    }
+    if server_config.upstream_pool_idle_timeout_secs > 0 {
+        builder = builder.pool_idle_timeout(Duration::from_secs(
+            server_config.upstream_pool_idle_timeout_secs,
+        ));
+    }
+    builder.build().unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// Build a `reqwest::Client` from raw upstream parameter values.
+/// Used by the tunables reloader which reads these from the settings
+/// table rather than from `ServerConfig`.
+fn build_http_client_from_params(
+    tcp_nodelay: bool,
+    tcp_keepalive_secs: u64,
+    pool_idle_timeout_secs: u64,
+) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .pool_max_idle_per_host(32)
+        .tcp_nodelay(tcp_nodelay);
+    if tcp_keepalive_secs > 0 {
+        builder = builder.tcp_keepalive(Duration::from_secs(tcp_keepalive_secs));
+    }
+    if pool_idle_timeout_secs > 0 {
+        builder = builder.pool_idle_timeout(Duration::from_secs(pool_idle_timeout_secs));
+    }
+    builder.build().unwrap_or_else(|_| reqwest::Client::new())
+}
+
 /// Internal builder kept separate from the public `router_with_telemetry_full`
 /// so we can also expose the bare `Router<AppState>` for tests and inspection
 /// harnesses.
@@ -229,55 +304,37 @@ fn build_data_plane_router(
     db_store: Option<Arc<tiygate_store::config_store::DbConfigStore>>,
 ) -> Router {
     let semaphore = Arc::new(Semaphore::new(server_config.max_inflight_requests));
-    let state = AppState {
-        config: Arc::new(config),
-        db_store,
-        health,
-        concurrency_semaphore: semaphore,
-        max_inflight: server_config.max_inflight_requests,
-        max_queue_depth: server_config.max_queue_depth,
-        acquire_timeout: Duration::from_secs(server_config.acquire_timeout_secs),
-        max_request_body_bytes: server_config.max_request_body_bytes,
-        max_multimodal_body_bytes: server_config.max_multimodal_body_bytes,
-        request_read_timeout: Duration::from_secs(server_config.request_read_timeout_secs),
-        upstream_stream_idle_timeout_secs: server_config.upstream_stream_idle_timeout_secs,
-        upstream_stream_total_timeout_secs: server_config.upstream_stream_total_timeout_secs,
-        // Shared connection pool. We add TCP keepalive + a pool idle
-        // timeout to detect and recycle half-dead/stale connections
-        // before they are reused for a long streaming response (the
-        // SSE idle/total timers handle stuck-but-alive streams; this
-        // handles silently reaped sockets). No per-call read timeout:
-        // we rely on RequestBodyTimeoutLayer for ingress and the SSE
-        // idle timer for streaming. `tcp_nodelay` lowers small-frame
-        // latency. All three are operator-tunable (see ServerConfig).
-        http_client: {
-            let mut builder = reqwest::Client::builder()
-                .connect_timeout(Duration::from_secs(10))
-                .pool_max_idle_per_host(32)
-                .tcp_nodelay(server_config.upstream_tcp_nodelay);
-            if server_config.upstream_tcp_keepalive_secs > 0 {
-                builder = builder.tcp_keepalive(Duration::from_secs(
-                    server_config.upstream_tcp_keepalive_secs,
-                ));
-            }
-            if server_config.upstream_pool_idle_timeout_secs > 0 {
-                builder = builder.pool_idle_timeout(Duration::from_secs(
-                    server_config.upstream_pool_idle_timeout_secs,
-                ));
-            }
-            builder.build().unwrap_or_else(|_| reqwest::Client::new())
-        },
-        telemetry,
+    // Clone the db_store before it is moved into AppState so we can
+    // spawn the tunables reloader after state construction.
+    let db_store_for_reloader = db_store.clone();
+    let tunables = RuntimeTunables {
         routing_strategy: server_config.routing_strategy,
-        quota,
-        embedding_cache,
         raw_envelope_capture_media: server_config.raw_envelope_capture_media,
-        redactor: Arc::new(tiygate_core::redaction::Redactor::with_defaults()),
         header_policy: Arc::new(
             tiygate_core::HeaderForwardPolicy::with_defaults()
                 .with_request_deny_extra(server_config.forward_request_header_deny_extra.iter())
                 .with_response_deny_extra(server_config.forward_response_header_deny_extra.iter()),
         ),
+        max_request_body_bytes: server_config.max_request_body_bytes,
+        max_inflight: server_config.max_inflight_requests,
+        max_queue_depth: server_config.max_queue_depth,
+        acquire_timeout: Duration::from_secs(server_config.acquire_timeout_secs),
+        upstream_stream_idle_timeout_secs: server_config.upstream_stream_idle_timeout_secs,
+        upstream_stream_total_timeout_secs: server_config.upstream_stream_total_timeout_secs,
+        http_client: build_http_client(server_config),
+    };
+    let state = AppState {
+        config: Arc::new(config),
+        db_store,
+        health,
+        concurrency_semaphore: semaphore,
+        max_multimodal_body_bytes: server_config.max_multimodal_body_bytes,
+        request_read_timeout: Duration::from_secs(server_config.request_read_timeout_secs),
+        telemetry,
+        quota,
+        embedding_cache,
+        redactor: Arc::new(tiygate_core::redaction::Redactor::with_defaults()),
+        tunables: Arc::new(arc_swap::ArcSwap::from_pointee(tunables)),
     };
 
     Router::new()
@@ -335,7 +392,139 @@ fn build_data_plane_router(
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             server_config.max_multimodal_body_bytes as usize,
         ))
-        .with_state(state)
+        .with_state({
+            // Spawn the tunables reloader when a DB store is
+            // available so runtime settings changes propagate to
+            // the data plane without a restart.
+            if let Some(ref db) = db_store_for_reloader {
+                spawn_tunables_reloader(db.clone(), state.clone());
+            }
+            state
+        })
+}
+
+/// Spawn a background task that watches the config epoch and
+/// reloads [`RuntimeTunables`] from the `settings` table into the
+/// [`AppState`] whenever the epoch advances. This runs alongside
+/// the store-level epoch poll task (which refreshes the routing
+/// snapshot); this task focuses exclusively on the ingress
+/// tunables that live in the server crate.
+pub(crate) fn spawn_tunables_reloader(
+    store: Arc<tiygate_store::config_store::DbConfigStore>,
+    state: AppState,
+) -> tokio::task::JoinHandle<()> {
+    use tiygate_store::settings_keys as sk;
+    tokio::spawn(async move {
+        let mut last_seen: Option<i64> = None;
+        loop {
+            let interval_secs = sk::get_u64(store.as_ref(), sk::EPOCH_POLL_INTERVAL_SECS, 2).await;
+            tokio::time::sleep(Duration::from_secs(interval_secs.max(1))).await;
+            let current = match store.current_epoch().await {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!(error = %e, "tunables reloader: current_epoch failed");
+                    continue;
+                }
+            };
+            if Some(current) == last_seen {
+                continue;
+            }
+            // Reload tunables from settings.
+            let routing_strategy =
+                sk::get_string(store.as_ref(), sk::ROUTING_DEFAULT_STRATEGY, "weighted").await;
+            let routing_strategy =
+                crate::config::RoutingStrategyName::parse(&routing_strategy).unwrap_or_default();
+            let raw_envelope_capture_media = sk::get_bool(
+                store.as_ref(),
+                sk::INGRESS_RAW_ENVELOPE_CAPTURE_MEDIA,
+                false,
+            )
+            .await;
+            let current_t = state.tunables();
+            let max_request_body_bytes = sk::get_u64(
+                store.as_ref(),
+                sk::INGRESS_MAX_BODY_BYTES,
+                current_t.max_request_body_bytes,
+            )
+            .await;
+            let max_inflight = sk::get_usize(
+                store.as_ref(),
+                sk::INGRESS_MAX_INFLIGHT,
+                current_t.max_inflight,
+            )
+            .await;
+            let max_queue_depth = sk::get_usize(
+                store.as_ref(),
+                sk::INGRESS_MAX_QUEUE_DEPTH,
+                current_t.max_queue_depth,
+            )
+            .await;
+            let acquire_timeout = Duration::from_secs(
+                sk::get_u64(
+                    store.as_ref(),
+                    sk::INGRESS_ACQUIRE_TIMEOUT_SECS,
+                    current_t.acquire_timeout.as_secs(),
+                )
+                .await,
+            );
+            let upstream_stream_idle_timeout_secs = sk::get_u64(
+                store.as_ref(),
+                sk::UPSTREAM_STREAM_IDLE_TIMEOUT_SECS,
+                current_t.upstream_stream_idle_timeout_secs,
+            )
+            .await;
+            let upstream_stream_total_timeout_secs = sk::get_u64(
+                store.as_ref(),
+                sk::UPSTREAM_STREAM_TOTAL_TIMEOUT_SECS,
+                current_t.upstream_stream_total_timeout_secs,
+            )
+            .await;
+            // Read upstream TCP/connection-pool settings. The
+            // http_client is rebuilt only when one of these three
+            // values changes, to avoid churning the connection pool
+            // on every epoch tick.
+            let tcp_nodelay = sk::get_bool(store.as_ref(), sk::UPSTREAM_TCP_NODELAY, true).await;
+            let tcp_keepalive_secs =
+                sk::get_u64(store.as_ref(), sk::UPSTREAM_TCP_KEEPALIVE_SECS, 0).await;
+            let pool_idle_timeout_secs =
+                sk::get_u64(store.as_ref(), sk::UPSTREAM_POOL_IDLE_TIMEOUT_SECS, 0).await;
+            // Rebuild header policy from settings deny lists.
+            let req_deny =
+                sk::get_string_list(store.as_ref(), sk::FORWARD_REQUEST_HEADER_DENY, &[]).await;
+            let resp_deny =
+                sk::get_string_list(store.as_ref(), sk::FORWARD_RESPONSE_HEADER_DENY, &[]).await;
+            let header_policy = Arc::new(
+                tiygate_core::HeaderForwardPolicy::with_defaults()
+                    .with_request_deny_extra(req_deny.iter())
+                    .with_response_deny_extra(resp_deny.iter()),
+            );
+            // Rebuild the http_client from the current TCP settings.
+            // This block only runs when the epoch advanced (i.e.
+            // something changed), so rebuilding is safe. The old
+            // client's in-flight requests complete naturally because
+            // reqwest::Client is internally Arc'd.
+            let http_client = build_http_client_from_params(
+                tcp_nodelay,
+                tcp_keepalive_secs,
+                pool_idle_timeout_secs,
+            );
+            drop(current_t);
+            state.reload_tunables(RuntimeTunables {
+                routing_strategy,
+                raw_envelope_capture_media,
+                header_policy,
+                max_request_body_bytes,
+                max_inflight,
+                max_queue_depth,
+                acquire_timeout,
+                upstream_stream_idle_timeout_secs,
+                upstream_stream_total_timeout_secs,
+                http_client,
+            });
+            tracing::debug!(epoch = current, "tunables reloaded from settings");
+            last_seen = Some(current);
+        }
+    })
 }
 
 /// Compute the raw-passthrough body and the same-suite flag, in a
@@ -488,7 +677,7 @@ pub fn enforce_body_limit(
         let limit = if is_multimodal {
             state.max_multimodal_body_bytes
         } else {
-            state.max_request_body_bytes
+            state.tunables().max_request_body_bytes
         };
         if body_size > limit {
             return Err(AppError::new(

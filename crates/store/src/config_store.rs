@@ -1177,6 +1177,26 @@ impl DbConfigStore {
         Ok(row.map(|r| r.get::<String, _>(0)))
     }
 
+    /// Returns all settings as `(key, value)` pairs. Used by the
+    /// admin API for bulk reads and by the bootstrap path on first
+    /// start to detect whether any settings have been written yet.
+    pub async fn list_settings(&self) -> Result<Vec<(String, String)>, StoreError> {
+        let rows = sqlx::query("SELECT key, value FROM settings ORDER BY key")
+            .fetch_all(self.pool.any())
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.get::<String, _>(0), r.get::<String, _>(1)))
+            .collect())
+    }
+
+    /// Insert or update a setting and bump the config epoch so the
+    /// data plane and background tasks pick up the new value on
+    /// their next poll. `bump_epoch` is best-effort: a failure to
+    /// increment the epoch is logged but does not roll back the
+    /// settings write, matching the existing `refresh()` behaviour
+    /// where the snapshot is still published even if the epoch read
+    /// races.
     pub async fn set_setting(&self, key: &str, value: &str) -> Result<(), StoreError> {
         let now = chrono::Utc::now().to_rfc3339();
         sqlx::query(
@@ -1188,7 +1208,50 @@ impl DbConfigStore {
         .bind(&now)
         .execute(self.pool.any())
         .await?;
+        // Notify the data plane + background tasks that a setting
+        // changed. We intentionally do NOT call `refresh()` here:
+        // settings are not part of the routing snapshot, and a full
+        // reload of providers/routes on every settings write would
+        // be wasteful. The epoch bump is enough for the epoch-poll
+        // task to wake and reload the runtime tunables.
+        if let Err(e) = self.bump_epoch().await {
+            tracing::warn!(error = %e, key, "failed to bump epoch after settings update");
+        }
         Ok(())
+    }
+
+    /// Read an encrypted setting, decrypting it with the master key.
+    /// Returns `Ok(None)` when the key is absent. When no master key
+    /// is configured the stored value is returned as-is (cleartext
+    /// mode, consistent with provider API key handling).
+    pub async fn get_setting_encrypted(&self, key: &str) -> Result<Option<String>, StoreError> {
+        let raw = self.get_setting(key).await?;
+        match (raw, self.encryption.as_ref()) {
+            (Some(blob), Some(enc)) => enc
+                .decrypt(crate::keys::PURPOSE_SETTINGS, &blob)
+                .map(Some)
+                .map_err(|e| StoreError::Decrypt(e.to_string())),
+            (Some(plain), None) => Ok(Some(plain)),
+            (None, _) => Ok(None),
+        }
+    }
+
+    /// Encrypt and store a sensitive setting (e.g. S3 credentials).
+    /// Without a master key the value is stored in cleartext with a
+    /// warning, mirroring the provider API key path.
+    pub async fn set_setting_encrypted(&self, key: &str, value: &str) -> Result<(), StoreError> {
+        let stored = match self.encryption.as_ref() {
+            Some(enc) => crate::keys::encrypt_settings(enc, value)
+                .map_err(|e| StoreError::Decrypt(e.to_string()))?,
+            None => {
+                warn!(
+                    key,
+                    "TIYGATE_MASTER_KEY not set; storing setting in cleartext (NOT FOR PRODUCTION)"
+                );
+                value.to_string()
+            }
+        };
+        self.set_setting(key, &stored).await
     }
 
     // --- ConfigEpoch ---
@@ -1779,5 +1842,85 @@ mod tests {
         let report = store.import_config(&bundle, "").await.expect("import");
         assert_eq!(report.api_keys_imported, 0);
         assert_eq!(report.api_keys_skipped, 1);
+    }
+
+    // --- Settings CRUD + encryption tests ---
+
+    async fn settings_store() -> Arc<DbConfigStore> {
+        let pool = crate::db::open_pool("sqlite::memory:").await.expect("pool");
+        crate::db::run_migrations(&pool).await.expect("migrate");
+        let mut b = [0u8; 32];
+        for (i, slot) in b.iter_mut().enumerate() {
+            *slot = (i as u8).wrapping_add(7);
+        }
+        let enc = Arc::new(crate::encryption::KeyEncryption::from_bytes(b));
+        Arc::new(DbConfigStore::new(pool, Some(enc)))
+    }
+
+    #[tokio::test]
+    async fn list_settings_returns_all_keys() {
+        let store = settings_store().await;
+        store.set_setting("gateway.test.a", "1").await.expect("set");
+        store.set_setting("gateway.test.b", "2").await.expect("set");
+        let rows = store.list_settings().await.expect("list");
+        let map: std::collections::HashMap<String, String> = rows.into_iter().collect();
+        assert_eq!(map.get("gateway.test.a"), Some(&"1".to_string()));
+        assert_eq!(map.get("gateway.test.b"), Some(&"2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn set_setting_bumps_epoch() {
+        let pool = crate::db::open_pool("sqlite::memory:").await.expect("pool");
+        crate::db::run_migrations(&pool).await.expect("migrate");
+        let store = Arc::new(DbConfigStore::new(pool, None));
+        let before = store.current_epoch().await.expect("epoch");
+        store
+            .set_setting("gateway.test.key", "value")
+            .await
+            .expect("set");
+        let after = store.current_epoch().await.expect("epoch");
+        assert!(after > before, "set_setting must bump the epoch");
+    }
+
+    #[tokio::test]
+    async fn encrypted_setting_round_trip() {
+        let store = settings_store().await;
+        let key = "gateway.archive.s3_secret_access_key";
+        store
+            .set_setting_encrypted(key, "super-secret")
+            .await
+            .expect("encrypt+set");
+        // The raw DB value must NOT be the plaintext.
+        let raw = store.get_setting(key).await.expect("get").expect("present");
+        assert_ne!(raw, "super-secret", "encrypted value must not be plaintext");
+        // Decrypted read returns the original.
+        let decrypted = store
+            .get_setting_encrypted(key)
+            .await
+            .expect("decrypt")
+            .expect("present");
+        assert_eq!(decrypted, "super-secret");
+    }
+
+    #[tokio::test]
+    async fn encrypted_setting_without_master_key_falls_back_to_cleartext() {
+        let pool = crate::db::open_pool("sqlite::memory:").await.expect("pool");
+        crate::db::run_migrations(&pool).await.expect("migrate");
+        let store = Arc::new(DbConfigStore::new(pool, None));
+        let key = "gateway.archive.s3_access_key_id";
+        store
+            .set_setting_encrypted(key, "AKIATEST")
+            .await
+            .expect("set");
+        // Without a master key, the value is stored as-is.
+        let raw = store.get_setting(key).await.expect("get").expect("present");
+        assert_eq!(raw, "AKIATEST");
+        // Read-back also returns cleartext.
+        let val = store
+            .get_setting_encrypted(key)
+            .await
+            .expect("get")
+            .expect("present");
+        assert_eq!(val, "AKIATEST");
     }
 }

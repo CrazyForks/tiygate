@@ -19,7 +19,9 @@ use sqlx::Row;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
+use crate::config_store::DbConfigStore;
 use crate::db::DbPool;
+use crate::settings_keys;
 
 /// Configuration for the token-stats aggregation background task.
 #[derive(Debug, Clone)]
@@ -71,21 +73,35 @@ impl TokenStatsHandle {
     }
 }
 
-/// Spawn the background aggregation task.
-pub fn spawn(pool: Arc<DbPool>, config: TokenStatsConfig) -> TokenStatsHandle {
+/// Spawn the background aggregation task. Both the interval and the
+/// lookback window are read from the `settings` table on every
+/// iteration so they can be tuned at runtime. The env-derived
+/// [`TokenStatsConfig`] is only a fallback default.
+pub fn spawn(pool: Arc<DbPool>, store: Arc<DbConfigStore>) -> TokenStatsHandle {
+    let fallback = TokenStatsConfig::from_env();
     let handle = tokio::spawn(async move {
         info!(
-            interval_secs = config.interval.as_secs(),
-            lookback_days = config.lookback_days,
-            "token stats aggregation task started"
+            interval_secs = fallback.interval.as_secs(),
+            lookback_days = fallback.lookback_days,
+            "token stats aggregation task started (defaults; runtime values come from settings)"
         );
-        let mut tick = tokio::time::interval(config.interval);
-        // First tick fires immediately to catch up after startup.
         loop {
-            tick.tick().await;
-            if let Err(e) = aggregate_once(pool.as_ref(), config.lookback_days).await {
+            let interval_secs = settings_keys::get_u64(
+                store.as_ref(),
+                settings_keys::TOKEN_STATS_INTERVAL_SECS,
+                fallback.interval.as_secs(),
+            )
+            .await;
+            let lookback_days = settings_keys::get_u64(
+                store.as_ref(),
+                settings_keys::TOKEN_STATS_LOOKBACK_DAYS,
+                fallback.lookback_days as u64,
+            )
+            .await as u32;
+            if let Err(e) = aggregate_once(pool.as_ref(), lookback_days).await {
                 warn!(error = %e, "token stats aggregation failed");
             }
+            tokio::time::sleep(Duration::from_secs(interval_secs.max(1))).await;
         }
     });
     TokenStatsHandle { handle }

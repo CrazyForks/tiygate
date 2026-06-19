@@ -10,7 +10,8 @@ import {
   ScrollText,
   ListChecks,
   BookOpen,
-  Settings,
+  DatabaseBackup,
+  SlidersHorizontal,
   LogOut,
   Menu,
   X,
@@ -35,9 +36,10 @@ const navItems: Array<{
   { to: "/routes", key: "nav.routes", icon: RouteIcon },
   { to: "/api-keys", key: "nav.apiKeys", icon: KeyRound },
   { to: "/requests", key: "nav.requests", icon: ScrollText },
-  { to: "/audit", key: "nav.audit", icon: ListChecks },
   { to: "/integration", key: "nav.integration", icon: BookOpen },
-  { to: "/config", key: "nav.backup", icon: Settings },
+  { to: "/settings", key: "nav.settings", icon: SlidersHorizontal },
+  { to: "/config", key: "nav.backup", icon: DatabaseBackup },
+  { to: "/audit", key: "nav.audit", icon: ListChecks },
 ];
 
 function navLinkClass({ isActive }: { isActive: boolean }): string {

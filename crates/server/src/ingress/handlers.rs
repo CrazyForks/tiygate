@@ -156,9 +156,10 @@ pub(super) async fn acquire_permit(
     state: &AppState,
 ) -> Result<tokio::sync::OwnedSemaphorePermit, AppError> {
     // Check queue depth before waiting
+    let tunables = state.tunables();
     let available = state.concurrency_semaphore.available_permits();
-    let waiting = state.max_inflight.saturating_sub(available);
-    if waiting > state.max_queue_depth {
+    let waiting = tunables.max_inflight.saturating_sub(available);
+    if waiting > tunables.max_queue_depth {
         return Err(AppError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "gateway overloaded, queue full".to_string(),
@@ -167,7 +168,7 @@ pub(super) async fn acquire_permit(
     }
 
     match tokio::time::timeout(
-        state.acquire_timeout,
+        tunables.acquire_timeout,
         state.concurrency_semaphore.clone().acquire_owned(),
     )
     .await

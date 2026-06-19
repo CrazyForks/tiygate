@@ -13,7 +13,7 @@ use std::time::Duration;
 use tiygate_store::config_store::DbConfigStore;
 use tiygate_store::db;
 use tiygate_store::models::{AuthMode, RouteTarget};
-use tiygate_store::retention::{EpochPollConfig, RetentionConfig};
+use tiygate_store::settings_keys;
 
 #[tokio::test]
 async fn data_plane_sees_admin_writes_via_epoch_poll() {
@@ -31,25 +31,27 @@ async fn data_plane_sees_admin_writes_via_epoch_poll() {
     let initial = store.config_store();
     assert!(initial.routing_table.routes.is_empty());
 
-    // Spawn a fast epoch poller (100ms) so the test does not
+    // Use a fast epoch poll interval (100ms) so the test does not
     // sleep for 2s.
-    let handle = tiygate_store::retention::spawn_epoch_poll(
-        store.clone(),
-        EpochPollConfig {
-            interval: Duration::from_millis(100),
-        },
-    );
+    store
+        .set_setting(settings_keys::EPOCH_POLL_INTERVAL_SECS, "1")
+        .await
+        .expect("set interval");
+
+    let handle = tiygate_store::retention::spawn_epoch_poll(store.clone());
 
     // Run the retention task too so the test exercises both
     // background loops simultaneously (it would otherwise hang
-    // forever in a clean test process).
-    let _retention = tiygate_store::retention::spawn(
-        pool.clone(),
-        RetentionConfig {
-            interval: Duration::from_secs(3600),
-            retention_days: 0, // disable actual cleanup
-        },
-    );
+    // forever in a clean test process). Disable actual cleanup.
+    store
+        .set_setting(settings_keys::RETENTION_INTERVAL_SECS, "3600")
+        .await
+        .expect("set retention interval");
+    store
+        .set_setting(settings_keys::RETENTION_LOG_RETENTION_DAYS, "0")
+        .await
+        .expect("set retention days");
+    let _retention = tiygate_store::retention::spawn(pool.clone(), store.clone());
 
     // Perform an admin write — create a provider + a route.
     store

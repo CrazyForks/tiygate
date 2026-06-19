@@ -20,6 +20,8 @@ import type {
   Route,
   RouteInput,
   ServerInfo,
+  Settings,
+  SettingsResponse,
   StatsResponse,
   TokenActivityResponse,
   TokenSummaryData,
@@ -161,5 +163,15 @@ export const configApi = {
     apiRequest<ImportReport>("/config/import", {
       method: "POST",
       body: { master_key: masterKey, config },
+    }),
+};
+
+// ---- settings ----
+export const settingsApi = {
+  list: () => apiRequest<SettingsResponse>("/settings"),
+  update: (settings: Settings) =>
+    apiRequest<SettingsResponse>("/settings", {
+      method: "PUT",
+      body: { settings },
     }),
 };

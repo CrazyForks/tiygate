@@ -11,6 +11,7 @@ import RequestLogs from "@/pages/RequestLogs";
 import Audit from "@/pages/Audit";
 import IntegrationGuide from "@/pages/IntegrationGuide";
 import ConfigManagement from "@/pages/ConfigManagement";
+import Settings from "@/pages/Settings";
 
 export default function App() {
   return (
@@ -32,6 +33,7 @@ export default function App() {
         <Route path="audit" element={<Audit />} />
         <Route path="integration" element={<IntegrationGuide />} />
         <Route path="config" element={<ConfigManagement />} />
+        <Route path="settings" element={<Settings />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>

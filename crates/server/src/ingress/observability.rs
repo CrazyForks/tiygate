@@ -431,7 +431,7 @@ pub(super) fn build_redacted_envelope(
     // If inline media capture is disabled (§4.1), strip base64
     // payloads to metadata only. This reduces storage pressure for
     // multimodal requests (images, audio, etc.).
-    if !state.raw_envelope_capture_media {
+    if !state.tunables().raw_envelope_capture_media {
         body_str = strip_inline_media(&body_str);
     }
 
