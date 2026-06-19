@@ -116,7 +116,7 @@ pub async fn aggregate_once(pool: &DbPool, lookback_days: u32) -> Result<(), sql
 
     // Step 1: Aggregate per-day stats from request_logs.
     let rows = sqlx::query(
-        "SELECT DATE(ts) AS day, \
+        "SELECT CAST(DATE(ts) AS TEXT) AS day, \
                 COUNT(*) AS cnt, \
                 COALESCE(SUM(total_tokens), 0) AS tt, \
                 COALESCE(SUM(prompt_tokens), 0) AS pt, \
