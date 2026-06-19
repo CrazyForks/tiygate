@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use tiygate_store::archive::{gzip_decompress, sha256_hex, PayloadArchiveManifest};
 use tiygate_store::config_store::StoreError;
-use tiygate_store::models::{AuthMode, Provider, Route, RouteTarget};
+use tiygate_store::models::{AuthMode, ConfigExport, Provider, Route, RouteTarget};
 
 use crate::state::AdminState;
 
@@ -73,6 +73,8 @@ pub fn router() -> Router<AdminState> {
         )
         .route("/admin/v1/requests/:id/replay", get(replay_request))
         .route("/admin/v1/health/circuit-breakers", get(circuit_breakers))
+        .route("/admin/v1/config/export", get(export_config))
+        .route("/admin/v1/config/import", post(import_config))
         .route("/admin/v1/info", get(info))
 }
 
@@ -1301,7 +1303,69 @@ async fn circuit_breakers(State(state): State<AdminState>) -> Result<Response, A
     Ok(Json(json!({ "targets": summary })).into_response())
 }
 
-// ---- error type ----// ---- error type ----
+// ---- config export / import ----
+
+/// GET /admin/v1/config/export — serializes all providers, routes,
+/// and api keys into a single JSON bundle. Provider secrets travel
+/// as their on-disk encrypted blobs; the response carries an
+/// `encrypted` flag so the importer knows whether a master key is
+/// required to decode them. A `Content-Disposition` header nudges
+/// browsers into a download flow.
+async fn export_config(State(state): State<AdminState>) -> Result<Response, AdminError> {
+    let bundle = state.store.export_config().await?;
+    let body = Json(&bundle);
+    Ok((
+        [(
+            axum::http::header::CONTENT_DISPOSITION,
+            axum::http::HeaderValue::from_static("attachment; filename=\"tiygate-config.json\""),
+        )],
+        body,
+    )
+        .into_response())
+}
+
+#[derive(Debug, Deserialize)]
+struct ImportRequest {
+    /// The master key of the instance that produced the export.
+    /// Required when the export's `encrypted` flag is `true`;
+    /// ignored otherwise.
+    master_key: String,
+    config: ConfigExport,
+}
+
+/// POST /admin/v1/config/import — inserts every entity from the
+/// supplied bundle that does not already exist by id. Provider
+/// secrets are decrypted with `master_key` and re-encrypted with
+/// this instance's key. Returns an [`ImportReport`] summarizing the
+/// imported / skipped counts.
+async fn import_config(
+    State(state): State<AdminState>,
+    Json(req): Json<ImportRequest>,
+) -> Result<Response, AdminError> {
+    let report = state
+        .store
+        .import_config(&req.config, &req.master_key)
+        .await?;
+    let _ = tiygate_store::audit::record(
+        state.pool.as_ref(),
+        "admin",
+        "import",
+        "config",
+        "bulk",
+        &json!({
+            "providers_imported": report.providers_imported,
+            "providers_skipped": report.providers_skipped,
+            "routes_imported": report.routes_imported,
+            "routes_skipped": report.routes_skipped,
+            "api_keys_imported": report.api_keys_imported,
+            "api_keys_skipped": report.api_keys_skipped,
+        }),
+    )
+    .await;
+    Ok(Json(report).into_response())
+}
+
+// ---- error type ----
 
 #[derive(Debug, thiserror::Error)]
 pub enum AdminError {

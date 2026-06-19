@@ -29,6 +29,7 @@ const zh: Translation = {
     requests: "请求日志",
     audit: "操作审计",
     integration: "接入指引",
+    backup: "备份恢复",
   },
   login: {
     title: "登录",
@@ -113,11 +114,9 @@ const zh: Translation = {
     breakerRemainingTime: "剩余 {{time}}",
     breakerTooltipCircuitBroken:
       "连续失败 {{failures}} 次（阈值 {{threshold}}），第 {{tier}} 档退避保护，{{remaining}} 后可重试",
-    breakerTooltipCooling:
-      "因 {{reason}} 触发冷却，{{remaining}} 后可重试",
+    breakerTooltipCooling: "因 {{reason}} 触发冷却，{{remaining}} 后可重试",
     breakerRulesTitle: "熔断器规则说明",
-    breakerRuleKey:
-      "每个熔断器按 供应商 + 模型 组合独立计算。",
+    breakerRuleKey: "每个熔断器按 供应商 + 模型 组合独立计算。",
     breakerRuleTrip:
       "目标连续失败 3 次后触发熔断；任何一次成功即重置失败计数。",
     breakerRuleRecovery:
@@ -128,8 +127,7 @@ const zh: Translation = {
       "速率限制响应（HTTP 429）触发冷却期，使用上游 Retry-After 头（默认 30 秒），不计入熔断失败次数。",
     breakerRuleCoolingAuth:
       "认证错误（HTTP 401/403）触发 300 秒冷却期，不计入熔断失败次数，并跳过同一账户下的所有目标。",
-    breakerRuleScope:
-      "熔断器状态仅在当前实例内维护，不会跨副本共享。",
+    breakerRuleScope: "熔断器状态仅在当前实例内维护，不会跨副本共享。",
   },
   providers: {
     title: "供应商",
@@ -151,7 +149,8 @@ const zh: Translation = {
     redacted: "密钥加密存储，永不返回明文。",
     deleteConfirm: "删除供应商 {{name}}？此操作不可撤销。",
     deleteImpactLoading: "正在检查关联路由…",
-    deleteImpactLoadFailed: "无法检查关联路由，确认删除时仍会由后端按最新配置同步清理。",
+    deleteImpactLoadFailed:
+      "无法检查关联路由，确认删除时仍会由后端按最新配置同步清理。",
     deleteImpactRoutes:
       "还有 {{count}} 个路由关联该供应商；确认删除会同步移除这些路由中的 {{targets}} 个当前供应商目标。",
     deleteImpactEmptyRoutes:
@@ -189,9 +188,12 @@ const zh: Translation = {
       latency: "延迟（优先低延迟目标）",
     },
     fallbackRuleTitle: "Fallback 规则说明",
-    fallbackRuleMax: "每次请求最多 10 次总尝试，包括切换 target 和同 target 重试。",
-    fallbackRuleCount: "失败会立即计入当前 target；已熔断/冷却的 target 会从下一跳开始跳过，也包括同请求后续跳。",
-    fallbackRuleCooldown: "仅 429/401/403 触发冷却；非 400/422 的 4xx（如 402）和 5xx 通常计为失败并尝试下一 target。",
+    fallbackRuleMax:
+      "每次请求最多 10 次总尝试，包括切换 target 和同 target 重试。",
+    fallbackRuleCount:
+      "失败会立即计入当前 target；已熔断/冷却的 target 会从下一跳开始跳过，也包括同请求后续跳。",
+    fallbackRuleCooldown:
+      "仅 429/401/403 触发冷却；非 400/422 的 4xx（如 402）和 5xx 通常计为失败并尝试下一 target。",
     deleteConfirm: "删除路由 {{name}}？此操作不可撤销。",
     deleteTitle: "删除路由",
     removeTarget: "移除目标",
@@ -279,7 +281,8 @@ const zh: Translation = {
     viewDetail: "查看详情",
     replay: "回放信封",
     redactedNote: "请求头已脱敏；超限的 body 已截断。",
-    replayNote: "这是已存储的快照，不会重新向上游发起请求；请求头已脱敏，超限的 body 已截断。",
+    replayNote:
+      "这是已存储的快照，不会重新向上游发起请求；请求头已脱敏，超限的 body 已截断。",
     rawEnvelope: "原始信封",
     redactedHeaders: "脱敏请求头",
     prev: "上一页",
@@ -432,9 +435,12 @@ const zh: Translation = {
     protocolResponsesPath: "POST {{path}}",
     protocolEmbeddingsPath: "POST {{path}}",
     protocolGeminiPath: "POST {{path}}",
-    protocolOpenaiDesc: "兼容 OpenAI 的 chat：messages、tools、流式输出、JSON 模式。",
-    protocolAnthropicDesc: "Anthropic 原生 /v1/messages，使用 x-api-key 鉴权，支持 prompt caching。",
-    protocolResponsesDesc: "OpenAI Responses API，面向有状态、可调用工具的 Agent。",
+    protocolOpenaiDesc:
+      "兼容 OpenAI 的 chat：messages、tools、流式输出、JSON 模式。",
+    protocolAnthropicDesc:
+      "Anthropic 原生 /v1/messages，使用 x-api-key 鉴权，支持 prompt caching。",
+    protocolResponsesDesc:
+      "OpenAI Responses API，面向有状态、可调用工具的 Agent。",
     protocolEmbeddingsDesc: "兼容 OpenAI 的 embeddings，内置结果缓存。",
     protocolGeminiDesc: "Google Gemini generateContent，用于 Gemini 系列模型。",
     troubleshootTitle: "排错",
@@ -459,6 +465,35 @@ const zh: Translation = {
     longestTask: "最长任务",
     currentStreak: "当前连续天数",
     longestStreak: "最长连续天数",
+  },
+  backup: {
+    title: "备份恢复",
+    subtitle: "导出或导入网关配置（供应商、路由、API 密钥）。",
+    exportTitle: "导出备份",
+    exportDesc:
+      "将当前实例的全部配置导出为 JSON 文件。供应商密钥以密文形式导出，API 密钥仅导出哈希。",
+    exportNote:
+      "如果实例配置了 MASTER_KEY，供应商密钥会被加密导出；导入时需要提供相同的 MASTER_KEY 才能解密。",
+    exportBtn: "导出备份",
+    exportSuccess: "备份已导出。",
+    importTitle: "恢复备份",
+    importDesc:
+      "上传导出的 JSON 文件和原实例的 MASTER_KEY，将配置导入当前实例。ID 相同的配置会被跳过，不会覆盖。",
+    selectFile: "选择备份文件",
+    noFileSelected: "未选择文件",
+    noFile: "请先选择备份文件。",
+    invalidFormat: "文件格式无效，请选择由 TiyGate 导出的备份文件。",
+    fileSummary:
+      "供应商 {{providers}} · 路由 {{routes}} · API 密钥 {{apiKeys}} · 加密：{{encrypted}}",
+    masterKey: "MASTER_KEY",
+    masterKeyHint:
+      "导出源实例的 TIYGATE_MASTER_KEY。如果导出文件未加密则可留空。",
+    importBtn: "恢复备份",
+    importSuccess: "备份已恢复。",
+    importResultTitle: "恢复结果",
+    providersResult: "供应商：导入 {{imported}}，跳过 {{skipped}}",
+    routesResult: "路由：导入 {{imported}}，跳过 {{skipped}}",
+    apiKeysResult: "API 密钥：导入 {{imported}}，跳过 {{skipped}}",
   },
 };
 

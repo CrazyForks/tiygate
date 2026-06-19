@@ -170,6 +170,40 @@ impl Default for ConfigEpoch {
     }
 }
 
+/// A serializable bundle of all configurable entities, used by the
+/// config export / import endpoints. Provider secrets are carried as
+/// their on-disk encrypted blobs; the `encrypted` flag tells the
+/// importer whether a master key is needed to decode them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigExport {
+    /// Schema version of the export envelope. Bumped when the
+    /// structure changes in a backwards-incompatible way.
+    pub schema_version: u32,
+    /// RFC-3339 timestamp of when the export was produced.
+    pub exported_at: String,
+    /// Whether the source instance had a master key configured. When
+    /// `true`, provider `encrypted_api_key` / `encrypted_oauth_meta`
+    /// are real AES-GCM blobs that need the source master key to
+    /// decrypt. When `false`, those columns hold cleartext.
+    pub encrypted: bool,
+    pub providers: Vec<Provider>,
+    pub routes: Vec<Route>,
+    pub api_keys: Vec<ApiKey>,
+}
+
+/// Summary of an import operation, returned to the caller so the UI
+/// can show how many rows were actually inserted vs. skipped due to
+/// an existing id.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportReport {
+    pub providers_imported: usize,
+    pub providers_skipped: usize,
+    pub routes_imported: usize,
+    pub routes_skipped: usize,
+    pub api_keys_imported: usize,
+    pub api_keys_skipped: usize,
+}
+
 /// The full in-memory snapshot used by the data plane. Built from
 /// the union of providers + routes; refreshed on every epoch tick.
 #[derive(Debug, Clone, Default)]

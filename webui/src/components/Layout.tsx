@@ -10,6 +10,7 @@ import {
   ScrollText,
   ListChecks,
   BookOpen,
+  Settings,
   LogOut,
   Menu,
   X,
@@ -36,6 +37,7 @@ const navItems: Array<{
   { to: "/requests", key: "nav.requests", icon: ScrollText },
   { to: "/audit", key: "nav.audit", icon: ListChecks },
   { to: "/integration", key: "nav.integration", icon: BookOpen },
+  { to: "/config", key: "nav.backup", icon: Settings },
 ];
 
 function navLinkClass({ isActive }: { isActive: boolean }): string {
@@ -151,7 +153,10 @@ function SidebarContent({
               title={collapsed ? label : undefined}
               aria-label={collapsed ? label : undefined}
               className={({ isActive }) =>
-                cn(navLinkClass({ isActive }), collapsed && "justify-center px-0")
+                cn(
+                  navLinkClass({ isActive }),
+                  collapsed && "justify-center px-0",
+                )
               }
             >
               <Icon
@@ -164,7 +169,12 @@ function SidebarContent({
           );
         })}
       </nav>
-      <div className={cn("space-y-2 border-t border-border", collapsed ? "p-2" : "p-3")}>
+      <div
+        className={cn(
+          "space-y-2 border-t border-border",
+          collapsed ? "p-2" : "p-3",
+        )}
+      >
         {collapsed ? (
           <div className="flex flex-col items-center gap-2">
             <ThemeSwitcher />
@@ -250,7 +260,9 @@ export default function Layout() {
             <RDialog.Portal>
               <RDialog.Overlay className="animate-overlay-in fixed inset-0 z-40 bg-overlay lg:hidden" />
               <RDialog.Content className="animate-drawer-in fixed inset-y-0 left-0 z-50 w-64 border-r border-border bg-surface focus:outline-none lg:hidden">
-                <RDialog.Title className="sr-only">{t("app.menu")}</RDialog.Title>
+                <RDialog.Title className="sr-only">
+                  {t("app.menu")}
+                </RDialog.Title>
                 <RDialog.Close asChild>
                   <button
                     type="button"

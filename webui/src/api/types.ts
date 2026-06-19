@@ -304,3 +304,71 @@ export interface ServerInfo {
   name: string;
   version: string;
 }
+
+// ---- config export / import ----
+
+/** Provider row inside an export bundle. Mirrors the Rust
+ *  `Provider` model (snake_case), so it carries the encrypted
+ *  secret columns rather than the `ProviderView` the list endpoint
+ *  returns. */
+export interface ExportProvider {
+  id: string;
+  name: string;
+  vendor: string;
+  api_base: string;
+  encrypted_api_key: string;
+  auth_mode: string;
+  encrypted_oauth_meta: string;
+  metadata_json: Record<string, unknown>;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ExportRouteTarget {
+  provider_id: string;
+  model_id: string;
+  weight?: number;
+  enabled?: boolean;
+  account_label?: string | null;
+  api_key_override?: string | null;
+  api_base_override?: string | null;
+}
+
+export interface ExportRoute {
+  id: string;
+  virtual_model: string;
+  targets: ExportRouteTarget[];
+  routing_strategy?: RoutingStrategyName | null;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ExportApiKey {
+  id: string;
+  name: string;
+  key_hash: string;
+  quota_json: Record<string, unknown>;
+  status: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ConfigExport {
+  schema_version: number;
+  exported_at: string;
+  encrypted: boolean;
+  providers: ExportProvider[];
+  routes: ExportRoute[];
+  api_keys: ExportApiKey[];
+}
+
+export interface ImportReport {
+  providers_imported: number;
+  providers_skipped: number;
+  routes_imported: number;
+  routes_skipped: number;
+  api_keys_imported: number;
+  api_keys_skipped: number;
+}

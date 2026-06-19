@@ -26,7 +26,8 @@ use crate::db::DbPool;
 use crate::encryption::KeyEncryption;
 use crate::keys;
 use crate::models::{
-    ApiKey, ApiKeyStatus, AuthMode, ConfigEpoch, ConfigSnapshot, Provider, Route, RouteTarget,
+    ApiKey, ApiKeyStatus, AuthMode, ConfigEpoch, ConfigExport, ConfigSnapshot, ImportReport,
+    Provider, Route, RouteTarget,
 };
 
 /// Convenience error for store operations.
@@ -948,6 +949,224 @@ impl DbConfigStore {
         Ok(())
     }
 
+    // --- Config export / import ---
+
+    /// Export all configurable entities (providers, routes, api keys)
+    /// into a single serializable bundle. Provider secrets are
+    /// carried as their on-disk encrypted blobs; the `encrypted`
+    /// flag reflects whether this instance has a master key
+    /// configured, which tells the importer whether decryption is
+    /// needed. The runtime-only `api_key_cleartext` field is cleared
+    /// so no decrypted secret ever leaves the store.
+    pub async fn export_config(&self) -> Result<ConfigExport, StoreError> {
+        let mut providers = self.load_providers().await?;
+        // `load_providers` does not populate `api_key_cleartext`
+        // (only `refresh()` does), but we clear it defensively so a
+        // future caller that builds a `ConfigExport` from a snapshot
+        // cannot leak the decrypted secret.
+        for p in providers.iter_mut() {
+            p.api_key_cleartext = None;
+        }
+        let routes = self.load_routes().await?;
+        let api_keys = self.list_api_keys().await?;
+        Ok(ConfigExport {
+            schema_version: 1,
+            exported_at: chrono::Utc::now().to_rfc3339(),
+            encrypted: self.encryption.is_some(),
+            providers,
+            routes,
+            api_keys,
+        })
+    }
+
+    /// Import a config bundle produced by [`Self::export_config`].
+    /// Each entity is inserted only when its id does not already
+    /// exist (`INSERT … ON CONFLICT(id) DO NOTHING`); existing rows
+    /// are left untouched. Provider secrets are decrypted with the
+    /// supplied `master_key` (the source instance's key) and
+    /// re-encrypted with this instance's key before insertion. When
+    /// the export was produced without a master key (`encrypted ==
+    /// false`), provider secret columns hold cleartext and are
+    /// encrypted directly. The whole import runs in a single
+    /// transaction that rolls back on any failure.
+    pub async fn import_config(
+        &self,
+        data: &ConfigExport,
+        master_key: &str,
+    ) -> Result<ImportReport, StoreError> {
+        // Guard against a future incompatible export format. The
+        // exporter currently emits `1`; bumping the version on the
+        // write side without updating this read side is a caller bug.
+        if data.schema_version != 1 {
+            return Err(StoreError::Invalid(format!(
+                "unsupported export schema_version: {} (expected 1)",
+                data.schema_version
+            )));
+        }
+        // Build the source-instance decryptor when the export was
+        // produced with encryption. An empty master_key on an
+        // encrypted export is a caller bug.
+        let source_enc = if data.encrypted {
+            if master_key.trim().is_empty() {
+                return Err(StoreError::Invalid(
+                    "export is encrypted but no master key was supplied".into(),
+                ));
+            }
+            Some(Arc::new(
+                KeyEncryption::from_secret(master_key)
+                    .map_err(|e| StoreError::Decrypt(e.to_string()))?,
+            ))
+        } else {
+            None
+        };
+
+        let mut tx = self.pool.any().begin().await?;
+        let mut report = ImportReport {
+            providers_imported: 0,
+            providers_skipped: 0,
+            routes_imported: 0,
+            routes_skipped: 0,
+            api_keys_imported: 0,
+            api_keys_skipped: 0,
+        };
+
+        for p in &data.providers {
+            // Re-encrypt provider secrets so they are readable by
+            // this instance. When the source had encryption, decrypt
+            // with the source key first; otherwise the column holds
+            // cleartext.
+            let enc_api_key = if p.encrypted_api_key.is_empty() {
+                String::new()
+            } else {
+                let plain = match &source_enc {
+                    Some(src) => keys::decrypt_api_key(src, &p.encrypted_api_key)
+                        .map_err(|e| StoreError::Decrypt(e.to_string()))?,
+                    None => p.encrypted_api_key.clone(),
+                };
+                match self.encryption.as_ref() {
+                    Some(enc) => keys::encrypt_api_key(enc, &plain)
+                        .map_err(|e| StoreError::Decrypt(e.to_string()))?,
+                    None => plain,
+                }
+            };
+            let enc_oauth_meta = if p.encrypted_oauth_meta.is_empty() {
+                String::new()
+            } else {
+                let plain = match &source_enc {
+                    Some(src) => keys::decrypt_oauth_meta(src, &p.encrypted_oauth_meta)
+                        .map_err(|e| StoreError::Decrypt(e.to_string()))?,
+                    None => p.encrypted_oauth_meta.clone(),
+                };
+                match self.encryption.as_ref() {
+                    Some(enc) => keys::encrypt_oauth_meta(enc, &plain)
+                        .map_err(|e| StoreError::Decrypt(e.to_string()))?,
+                    None => plain,
+                }
+            };
+            let metadata_str = serde_json::to_string(&p.metadata_json)?;
+            let enabled_int: i32 = if p.enabled { 1 } else { 0 };
+            let created_at = p.created_at.to_rfc3339();
+            let updated_at = chrono::Utc::now().to_rfc3339();
+            let res = sqlx::query(
+                "INSERT INTO providers (id, name, vendor, api_base, encrypted_api_key, auth_mode, \
+                 encrypted_oauth_meta, metadata_json, enabled, created_at, updated_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+                 ON CONFLICT(id) DO NOTHING",
+            )
+            .bind(&p.id)
+            .bind(&p.name)
+            .bind(&p.vendor)
+            .bind(&p.api_base)
+            .bind(&enc_api_key)
+            .bind(p.auth_mode.as_str())
+            .bind(&enc_oauth_meta)
+            .bind(&metadata_str)
+            .bind(enabled_int)
+            .bind(&created_at)
+            .bind(&updated_at)
+            .execute(&mut *tx)
+            .await?;
+            if res.rows_affected() == 1 {
+                report.providers_imported += 1;
+            } else {
+                report.providers_skipped += 1;
+            }
+        }
+
+        for r in &data.routes {
+            let targets_json = serde_json::to_string(&r.targets)?;
+            let strategy_str = r.routing_strategy.map(|s| s.as_str());
+            let enabled_int: i32 = if r.enabled { 1 } else { 0 };
+            let created_at = r.created_at.to_rfc3339();
+            let updated_at = chrono::Utc::now().to_rfc3339();
+            let res = sqlx::query(
+                "INSERT INTO routes (id, virtual_model, targets_json, routing_strategy, enabled, \
+                 created_at, updated_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7) \
+                 ON CONFLICT(id) DO NOTHING",
+            )
+            .bind(&r.id)
+            .bind(&r.virtual_model)
+            .bind(&targets_json)
+            .bind(strategy_str)
+            .bind(enabled_int)
+            .bind(&created_at)
+            .bind(&updated_at)
+            .execute(&mut *tx)
+            .await?;
+            if res.rows_affected() == 1 {
+                report.routes_imported += 1;
+            } else {
+                report.routes_skipped += 1;
+            }
+        }
+
+        // The api_keys table has a UNIQUE constraint on key_hash in
+        // addition to the PRIMARY KEY on id. An import that carries
+        // a key_hash already present under a different id would
+        // violate that constraint, so we pre-check and skip such
+        // rows rather than letting the INSERT fail and roll back the
+        // whole transaction.
+        for k in &data.api_keys {
+            let existing_hash: Option<(String,)> =
+                sqlx::query_as("SELECT key_hash FROM api_keys WHERE key_hash = $1")
+                    .bind(&k.key_hash)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            if existing_hash.is_some() {
+                report.api_keys_skipped += 1;
+                continue;
+            }
+            let quota_str = serde_json::to_string(&k.quota_json)?;
+            let created_at = k.created_at.to_rfc3339();
+            let updated_at = chrono::Utc::now().to_rfc3339();
+            let res = sqlx::query(
+                "INSERT INTO api_keys (id, name, key_hash, quota_json, status, created_at, \
+                 updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT(id) DO NOTHING",
+            )
+            .bind(&k.id)
+            .bind(&k.name)
+            .bind(&k.key_hash)
+            .bind(&quota_str)
+            .bind(k.status.as_str())
+            .bind(&created_at)
+            .bind(&updated_at)
+            .execute(&mut *tx)
+            .await?;
+            if res.rows_affected() == 1 {
+                report.api_keys_imported += 1;
+            } else {
+                report.api_keys_skipped += 1;
+            }
+        }
+
+        tx.commit().await?;
+        // Refresh the in-memory snapshot so the data plane picks up
+        // the newly imported rows immediately.
+        self.refresh().await?;
+        Ok(report)
+    }
+
     // --- Settings ---
 
     pub async fn get_setting(&self, key: &str) -> Result<Option<String>, StoreError> {
@@ -1304,5 +1523,261 @@ mod tests {
         // pollute their assertions about the `from_env()`
         // constructor.
         std::env::remove_var("OPENAI_API_KEY");
+    }
+
+    // ---- config export / import tests ----
+
+    fn master_key_hex() -> String {
+        (0..32u8).map(|i| format!("{:02x}", i)).collect()
+    }
+
+    async fn boot_store(encryption: Option<Arc<KeyEncryption>>) -> DbConfigStore {
+        let pool = crate::db::open_pool("sqlite::memory:").await.expect("pool");
+        crate::db::run_migrations(&pool).await.expect("migrate");
+        let store = DbConfigStore::new(pool, encryption);
+        store.refresh().await.expect("refresh");
+        store
+    }
+
+    #[tokio::test]
+    async fn export_config_returns_all_entities_and_clears_cleartext() {
+        let store = boot_store(None).await;
+        store
+            .upsert_provider(
+                "p1",
+                "Provider 1",
+                "openai",
+                "https://api.openai.com/v1",
+                Some("sk-test"),
+                AuthMode::ApiKey,
+                None,
+                serde_json::json!({}),
+                true,
+            )
+            .await
+            .expect("upsert provider");
+        store
+            .upsert_route(
+                "r1",
+                "gpt-4o",
+                &[RouteTarget {
+                    provider_id: "p1".into(),
+                    model_id: "gpt-4o".into(),
+                    weight: 1.0,
+                    enabled: true,
+                    account_label: None,
+                    api_key_override: None,
+                    api_base_override: None,
+                }],
+                None,
+                true,
+            )
+            .await
+            .expect("upsert route");
+        store
+            .create_api_key("key-1", "secret-1", serde_json::json!({}))
+            .await
+            .expect("create api key");
+
+        let bundle = store.export_config().await.expect("export");
+        assert_eq!(bundle.schema_version, 1);
+        assert!(!bundle.encrypted, "no encryption configured");
+        assert_eq!(bundle.providers.len(), 1);
+        assert_eq!(bundle.routes.len(), 1);
+        assert_eq!(bundle.api_keys.len(), 1);
+        // The runtime-only cleartext field must never appear in an
+        // export, even when the store runs without a master key.
+        assert!(
+            bundle.providers[0].api_key_cleartext.is_none(),
+            "export must not carry decrypted api_key_cleartext"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_config_skips_existing_ids_and_inserts_new() {
+        let store = boot_store(None).await;
+        // Pre-populate one provider so the import should skip it.
+        store
+            .upsert_provider(
+                "p-existing",
+                "Existing",
+                "openai",
+                "https://api.openai.com/v1",
+                Some("sk-old"),
+                AuthMode::ApiKey,
+                None,
+                serde_json::json!({}),
+                true,
+            )
+            .await
+            .expect("upsert existing provider");
+
+        let now = chrono::Utc::now();
+        let bundle = ConfigExport {
+            schema_version: 1,
+            exported_at: now.to_rfc3339(),
+            encrypted: false,
+            providers: vec![
+                Provider {
+                    id: "p-existing".into(),
+                    name: "Existing (from export)".into(),
+                    vendor: "openai".into(),
+                    api_base: "https://api.openai.com/v1".into(),
+                    encrypted_api_key: "sk-exported".into(),
+                    auth_mode: AuthMode::ApiKey,
+                    encrypted_oauth_meta: String::new(),
+                    metadata_json: serde_json::json!({}),
+                    enabled: true,
+                    created_at: now,
+                    updated_at: now,
+                    api_key_cleartext: None,
+                },
+                Provider {
+                    id: "p-new".into(),
+                    name: "New".into(),
+                    vendor: "anthropic".into(),
+                    api_base: "https://api.anthropic.com".into(),
+                    encrypted_api_key: "sk-new".into(),
+                    auth_mode: AuthMode::ApiKey,
+                    encrypted_oauth_meta: String::new(),
+                    metadata_json: serde_json::json!({}),
+                    enabled: true,
+                    created_at: now,
+                    updated_at: now,
+                    api_key_cleartext: None,
+                },
+            ],
+            routes: vec![],
+            api_keys: vec![],
+        };
+
+        let report = store.import_config(&bundle, "").await.expect("import");
+        assert_eq!(report.providers_imported, 1);
+        assert_eq!(report.providers_skipped, 1);
+
+        // The existing provider must not have been overwritten.
+        let existing = store
+            .get_provider("p-existing")
+            .await
+            .expect("get")
+            .expect("provider exists");
+        assert_eq!(
+            existing.name, "Existing",
+            "existing row must not be overwritten"
+        );
+
+        // The new provider should be present.
+        let new = store
+            .get_provider("p-new")
+            .await
+            .expect("get")
+            .expect("new provider exists");
+        assert_eq!(new.name, "New");
+    }
+
+    #[tokio::test]
+    async fn import_config_re_encrypts_provider_secrets_with_different_master_keys() {
+        // Source instance with master key A.
+        let key_a = KeyEncryption::from_secret(&master_key_hex()).expect("key A");
+        let source_store = boot_store(Some(Arc::new(key_a))).await;
+        source_store
+            .upsert_provider(
+                "p-enc",
+                "Encrypted Provider",
+                "openai",
+                "https://api.openai.com/v1",
+                Some("sk-secret-value"),
+                AuthMode::ApiKey,
+                None,
+                serde_json::json!({}),
+                true,
+            )
+            .await
+            .expect("upsert provider with encryption");
+
+        let bundle = source_store.export_config().await.expect("export");
+        assert!(bundle.encrypted, "export must be flagged encrypted");
+        assert_eq!(bundle.providers.len(), 1);
+        // The exported blob must NOT be the cleartext.
+        assert_ne!(
+            bundle.providers[0].encrypted_api_key, "sk-secret-value",
+            "encrypted export must not carry cleartext"
+        );
+
+        // Target instance with master key B.
+        let key_b_hex: String = (0..32u8).map(|i| format!("{:02x}", i + 100)).collect();
+        let key_b = KeyEncryption::from_secret(&key_b_hex).expect("key B");
+        let target_store = boot_store(Some(Arc::new(key_b))).await;
+
+        let report = target_store
+            .import_config(&bundle, &master_key_hex())
+            .await
+            .expect("import");
+        assert_eq!(report.providers_imported, 1);
+
+        // After import, the target instance should be able to decrypt
+        // the provider key with its own master key (B).
+        let imported = target_store
+            .get_provider("p-enc")
+            .await
+            .expect("get")
+            .expect("provider exists");
+        let plain = keys::decrypt_api_key(
+            &KeyEncryption::from_secret(&key_b_hex).expect("key B"),
+            &imported.encrypted_api_key,
+        )
+        .expect("decrypt with target key");
+        assert_eq!(plain, "sk-secret-value");
+    }
+
+    #[tokio::test]
+    async fn import_config_rejects_encrypted_export_without_master_key() {
+        let store = boot_store(None).await;
+        let bundle = ConfigExport {
+            schema_version: 1,
+            exported_at: chrono::Utc::now().to_rfc3339(),
+            encrypted: true,
+            providers: vec![],
+            routes: vec![],
+            api_keys: vec![],
+        };
+        let err = store.import_config(&bundle, "").await;
+        assert!(
+            matches!(err, Err(StoreError::Invalid(_))),
+            "encrypted export without master key must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_config_skips_api_key_with_duplicate_hash() {
+        let store = boot_store(None).await;
+        // Pre-create an api key with the same secret.
+        store
+            .create_api_key("original", "shared-secret", serde_json::json!({}))
+            .await
+            .expect("create api key");
+        let existing_hash = hash_api_key("shared-secret");
+
+        let now = chrono::Utc::now();
+        let bundle = ConfigExport {
+            schema_version: 1,
+            exported_at: now.to_rfc3339(),
+            encrypted: false,
+            providers: vec![],
+            routes: vec![],
+            api_keys: vec![ApiKey {
+                id: "imported-key".into(),
+                name: "Imported".into(),
+                key_hash: existing_hash,
+                quota_json: serde_json::json!({}),
+                status: ApiKeyStatus::Active,
+                created_at: now,
+                updated_at: now,
+            }],
+        };
+
+        let report = store.import_config(&bundle, "").await.expect("import");
+        assert_eq!(report.api_keys_imported, 0);
+        assert_eq!(report.api_keys_skipped, 1);
     }
 }

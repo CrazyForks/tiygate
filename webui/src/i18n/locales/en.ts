@@ -27,6 +27,7 @@ const en = {
     requests: "Request Logs",
     audit: "Operation Audit",
     integration: "Integration",
+    backup: "Backup",
   },
   login: {
     title: "Sign in",
@@ -198,7 +199,8 @@ const en = {
     deleteConfirm: "Delete route {{name}}? This cannot be undone.",
     deleteTitle: "Delete route",
     removeTarget: "Remove target",
-    validationError: "A virtual model and at least one valid target are required.",
+    validationError:
+      "A virtual model and at least one valid target are required.",
     saved: "Route saved.",
     deleted: "Route deleted.",
     deleteFailed: "Failed to delete route.",
@@ -207,7 +209,8 @@ const en = {
     copyVirtualModel: "Copy virtual model",
     virtualModelCopied: "Virtual model name copied.",
     virtualModelCopyFailed: "Failed to copy virtual model name.",
-    empty: "No routes yet. Map a virtual model to one or more provider targets.",
+    empty:
+      "No routes yet. Map a virtual model to one or more provider targets.",
   },
   apiKeys: {
     title: "API Keys",
@@ -335,7 +338,8 @@ const en = {
     clientRespBody: "Client response body",
     sseParsed: "Response body (SSE Parsed)",
     sseRaw: "Raw SSE stream",
-    streamNote: "Streaming response (SSE). The parsed result merges the streamed chunks.",
+    streamNote:
+      "Streaming response (SSE). The parsed result merges the streamed chunks.",
     copySuccess: "Copied to clipboard.",
     copyFailed: "Copy failed.",
     payloadEmpty: "No payload captured for this request.",
@@ -440,18 +444,26 @@ const en = {
     protocolResponsesPath: "POST {{path}}",
     protocolEmbeddingsPath: "POST {{path}}",
     protocolGeminiPath: "POST {{path}}",
-    protocolOpenaiDesc: "OpenAI-compatible chat — messages, tools, streaming, JSON mode.",
-    protocolAnthropicDesc: "Anthropic-native /v1/messages with x-api-key auth and prompt caching.",
-    protocolResponsesDesc: "OpenAI Responses API for stateful, tool-using agents.",
-    protocolEmbeddingsDesc: "OpenAI-compatible embeddings with a built-in result cache.",
-    protocolGeminiDesc: "Google Gemini generateContent for Gemini-family models.",
+    protocolOpenaiDesc:
+      "OpenAI-compatible chat — messages, tools, streaming, JSON mode.",
+    protocolAnthropicDesc:
+      "Anthropic-native /v1/messages with x-api-key auth and prompt caching.",
+    protocolResponsesDesc:
+      "OpenAI Responses API for stateful, tool-using agents.",
+    protocolEmbeddingsDesc:
+      "OpenAI-compatible embeddings with a built-in result cache.",
+    protocolGeminiDesc:
+      "Google Gemini generateContent for Gemini-family models.",
     troubleshootTitle: "Troubleshooting",
     troubleshootDesc: "Common error codes and the page that explains them.",
     tip: {
       auth: "Token rejected. Re-issue the key on the API Keys page and confirm it is active.",
-      model: "No route for this virtual model. Map it to one or more upstream targets on the Routes page.",
-      quota: "Rate or token quota exceeded. Raise the limit on the API Keys page or rotate keys.",
-      stream: "Streaming responses use chunked text/event-stream. Consume the response as SSE.",
+      model:
+        "No route for this virtual model. Map it to one or more upstream targets on the Routes page.",
+      quota:
+        "Rate or token quota exceeded. Raise the limit on the API Keys page or rotate keys.",
+      stream:
+        "Streaming responses use chunked text/event-stream. Consume the response as SSE.",
     },
   },
   tokenActivity: {
@@ -467,6 +479,37 @@ const en = {
     longestTask: "Longest task",
     currentStreak: "Current streak",
     longestStreak: "Longest streak",
+  },
+  backup: {
+    title: "Backup & Restore",
+    subtitle:
+      "Export or import gateway configuration (providers, routes, API keys).",
+    exportTitle: "Export Backup",
+    exportDesc:
+      "Export all configuration from this instance as a JSON file. Provider secrets are exported encrypted; API keys are exported as hashes only.",
+    exportNote:
+      "If the instance has a MASTER_KEY configured, provider secrets are exported encrypted. You will need the same MASTER_KEY to import them.",
+    exportBtn: "Export Backup",
+    exportSuccess: "Backup exported.",
+    importTitle: "Restore Backup",
+    importDesc:
+      "Upload an exported JSON file along with the source instance's MASTER_KEY to restore configuration. Items with existing IDs are skipped, not overwritten.",
+    selectFile: "Select backup file",
+    noFileSelected: "No file selected",
+    noFile: "Please select a backup file first.",
+    invalidFormat:
+      "Invalid file format. Please select a backup file exported by TiyGate.",
+    fileSummary:
+      "Providers {{providers}} · Routes {{routes}} · API keys {{apiKeys}} · Encrypted: {{encrypted}}",
+    masterKey: "MASTER_KEY",
+    masterKeyHint:
+      "The source instance's TIYGATE_MASTER_KEY. Leave blank if the export file is not encrypted.",
+    importBtn: "Restore Backup",
+    importSuccess: "Backup restored.",
+    importResultTitle: "Restore Result",
+    providersResult: "Providers: imported {{imported}}, skipped {{skipped}}",
+    routesResult: "Routes: imported {{imported}}, skipped {{skipped}}",
+    apiKeysResult: "API keys: imported {{imported}}, skipped {{skipped}}",
   },
 };
 

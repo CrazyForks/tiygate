@@ -10,6 +10,7 @@ import OAuth from "@/pages/OAuth";
 import RequestLogs from "@/pages/RequestLogs";
 import Audit from "@/pages/Audit";
 import IntegrationGuide from "@/pages/IntegrationGuide";
+import ConfigManagement from "@/pages/ConfigManagement";
 
 export default function App() {
   return (
@@ -30,6 +31,7 @@ export default function App() {
         <Route path="requests" element={<RequestLogs />} />
         <Route path="audit" element={<Audit />} />
         <Route path="integration" element={<IntegrationGuide />} />
+        <Route path="config" element={<ConfigManagement />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>

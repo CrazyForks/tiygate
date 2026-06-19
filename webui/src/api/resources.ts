@@ -4,7 +4,9 @@ import type {
   ApiKeyDetail,
   AuditListResponse,
   CircuitBreakersResponse,
+  ConfigExport,
   CreateApiKeyResponse,
+  ImportReport,
   OAuthStartResponse,
   OAuthTokenResponse,
   Provider,
@@ -34,7 +36,10 @@ export const providersApi = {
   update: (id: string, body: ProviderInput) =>
     apiRequest<Provider>(`/providers/${id}`, { method: "PUT", body }),
   remove: (id: string) =>
-    apiRequest<void>(`/providers/${id}`, { method: "DELETE", allowEmpty: true }),
+    apiRequest<void>(`/providers/${id}`, {
+      method: "DELETE",
+      allowEmpty: true,
+    }),
 };
 
 // ---- provider catalog (server-side registered providers) ----
@@ -58,11 +63,8 @@ export const routesApi = {
 export const apiKeysApi = {
   list: () => apiRequest<ApiKey[]>("/api-keys"),
   get: (id: string) => apiRequest<ApiKeyDetail>(`/api-keys/${id}`),
-  create: (body: {
-    name: string;
-    secret?: string;
-    quota?: QuotaSpec;
-  }) => apiRequest<CreateApiKeyResponse>("/api-keys", { method: "POST", body }),
+  create: (body: { name: string; secret?: string; quota?: QuotaSpec }) =>
+    apiRequest<CreateApiKeyResponse>("/api-keys", { method: "POST", body }),
   updateQuota: (id: string, quota: QuotaSpec) =>
     apiRequest<ApiKey>(`/api-keys/${id}`, { method: "PATCH", body: { quota } }),
   disable: (id: string) =>
@@ -97,9 +99,10 @@ export const statsApi = {
   byTarget: (range: StatsRange = {}) =>
     apiRequest<StatsResponse>("/stats/by-target", { query: range }),
   tokenActivity: (days = 365) =>
-    apiRequest<TokenActivityResponse>("/stats/token-activity", { query: { days } }),
-  tokenSummary: () =>
-    apiRequest<TokenSummaryData>("/stats/token-summary"),
+    apiRequest<TokenActivityResponse>("/stats/token-activity", {
+      query: { days },
+    }),
+  tokenSummary: () => apiRequest<TokenSummaryData>("/stats/token-summary"),
 };
 
 // ---- requests (drill-down + replay) ----
@@ -125,8 +128,7 @@ export const requestsApi = {
     apiRequest<RequestFilterOptions>("/requests/filter-options", {
       query: filter as Record<string, string | number | boolean | undefined>,
     }),
-  replay: (id: string) =>
-    apiRequest<RequestReplay>(`/requests/${id}/replay`),
+  replay: (id: string) => apiRequest<RequestReplay>(`/requests/${id}/replay`),
 };
 
 // ---- audit ----
@@ -150,4 +152,14 @@ export const healthApi = {
 // ---- server info ----
 export const serverInfoApi = {
   get: () => apiRequest<ServerInfo>("/info"),
+};
+
+// ---- config export / import ----
+export const configApi = {
+  export: () => apiRequest<ConfigExport>("/config/export"),
+  import: (masterKey: string, config: ConfigExport) =>
+    apiRequest<ImportReport>("/config/import", {
+      method: "POST",
+      body: { master_key: masterKey, config },
+    }),
 };

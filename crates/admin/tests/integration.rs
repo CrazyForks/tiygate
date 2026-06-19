@@ -916,3 +916,137 @@ async fn provider_catalog_lists_registered_providers() {
     assert!(openai["default_base_url"].is_string());
     assert!(openai["auth_mode"].is_string());
 }
+
+#[tokio::test]
+async fn config_export_returns_json_with_content_disposition() {
+    let (router, _store, _pool) = boot_no_auth().await;
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/admin/v1/config/export")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let cd = resp
+        .headers()
+        .get(header::CONTENT_DISPOSITION)
+        .expect("content-disposition header");
+    assert!(
+        cd.to_str().unwrap().contains("attachment"),
+        "export should carry a Content-Disposition attachment header"
+    );
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .expect("body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(json["schema_version"], 1);
+    assert!(json["providers"].is_array());
+    assert!(json["routes"].is_array());
+    assert!(json["api_keys"].is_array());
+}
+
+#[tokio::test]
+async fn config_import_inserts_and_returns_report() {
+    let (router, _store, _pool) = boot_no_auth().await;
+    let import_body = json!({
+        "master_key": "",
+        "config": {
+            "schema_version": 1,
+            "exported_at": "2025-01-01T00:00:00Z",
+            "encrypted": false,
+            "providers": [{
+                "id": "p-import-test",
+                "name": "Imported",
+                "vendor": "openai",
+                "api_base": "https://api.openai.com/v1",
+                "encrypted_api_key": "sk-imported",
+                "auth_mode": "api_key",
+                "encrypted_oauth_meta": "",
+                "metadata_json": {},
+                "enabled": true,
+                "created_at": "2025-01-01T00:00:00Z",
+                "updated_at": "2025-01-01T00:00:00Z"
+            }],
+            "routes": [],
+            "api_keys": []
+        }
+    });
+    let resp = router
+        .oneshot(json_request("POST", "/admin/v1/config/import", import_body))
+        .await
+        .expect("response");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .expect("body");
+    let report: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(report["providers_imported"], 1);
+    assert_eq!(report["providers_skipped"], 0);
+}
+
+#[tokio::test]
+async fn config_import_skips_existing_ids() {
+    let (router, store, _pool) = boot_no_auth().await;
+    // Pre-create a provider so the import should skip it.
+    store
+        .upsert_provider(
+            "p-dup",
+            "Original",
+            "openai",
+            "https://api.openai.com/v1",
+            Some("sk-original"),
+            AuthMode::ApiKey,
+            None,
+            json!({}),
+            true,
+        )
+        .await
+        .expect("upsert");
+
+    let import_body = json!({
+        "master_key": "",
+        "config": {
+            "schema_version": 1,
+            "exported_at": "2025-01-01T00:00:00Z",
+            "encrypted": false,
+            "providers": [{
+                "id": "p-dup",
+                "name": "Should Not Overwrite",
+                "vendor": "openai",
+                "api_base": "https://api.openai.com/v1",
+                "encrypted_api_key": "sk-different",
+                "auth_mode": "api_key",
+                "encrypted_oauth_meta": "",
+                "metadata_json": {},
+                "enabled": true,
+                "created_at": "2025-01-01T00:00:00Z",
+                "updated_at": "2025-01-01T00:00:00Z"
+            }],
+            "routes": [],
+            "api_keys": []
+        }
+    });
+    let resp = router
+        .oneshot(json_request("POST", "/admin/v1/config/import", import_body))
+        .await
+        .expect("response");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .expect("body");
+    let report: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(report["providers_imported"], 0);
+    assert_eq!(report["providers_skipped"], 1);
+
+    // The original provider must not have been overwritten.
+    let p = store
+        .get_provider("p-dup")
+        .await
+        .expect("get")
+        .expect("exists");
+    assert_eq!(p.name, "Original");
+}
