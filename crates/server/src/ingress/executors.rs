@@ -5,13 +5,14 @@ use std::time::Duration;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use tiygate_core::tracing_ctx::TraceContext;
 use tiygate_core::{EndpointCodec, IrRequest, UsageAccumulator};
 use tiygate_protocols::chat_completions::ChatCompletionsCodec;
 use tiygate_protocols::embeddings::EmbeddingsCodec;
 use tiygate_protocols::gemini::GeminiCodec;
+use tiygate_protocols::images::ImagesGenerationsCodec;
 use tiygate_protocols::messages::MessagesCodec;
 use tiygate_protocols::responses::ResponsesCodec;
 
@@ -24,6 +25,12 @@ use super::streaming::{
     drive_upstream_stream, StreamCapture, StreamTranscode, DEFAULT_SSE_KEEPALIVE_INTERVAL,
 };
 use super::{apply_provider_auth, AppError, AppState};
+
+/// Non-streaming timeout for image generation/edit requests. Image
+/// generation is significantly slower than text chat (typically 10–60s
+/// upstream), so we use a dedicated budget that is independent of the
+/// global `request_read_timeout` (which defaults to 30s for chat).
+const IMAGES_NONSTREAM_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn execute_upstream(
@@ -1799,4 +1806,619 @@ pub(super) async fn execute_gemini_upstream(
         },
     );
     Ok((resp, ttfb_ms))
+}
+
+/// Execute a single upstream call for the Images Generations protocol.
+///
+/// Forwards the raw JSON body verbatim (passthrough) to the upstream
+/// `/images/generations` endpoint, applying model override when the
+/// virtual model differs from the target model. Supports both
+/// non-streaming (JSON response) and streaming (SSE) paths.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn execute_images_generations_upstream(
+    state: &AppState,
+    codec: &ImagesGenerationsCodec,
+    ingress_protocol: &tiygate_core::ProtocolEndpoint,
+    ir_request: &IrRequest,
+    target: &tiygate_core::RoutingTarget,
+    is_stream: bool,
+    raw_passthrough_body: Option<&str>,
+    trace: &TraceContext,
+    request_id: &str,
+    client_headers: &http::HeaderMap,
+    api_key_id: &str,
+) -> Result<(Response, Option<u64>), AppError> {
+    let egress_protocol = target.api_protocol.clone();
+    let is_same_protocol = ingress_protocol.suite == egress_protocol.suite;
+    let is_pass_through = raw_passthrough_body.is_some() && is_same_protocol;
+
+    let (mut upstream_body, mut upstream_headers) = if let Some(raw) = raw_passthrough_body {
+        if is_same_protocol {
+            match serde_json::from_str::<Value>(raw) {
+                Ok(v) => {
+                    let headers = codec
+                        .encode_request(ir_request)
+                        .map(|(_, h)| h)
+                        .unwrap_or_default();
+                    (v, headers)
+                }
+                Err(e) => {
+                    return Err(AppError::new(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("PassThrough: invalid raw body JSON: {e}"),
+                    ));
+                }
+            }
+        } else {
+            encode_cross_protocol(codec, &egress_protocol, ir_request)?
+        }
+    } else if is_same_protocol {
+        codec.encode_request(ir_request).map_err(|e| {
+            AppError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Encode error: {e}"),
+            )
+        })?
+    } else {
+        encode_cross_protocol(codec, &egress_protocol, ir_request)?
+    };
+
+    maybe_inject_prompt_cache_key(&mut upstream_body, &egress_protocol.suite, api_key_id);
+
+    let model_was_overridden = override_model_in_body(&mut upstream_body, &target.model_id);
+    let pass_through_verbatim = is_pass_through && !model_was_overridden;
+
+    merge_client_headers(
+        client_headers,
+        &mut upstream_headers,
+        &state.tunables().header_policy,
+    );
+    apply_provider_auth(target, &mut upstream_headers).await?;
+
+    let egress_body_capture = if pass_through_verbatim {
+        raw_passthrough_body.map(|s| s.to_string())
+    } else {
+        serde_json::to_string(&upstream_body).ok()
+    };
+
+    let client = &state.tunables().http_client;
+    let upstream_url = format!("{}/images/generations", target.effective_api_base());
+
+    if is_stream {
+        let mut stream_req = crate::ingress::observability::inject_trace(
+            client.post(&upstream_url).headers(upstream_headers),
+            trace,
+        );
+        if pass_through_verbatim {
+            if let Some(raw) = raw_passthrough_body {
+                stream_req = stream_req
+                    .header("content-type", "application/json")
+                    .body(raw.to_string());
+            } else {
+                stream_req = stream_req.json(&upstream_body);
+            }
+        } else {
+            stream_req = stream_req.json(&upstream_body);
+        }
+        let (egress_req, egress_headers_capture, egress_method, egress_path) =
+            crate::ingress::observability::finalize_egress(stream_req)?;
+        let exec_started = std::time::Instant::now();
+        let response = client
+            .execute(egress_req)
+            .await
+            .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {e}")))?;
+        let ttfb_ms = Some(exec_started.elapsed().as_millis() as u64);
+
+        let retry_after = extract_retry_after(response.headers());
+        let rate_limit_headers_vec: Vec<(&'static str, String)> =
+            extract_rate_limit_headers(response.headers());
+        let status = response.status();
+        let upstream_resp_headers_capture = reqwest_headers_to_vec(response.headers());
+        let upstream_status_capture = status.as_u16();
+
+        if !status.is_success() {
+            let error_body = response.text().await.unwrap_or_default();
+            spawn_capture(
+                state,
+                tiygate_core::ExchangeCapture {
+                    request_id: request_id.to_string(),
+                    egress_method: egress_method.clone(),
+                    egress_path: egress_path.clone(),
+                    egress_headers: egress_headers_capture.clone(),
+                    egress_body: egress_body_capture.clone(),
+                    upstream_status: Some(upstream_status_capture),
+                    upstream_resp_headers: upstream_resp_headers_capture.clone(),
+                    upstream_resp_body: Some(error_body.clone()),
+                    client_resp_headers: Vec::new(),
+                    client_resp_body: None,
+                    is_stream: true,
+                    truncation_reason: None,
+                    stream_duration_ms: None,
+                },
+            );
+            let mut app_err = AppError::new(
+                StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+                format!("Upstream {status}: {error_body}"),
+            );
+            app_err.upstream_status = Some(status.as_u16());
+            if let Some(ra) = retry_after {
+                app_err = app_err.with_retry_after_header(ra);
+            }
+            app_err.rate_limit_headers = rate_limit_headers_vec;
+            return Err(app_err);
+        }
+
+        let accum =
+            std::sync::Arc::new(std::sync::Mutex::new(tiygate_core::UsageAccumulator::new()));
+
+        let mut end_enc = codec.stream_encoder();
+        let mut err_enc = codec.stream_encoder();
+        let end_marker = end_enc.encode_done();
+        let error_marker = err_enc.encode_error(
+            "upstream stream truncated by gateway",
+            Some("upstream_timeout"),
+        );
+
+        let forwarded_resp_headers = forwarded_resp_headers_for_capture(
+            &upstream_resp_headers_capture,
+            &state.tunables().header_policy,
+            request_id,
+        );
+        let upstream_resp_headers_for_forward = upstream_resp_headers_capture.clone();
+        let mut response = drive_upstream_stream(
+            state,
+            accum,
+            response,
+            end_marker,
+            error_marker,
+            Duration::from_secs(state.tunables().upstream_stream_idle_timeout_secs),
+            Duration::from_secs(state.tunables().upstream_stream_total_timeout_secs),
+            DEFAULT_SSE_KEEPALIVE_INTERVAL,
+            Some(StreamCapture {
+                request_id: request_id.to_string(),
+                telemetry: state.telemetry.clone(),
+                egress_method: egress_method.to_string(),
+                egress_path: egress_path.to_string(),
+                egress_headers: egress_headers_capture,
+                egress_body: egress_body_capture,
+                upstream_status: Some(upstream_status_capture),
+                upstream_resp_headers: upstream_resp_headers_capture,
+                client_resp_headers: forwarded_resp_headers,
+            }),
+            build_stream_transcode(ingress_protocol, &egress_protocol),
+        );
+        forward_upstream_resp_headers(
+            &mut response,
+            &upstream_resp_headers_for_forward,
+            &state.tunables().header_policy,
+            request_id,
+        );
+        if let Some(ra) = retry_after {
+            response.headers_mut().insert(
+                http::HeaderName::from_static("retry-after"),
+                http::HeaderValue::from_str(&ra).unwrap_or(http::HeaderValue::from_static("")),
+            );
+        }
+        for (name, value) in extract_rate_limit_headers(response.headers()) {
+            if let Ok(hv) = http::HeaderValue::from_str(&value) {
+                if let Ok(hn) = http::HeaderName::from_bytes(name.as_bytes()) {
+                    response.headers_mut().insert(hn, hv);
+                }
+            }
+        }
+        Ok((response, ttfb_ms))
+    } else {
+        let mut nonstream_req = crate::ingress::observability::inject_trace(
+            client
+                .post(&upstream_url)
+                .headers(upstream_headers)
+                .timeout(IMAGES_NONSTREAM_TIMEOUT),
+            trace,
+        );
+        if pass_through_verbatim {
+            if let Some(raw) = raw_passthrough_body {
+                nonstream_req = nonstream_req
+                    .header("content-type", "application/json")
+                    .body(raw.to_string());
+            } else {
+                nonstream_req = nonstream_req.json(&upstream_body);
+            }
+        } else {
+            nonstream_req = nonstream_req.json(&upstream_body);
+        }
+        let (egress_req, egress_headers_capture, egress_method, egress_path) =
+            crate::ingress::observability::finalize_egress(nonstream_req)?;
+        let exec_started = std::time::Instant::now();
+        let response = client
+            .execute(egress_req)
+            .await
+            .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {e}")))?;
+        let ttfb_ms = Some(exec_started.elapsed().as_millis() as u64);
+
+        let retry_after = extract_retry_after(response.headers());
+        let rate_limit_headers_vec: Vec<(&'static str, String)> =
+            extract_rate_limit_headers(response.headers());
+        let status = response.status();
+        let upstream_resp_headers_capture = reqwest_headers_to_vec(response.headers());
+        let upstream_status_capture = status.as_u16();
+        let response_text = response
+            .text()
+            .await
+            .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, format!("Read error: {e}")))?;
+        let response_body: Value = serde_json::from_str(&response_text)
+            .unwrap_or_else(|_| json!({"error": {"message": response_text}}));
+
+        if !status.is_success() {
+            spawn_capture(
+                state,
+                tiygate_core::ExchangeCapture {
+                    request_id: request_id.to_string(),
+                    egress_method: egress_method.clone(),
+                    egress_path: egress_path.clone(),
+                    egress_headers: egress_headers_capture.clone(),
+                    egress_body: egress_body_capture.clone(),
+                    upstream_status: Some(upstream_status_capture),
+                    upstream_resp_headers: upstream_resp_headers_capture.clone(),
+                    upstream_resp_body: serde_json::to_string(&response_body).ok(),
+                    client_resp_headers: Vec::new(),
+                    client_resp_body: None,
+                    is_stream: false,
+                    truncation_reason: None,
+                    stream_duration_ms: None,
+                },
+            );
+            let mut app_err = AppError::new(
+                StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+                format!(
+                    "Upstream error: {}",
+                    response_body["error"]["message"]
+                        .as_str()
+                        .unwrap_or("Unknown error")
+                ),
+            );
+            app_err.upstream_status = Some(status.as_u16());
+            if let Some(ra) = retry_after {
+                app_err = app_err.with_retry_after_header(ra);
+            }
+            app_err.rate_limit_headers = rate_limit_headers_vec;
+            return Err(app_err);
+        }
+
+        // Cross-protocol re-encoding: when the egress suite differs
+        // from the ingress suite, decode via the egress codec and
+        // re-encode to the ingress protocol. Same-suite: forward
+        // verbatim.
+        let response_json = if is_same_protocol {
+            response_body
+        } else {
+            let egress_codec = get_egress_codec(&egress_protocol).ok_or_else(|| {
+                AppError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("No egress codec found: {egress_protocol:?}"),
+                )
+            })?;
+            let ir_response = egress_codec.decode_response(response_body).map_err(|e| {
+                AppError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Decode response error: {e}"),
+                )
+            })?;
+            codec.encode_response(&ir_response).map_err(|e| {
+                AppError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Encode response error: {e}"),
+                )
+            })?
+        };
+
+        let upstream_resp_body_capture = serde_json::to_string(&response_json).ok();
+        let client_resp_body_capture = upstream_resp_body_capture.clone();
+        let mut response = Json(response_json).into_response();
+        forward_upstream_resp_headers(
+            &mut response,
+            &upstream_resp_headers_capture,
+            &state.tunables().header_policy,
+            request_id,
+        );
+        if let Some(ra) = retry_after {
+            response.headers_mut().insert(
+                http::HeaderName::from_static("retry-after"),
+                http::HeaderValue::from_str(&ra)
+                    .unwrap_or_else(|_| http::HeaderValue::from_static("")),
+            );
+        }
+        for (name, value) in extract_rate_limit_headers(response.headers()) {
+            if let Ok(hv) = http::HeaderValue::from_str(&value) {
+                if let Ok(hn) = http::HeaderName::from_bytes(name.as_bytes()) {
+                    response.headers_mut().insert(hn, hv);
+                }
+            }
+        }
+        spawn_capture(
+            state,
+            tiygate_core::ExchangeCapture {
+                request_id: request_id.to_string(),
+                egress_method: egress_method.to_string(),
+                egress_path: egress_path.to_string(),
+                egress_headers: egress_headers_capture,
+                egress_body: egress_body_capture,
+                upstream_status: Some(upstream_status_capture),
+                upstream_resp_headers: upstream_resp_headers_capture,
+                upstream_resp_body: upstream_resp_body_capture,
+                client_resp_headers: header_map_to_vec(response.headers()),
+                client_resp_body: client_resp_body_capture,
+                is_stream: false,
+                truncation_reason: None,
+                stream_duration_ms: None,
+            },
+        );
+        Ok((response, ttfb_ms))
+    }
+}
+
+/// Execute a single upstream call for the Images Edits protocol.
+///
+/// Forwards the raw multipart/form-data bytes verbatim to the upstream
+/// `/images/edits` endpoint. The original Content-Type header (including
+/// the multipart boundary) is preserved. No model override is applied
+/// (multipart re-encoding is not supported in this version).
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn execute_images_edits_upstream(
+    state: &AppState,
+    target: &tiygate_core::RoutingTarget,
+    is_stream: bool,
+    raw_body: bytes::Bytes,
+    content_type: String,
+    trace: &TraceContext,
+    request_id: &str,
+    client_headers: &http::HeaderMap,
+    api_key_id: &str,
+) -> Result<(Response, Option<u64>), AppError> {
+    let mut upstream_headers = http::HeaderMap::new();
+    merge_client_headers(
+        client_headers,
+        &mut upstream_headers,
+        &state.tunables().header_policy,
+    );
+    apply_provider_auth(target, &mut upstream_headers).await?;
+
+    // TODO(prompt-cache): multipart re-encoding is not implemented in
+    // v1, so prompt_cache_key cannot be injected for edits requests.
+    // The virtual→upstream model mapping is also effectively ignored
+    // for /v1/images/edits (model override requires multipart parsing).
+    let _ = api_key_id;
+
+    let upstream_url = format!("{}/images/edits", target.effective_api_base());
+    let client = &state.tunables().http_client;
+
+    if is_stream {
+        let mut stream_req = crate::ingress::observability::inject_trace(
+            client.post(&upstream_url).headers(upstream_headers),
+            trace,
+        );
+        stream_req = stream_req
+            .header("content-type", &content_type)
+            .body(raw_body);
+        let (egress_req, egress_headers_capture, egress_method, egress_path) =
+            crate::ingress::observability::finalize_egress(stream_req)?;
+        let exec_started = std::time::Instant::now();
+        let response = client
+            .execute(egress_req)
+            .await
+            .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {e}")))?;
+        let ttfb_ms = Some(exec_started.elapsed().as_millis() as u64);
+
+        let retry_after = extract_retry_after(response.headers());
+        let rate_limit_headers_vec: Vec<(&'static str, String)> =
+            extract_rate_limit_headers(response.headers());
+        let status = response.status();
+        let upstream_resp_headers_capture = reqwest_headers_to_vec(response.headers());
+        let upstream_status_capture = status.as_u16();
+
+        if !status.is_success() {
+            let error_body = response.text().await.unwrap_or_default();
+            spawn_capture(
+                state,
+                tiygate_core::ExchangeCapture {
+                    request_id: request_id.to_string(),
+                    egress_method: egress_method.clone(),
+                    egress_path: egress_path.clone(),
+                    egress_headers: egress_headers_capture.clone(),
+                    egress_body: None,
+                    upstream_status: Some(upstream_status_capture),
+                    upstream_resp_headers: upstream_resp_headers_capture.clone(),
+                    upstream_resp_body: Some(error_body.clone()),
+                    client_resp_headers: Vec::new(),
+                    client_resp_body: None,
+                    is_stream: true,
+                    truncation_reason: None,
+                    stream_duration_ms: None,
+                },
+            );
+            let mut app_err = AppError::new(
+                StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+                format!("Upstream {status}: {error_body}"),
+            );
+            app_err.upstream_status = Some(status.as_u16());
+            if let Some(ra) = retry_after {
+                app_err = app_err.with_retry_after_header(ra);
+            }
+            app_err.rate_limit_headers = rate_limit_headers_vec;
+            return Err(app_err);
+        }
+
+        let accum =
+            std::sync::Arc::new(std::sync::Mutex::new(tiygate_core::UsageAccumulator::new()));
+
+        // Use the images stream encoder for error/done markers.
+        let images_codec = tiygate_protocols::images::ImagesEditsCodec::new();
+        let mut end_enc = images_codec.stream_encoder();
+        let mut err_enc = images_codec.stream_encoder();
+        let end_marker = end_enc.encode_done();
+        let error_marker = err_enc.encode_error(
+            "upstream stream truncated by gateway",
+            Some("upstream_timeout"),
+        );
+
+        let forwarded_resp_headers = forwarded_resp_headers_for_capture(
+            &upstream_resp_headers_capture,
+            &state.tunables().header_policy,
+            request_id,
+        );
+        let upstream_resp_headers_for_forward = upstream_resp_headers_capture.clone();
+        // No transcode — verbatim SSE passthrough.
+        let mut response = drive_upstream_stream(
+            state,
+            accum,
+            response,
+            end_marker,
+            error_marker,
+            Duration::from_secs(state.tunables().upstream_stream_idle_timeout_secs),
+            Duration::from_secs(state.tunables().upstream_stream_total_timeout_secs),
+            DEFAULT_SSE_KEEPALIVE_INTERVAL,
+            Some(StreamCapture {
+                request_id: request_id.to_string(),
+                telemetry: state.telemetry.clone(),
+                egress_method: egress_method.to_string(),
+                egress_path: egress_path.to_string(),
+                egress_headers: egress_headers_capture,
+                egress_body: None,
+                upstream_status: Some(upstream_status_capture),
+                upstream_resp_headers: upstream_resp_headers_capture,
+                client_resp_headers: forwarded_resp_headers,
+            }),
+            None,
+        );
+        forward_upstream_resp_headers(
+            &mut response,
+            &upstream_resp_headers_for_forward,
+            &state.tunables().header_policy,
+            request_id,
+        );
+        if let Some(ra) = retry_after {
+            response.headers_mut().insert(
+                http::HeaderName::from_static("retry-after"),
+                http::HeaderValue::from_str(&ra).unwrap_or(http::HeaderValue::from_static("")),
+            );
+        }
+        for (name, value) in extract_rate_limit_headers(response.headers()) {
+            if let Ok(hv) = http::HeaderValue::from_str(&value) {
+                if let Ok(hn) = http::HeaderName::from_bytes(name.as_bytes()) {
+                    response.headers_mut().insert(hn, hv);
+                }
+            }
+        }
+        Ok((response, ttfb_ms))
+    } else {
+        let mut nonstream_req = crate::ingress::observability::inject_trace(
+            client
+                .post(&upstream_url)
+                .headers(upstream_headers)
+                .timeout(IMAGES_NONSTREAM_TIMEOUT),
+            trace,
+        );
+        nonstream_req = nonstream_req
+            .header("content-type", &content_type)
+            .body(raw_body);
+        let (egress_req, egress_headers_capture, egress_method, egress_path) =
+            crate::ingress::observability::finalize_egress(nonstream_req)?;
+        let exec_started = std::time::Instant::now();
+        let response = client
+            .execute(egress_req)
+            .await
+            .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, format!("Upstream error: {e}")))?;
+        let ttfb_ms = Some(exec_started.elapsed().as_millis() as u64);
+
+        let retry_after = extract_retry_after(response.headers());
+        let rate_limit_headers_vec: Vec<(&'static str, String)> =
+            extract_rate_limit_headers(response.headers());
+        let status = response.status();
+        let upstream_resp_headers_capture = reqwest_headers_to_vec(response.headers());
+        let upstream_status_capture = status.as_u16();
+        let response_text = response
+            .text()
+            .await
+            .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, format!("Read error: {e}")))?;
+        let response_body: Value = serde_json::from_str(&response_text)
+            .unwrap_or_else(|_| json!({"error": {"message": response_text}}));
+
+        if !status.is_success() {
+            spawn_capture(
+                state,
+                tiygate_core::ExchangeCapture {
+                    request_id: request_id.to_string(),
+                    egress_method: egress_method.clone(),
+                    egress_path: egress_path.clone(),
+                    egress_headers: egress_headers_capture.clone(),
+                    egress_body: None,
+                    upstream_status: Some(upstream_status_capture),
+                    upstream_resp_headers: upstream_resp_headers_capture.clone(),
+                    upstream_resp_body: serde_json::to_string(&response_body).ok(),
+                    client_resp_headers: Vec::new(),
+                    client_resp_body: None,
+                    is_stream: false,
+                    truncation_reason: None,
+                    stream_duration_ms: None,
+                },
+            );
+            let mut app_err = AppError::new(
+                StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+                format!(
+                    "Upstream error: {}",
+                    response_body["error"]["message"]
+                        .as_str()
+                        .unwrap_or("Unknown error")
+                ),
+            );
+            app_err.upstream_status = Some(status.as_u16());
+            if let Some(ra) = retry_after {
+                app_err = app_err.with_retry_after_header(ra);
+            }
+            app_err.rate_limit_headers = rate_limit_headers_vec;
+            return Err(app_err);
+        }
+
+        let upstream_resp_body_capture = serde_json::to_string(&response_body).ok();
+        let client_resp_body_capture = upstream_resp_body_capture.clone();
+        let mut response = Json(response_body).into_response();
+        forward_upstream_resp_headers(
+            &mut response,
+            &upstream_resp_headers_capture,
+            &state.tunables().header_policy,
+            request_id,
+        );
+        if let Some(ra) = retry_after {
+            response.headers_mut().insert(
+                http::HeaderName::from_static("retry-after"),
+                http::HeaderValue::from_str(&ra)
+                    .unwrap_or_else(|_| http::HeaderValue::from_static("")),
+            );
+        }
+        for (name, value) in extract_rate_limit_headers(response.headers()) {
+            if let Ok(hv) = http::HeaderValue::from_str(&value) {
+                if let Ok(hn) = http::HeaderName::from_bytes(name.as_bytes()) {
+                    response.headers_mut().insert(hn, hv);
+                }
+            }
+        }
+        spawn_capture(
+            state,
+            tiygate_core::ExchangeCapture {
+                request_id: request_id.to_string(),
+                egress_method: egress_method.to_string(),
+                egress_path: egress_path.to_string(),
+                egress_headers: egress_headers_capture,
+                egress_body: None,
+                upstream_status: Some(upstream_status_capture),
+                upstream_resp_headers: upstream_resp_headers_capture,
+                upstream_resp_body: upstream_resp_body_capture,
+                client_resp_headers: header_map_to_vec(response.headers()),
+                client_resp_body: client_resp_body_capture,
+                is_stream: false,
+                truncation_reason: None,
+                stream_duration_ms: None,
+            },
+        );
+        Ok((response, ttfb_ms))
+    }
 }

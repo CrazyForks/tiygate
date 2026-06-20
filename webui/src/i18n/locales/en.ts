@@ -440,11 +440,13 @@ const en = {
     protocolResponses: "OpenAI Responses",
     protocolEmbeddings: "OpenAI Embeddings",
     protocolGemini: "Gemini generateContent",
+    protocolImages: "OpenAI Images",
     protocolOpenaiPath: "POST {{path}}",
     protocolAnthropicPath: "POST {{path}}",
     protocolResponsesPath: "POST {{path}}",
     protocolEmbeddingsPath: "POST {{path}}",
     protocolGeminiPath: "POST {{path}}",
+    protocolImagesPath: "POST {{path}}",
     protocolOpenaiDesc:
       "OpenAI-compatible chat — messages, tools, streaming, JSON mode.",
     protocolAnthropicDesc:
@@ -455,6 +457,8 @@ const en = {
       "OpenAI-compatible embeddings with a built-in result cache.",
     protocolGeminiDesc:
       "Google Gemini generateContent for Gemini-family models.",
+    protocolImagesDesc:
+      "OpenAI Images — text-to-image generation with optional streaming.",
     troubleshootTitle: "Troubleshooting",
     troubleshootDesc: "Common error codes and the page that explains them.",
     tip: {

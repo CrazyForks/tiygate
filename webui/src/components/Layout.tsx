@@ -36,10 +36,10 @@ const navItems: Array<{
   { to: "/routes", key: "nav.routes", icon: RouteIcon },
   { to: "/api-keys", key: "nav.apiKeys", icon: KeyRound },
   { to: "/requests", key: "nav.requests", icon: ScrollText },
-  { to: "/integration", key: "nav.integration", icon: BookOpen },
   { to: "/settings", key: "nav.settings", icon: SlidersHorizontal },
   { to: "/config", key: "nav.backup", icon: DatabaseBackup },
   { to: "/audit", key: "nav.audit", icon: ListChecks },
+  { to: "/integration", key: "nav.integration", icon: BookOpen },
 ];
 
 function navLinkClass({ isActive }: { isActive: boolean }): string {

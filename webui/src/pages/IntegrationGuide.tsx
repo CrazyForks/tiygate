@@ -39,7 +39,13 @@ import geminiBrand from "@/assets/brand/googlegemini.svg?raw";
 import pythonLang from "@/assets/lang/python.svg?raw";
 import typescriptLang from "@/assets/lang/typescript.svg?raw";
 
-type ProtocolId = "openai" | "anthropic" | "responses" | "embeddings" | "gemini";
+type ProtocolId =
+  | "openai"
+  | "anthropic"
+  | "responses"
+  | "embeddings"
+  | "gemini"
+  | "images";
 type LanguageId = "python" | "typescript" | "curl";
 
 interface ProtocolSpec {
@@ -131,6 +137,18 @@ const PROTOCOLS: ProtocolSpec[] = [
     brandLabel: "OpenAI",
     auth: "bearer",
   },
+  {
+    id: "images",
+    labelKey: "integration.protocolImages",
+    pathKey: "integration.protocolImagesPath",
+    path: "/v1/images/generations",
+    pathTemplate: "/v1/images/generations",
+    descriptionKey: "integration.protocolImagesDesc",
+    icon: Code2,
+    brand: openaiBrand,
+    brandLabel: "OpenAI",
+    auth: "bearer",
+  },
 ];
 
 const LANGUAGES: LanguageSpec[] = [
@@ -187,10 +205,15 @@ function escapeForCurl(s: string): string {
 }
 
 function resolveDefaultBaseUrl(): string {
-  if (typeof window === "undefined" || !window.location) return DEFAULT_API_BASE;
+  if (typeof window === "undefined" || !window.location)
+    return DEFAULT_API_BASE;
   const { hostname, origin } = window.location;
   // 本地开发环境仍使用固定默认值，线上部署自动取当前域名
-  if (hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]") {
+  if (
+    hostname === "localhost" ||
+    hostname === "127.0.0.1" ||
+    hostname === "[::1]"
+  ) {
     return DEFAULT_API_BASE;
   }
   return origin;
@@ -208,7 +231,11 @@ function readStoredBoolean(key: string, fallback: boolean): boolean {
   return raw === "1";
 }
 
-function protocolPathFor(protocol: ProtocolId, model: string, stream: boolean): string {
+function protocolPathFor(
+  protocol: ProtocolId,
+  model: string,
+  stream: boolean,
+): string {
   if (protocol === "gemini") {
     const encodedModel = encodeURIComponent(model || "model");
     return stream
@@ -219,7 +246,11 @@ function protocolPathFor(protocol: ProtocolId, model: string, stream: boolean): 
   return p ? p.path : "";
 }
 
-function pythonBodyFor(protocol: ProtocolId, model: string, stream: boolean): string {
+function pythonBodyFor(
+  protocol: ProtocolId,
+  model: string,
+  stream: boolean,
+): string {
   const s = stream ? "True" : "False";
   switch (protocol) {
     case "openai":
@@ -252,6 +283,13 @@ function pythonBodyFor(protocol: ProtocolId, model: string, stream: boolean): st
     "model": "${escapeForPythonString(model)}",
     "input": "Hello, who are you?",
 }`;
+    case "images":
+      return `{
+    "model": "${escapeForPythonString(model)}",
+    "prompt": "A cute sea otter in a hat",
+    "n": 1,
+    "size": "1024x1024",${stream ? '\n    "stream": True,' : ""}
+}`;
     case "gemini":
       return `{
     "contents": [
@@ -264,7 +302,11 @@ function pythonBodyFor(protocol: ProtocolId, model: string, stream: boolean): st
   }
 }
 
-function typescriptBodyFor(protocol: ProtocolId, model: string, stream: boolean): string {
+function typescriptBodyFor(
+  protocol: ProtocolId,
+  model: string,
+  stream: boolean,
+): string {
   const s = stream ? "true" : "false";
   switch (protocol) {
     case "openai":
@@ -297,6 +339,13 @@ function typescriptBodyFor(protocol: ProtocolId, model: string, stream: boolean)
   model: ${JSON.stringify(model)},
   input: "Hello, who are you?",
 }`;
+    case "images":
+      return `{
+  model: ${JSON.stringify(model)},
+  prompt: "A cute sea otter in a hat",
+  n: 1,
+  size: "1024x1024",${stream ? "\n  stream: true," : ""}
+}`;
     case "gemini":
       return `{
   contents: [
@@ -309,7 +358,11 @@ function typescriptBodyFor(protocol: ProtocolId, model: string, stream: boolean)
   }
 }
 
-function curlBodyFor(protocol: ProtocolId, model: string, stream: boolean): string {
+function curlBodyFor(
+  protocol: ProtocolId,
+  model: string,
+  stream: boolean,
+): string {
   const lines: string[] = [];
   switch (protocol) {
     case "openai":
@@ -354,6 +407,19 @@ function curlBodyFor(protocol: ProtocolId, model: string, stream: boolean): stri
         "}",
       );
       break;
+    case "images":
+      lines.push(
+        "{",
+        `  "model": "${model}",`,
+        `  "prompt": "A cute sea otter in a hat",`,
+        `  "n": 1,`,
+        `  "size": "1024x1024"${stream ? "," : ""}`,
+      );
+      if (stream) {
+        lines.push(`  "stream": true`);
+      }
+      lines.push("}");
+      break;
     case "gemini":
       lines.push(
         "{",
@@ -367,11 +433,7 @@ function curlBodyFor(protocol: ProtocolId, model: string, stream: boolean): stri
       );
       break;
   }
-  return lines
-    .join("\n")
-    .replace(/\n\s*/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+  return lines.join("\n").replace(/\n\s*/g, " ").replace(/\s+/g, " ").trim();
 }
 
 function buildPython(
@@ -703,11 +765,11 @@ export default function IntegrationGuide() {
   const [stream, setStream] = useState<boolean>(() =>
     readStoredBoolean(STORAGE.stream, true),
   );
-  const [activeProtocol, setActiveProtocol] = useState<ProtocolId>(() =>
-    readStoredString(STORAGE.protocol, "openai") as ProtocolId,
+  const [activeProtocol, setActiveProtocol] = useState<ProtocolId>(
+    () => readStoredString(STORAGE.protocol, "openai") as ProtocolId,
   );
-  const [activeLanguage, setActiveLanguage] = useState<LanguageId>(() =>
-    readStoredString(STORAGE.language, "python") as LanguageId,
+  const [activeLanguage, setActiveLanguage] = useState<LanguageId>(
+    () => readStoredString(STORAGE.language, "python") as LanguageId,
   );
   const [copied, setCopied] = useState(false);
 
@@ -762,7 +824,10 @@ export default function IntegrationGuide() {
   return (
     <TooltipProvider delayDuration={200}>
       <div className="space-y-6">
-        <PageHeader title={t("integration.title")} description={t("integration.intro")} />
+        <PageHeader
+          title={t("integration.title")}
+          description={t("integration.intro")}
+        />
 
         {/* ---------------------------------------------------------------- */}
         {/* Overview                                                         */}
@@ -834,7 +899,8 @@ export default function IntegrationGuide() {
                           POST
                         </span>
                         <span>
-                          {p.pathTemplate === "/v1beta/models/{model}:generateContent"
+                          {p.pathTemplate ===
+                          "/v1beta/models/{model}:generateContent"
                             ? `/v1beta/models/{${model || "model"}}:generateContent`
                             : p.path}
                         </span>
@@ -897,7 +963,8 @@ export default function IntegrationGuide() {
                           />
                           <span className="truncate">{t(p.labelKey)}</span>
                           <span className="ml-auto truncate font-mono text-[10px] text-text-subtle">
-                            {p.pathTemplate === "/v1beta/models/{model}:generateContent"
+                            {p.pathTemplate ===
+                            "/v1beta/models/{model}:generateContent"
                               ? `/v1beta/models/{…}`
                               : p.path}
                           </span>
@@ -959,7 +1026,7 @@ export default function IntegrationGuide() {
                       ? t("integration.authAnthropic")
                       : activeProtocolSpec.auth === "x-goog-api-key"
                         ? "x-goog-api-key: <YOUR_API_KEY>"
-                      : t("integration.authBearer")}
+                        : t("integration.authBearer")}
                   </code>
                 </div>
               </div>
@@ -1029,7 +1096,8 @@ export default function IntegrationGuide() {
             title={
               <div className="flex items-center gap-2">
                 <ShieldAlert size={16} className="text-primary" aria-hidden />
-                {t("integration.authTitle")} · {t("integration.troubleshootTitle")}
+                {t("integration.authTitle")} ·{" "}
+                {t("integration.troubleshootTitle")}
               </div>
             }
             description={
@@ -1084,7 +1152,11 @@ interface TipCardProps {
 
 function TipCard({ status, tone, title, action }: TipCardProps) {
   const Icon =
-    tone === "warning" ? AlertTriangle : tone === "danger" ? ShieldAlert : Activity;
+    tone === "warning"
+      ? AlertTriangle
+      : tone === "danger"
+        ? ShieldAlert
+        : Activity;
   return (
     <div className="flex flex-col gap-2 rounded-md border border-border bg-surface p-3">
       <div className="flex items-center gap-2">

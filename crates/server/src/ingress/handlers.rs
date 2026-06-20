@@ -6,18 +6,21 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use bytes::Bytes;
 use serde_json::Value;
 
 use tiygate_core::{EndpointCodec, PipelineContext};
 use tiygate_protocols::chat_completions::ChatCompletionsCodec;
 use tiygate_protocols::embeddings::EmbeddingsCodec;
 use tiygate_protocols::gemini::GeminiCodec;
+use tiygate_protocols::images::{ImagesEditsCodec, ImagesGenerationsCodec};
 use tiygate_protocols::messages::MessagesCodec;
 use tiygate_protocols::responses::ResponsesCodec;
 
 use super::executors::{
-    execute_embeddings_upstream, execute_gemini_upstream, execute_messages_upstream,
-    execute_responses_upstream, execute_upstream,
+    execute_embeddings_upstream, execute_gemini_upstream, execute_images_edits_upstream,
+    execute_images_generations_upstream, execute_messages_upstream, execute_responses_upstream,
+    execute_upstream,
 };
 use super::fallback::{execute_with_fallback, FallbackOutcome};
 use super::{compute_pass_through, enforce_body_limit, AppError, AppState};
@@ -957,6 +960,319 @@ pub(super) async fn handle_gemini_generate(
                 target,
                 is_stream,
                 raw_passthrough_body.as_deref(),
+                &trace_ctx,
+                &request_id,
+                &headers,
+                &api_key.key_id,
+            ))
+        },
+    )
+    .await;
+
+    match outcome {
+        FallbackOutcome::Success { response, .. } => {
+            scope.emit_ok(Some(response.status().as_u16()));
+            Ok(response)
+        }
+        FallbackOutcome::Failed { error, error_class } => {
+            let http_status = error.http_status().as_u16();
+            scope.emit_error(&error_class, Some(http_status));
+            Err(error)
+        }
+        FallbackOutcome::Exhausted { error } => {
+            let http_status = error.http_status().as_u16();
+            scope.emit_error("upstream_exhausted", Some(http_status));
+            Err(error)
+        }
+    }
+}
+
+/// Handle POST /v1/images/generations.
+///
+/// OpenAI Images generations endpoint. The request body is JSON and is
+/// forwarded to the upstream provider in raw-body passthrough mode (no
+/// IR round-trip) when the routing target shares the same protocol suite.
+/// Model override is applied to the JSON body before forwarding.
+pub(super) async fn handle_images_generations(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Response, AppError> {
+    let _permit = acquire_permit(&state).await?;
+
+    let codec = ImagesGenerationsCodec::new();
+    let ingress_protocol = codec.id().clone();
+
+    // Per-route body-limit enforcement (text vs. multimodal).
+    let content_type = headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok());
+    let body_size = serde_json::to_string(&body)
+        .map(|s| s.len() as u64)
+        .unwrap_or(0);
+    enforce_body_limit(&state, content_type, body_size)?;
+
+    let started = Instant::now();
+    let request_id = uuid::Uuid::now_v7().to_string();
+
+    let trace_ctx = crate::ingress::observability::extract_trace(&headers);
+    let raw_env = crate::ingress::observability::build_redacted_envelope(
+        &state,
+        "POST",
+        "/v1/images/generations",
+        &body,
+        &headers,
+    );
+
+    let mut scope = crate::ingress::observability::RequestScope::new(
+        &state,
+        request_id.clone(),
+        "unknown",
+        ingress_protocol.clone(),
+        trace_ctx.clone(),
+        started,
+    );
+    scope.set_envelope(raw_env.clone());
+
+    let api_key = crate::ingress::observability::resolve_api_key(&state, &headers).await;
+    scope.set_api_key_id(api_key.key_id.clone());
+    match crate::ingress::observability::check_quota(&state, &api_key.key_id, &api_key.spec, 1)
+        .await
+    {
+        crate::ingress::observability::QuotaOutcome::Allow => {}
+        crate::ingress::observability::QuotaOutcome::Deny { retry_after, .. } => {
+            let app_err =
+                AppError::new(StatusCode::TOO_MANY_REQUESTS, "quota exceeded".to_string())
+                    .with_retry_after(retry_after.as_secs().max(1));
+            let http_status = app_err.http_status().as_u16();
+            scope.emit_error("quota_exceeded", Some(http_status));
+            return Err(app_err);
+        }
+    }
+
+    // Decode request — in passthrough mode this is only used to extract
+    // the model name and stream flag for routing.
+    let ir_request = match codec.decode_request(body, &raw_env) {
+        Ok(r) => r,
+        Err(e) => {
+            let app_err = AppError::new(StatusCode::BAD_REQUEST, format!("Decode error: {e}"));
+            let http_status = app_err.http_status().as_u16();
+            scope.emit_error("decode_error", Some(http_status));
+            return Err(app_err);
+        }
+    };
+
+    let virtual_model = ir_request.model.clone();
+    let is_stream = ir_request.stream;
+    scope.set_virtual_model(virtual_model.clone());
+
+    let targets = match state.current_config().routing_table.resolve(&virtual_model) {
+        Some(t) => t,
+        None => {
+            let app_err = AppError::new(
+                StatusCode::NOT_FOUND,
+                format!("No route found for model: {virtual_model}"),
+            );
+            let http_status = app_err.http_status().as_u16();
+            scope.emit_error("route_not_found", Some(http_status));
+            return Err(app_err);
+        }
+    };
+
+    let _ctx = PipelineContext::new(
+        request_id.clone(),
+        ir_request.clone(),
+        Some(raw_env.clone()),
+    );
+
+    let (_pass_through_candidate, raw_passthrough_body) =
+        compute_pass_through(&codec, &ingress_protocol, &targets, &raw_env);
+
+    let outcome = execute_with_fallback(
+        &state,
+        &mut scope,
+        &targets,
+        &virtual_model,
+        &request_id,
+        |target| {
+            Box::pin(execute_images_generations_upstream(
+                &state,
+                &codec,
+                &ingress_protocol,
+                &ir_request,
+                target,
+                is_stream,
+                raw_passthrough_body.as_deref(),
+                &trace_ctx,
+                &request_id,
+                &headers,
+                &api_key.key_id,
+            ))
+        },
+    )
+    .await;
+
+    match outcome {
+        FallbackOutcome::Success { response, .. } => {
+            scope.emit_ok(Some(response.status().as_u16()));
+            Ok(response)
+        }
+        FallbackOutcome::Failed { error, error_class } => {
+            let http_status = error.http_status().as_u16();
+            scope.emit_error(&error_class, Some(http_status));
+            Err(error)
+        }
+        FallbackOutcome::Exhausted { error } => {
+            let http_status = error.http_status().as_u16();
+            scope.emit_error("upstream_exhausted", Some(http_status));
+            Err(error)
+        }
+    }
+}
+
+/// Extract the `model` and `stream` form-field values from a multipart
+/// body without a full multipart parser. Scans for `name="model"` and
+/// `name="stream"` field headers, then reads the value that follows the
+/// blank-line separator. Returns `(model, is_stream)`.
+///
+/// This is a best-effort lightweight extractor sufficient for routing
+/// decisions; the raw body is forwarded verbatim regardless of these
+/// values, so an extraction miss only degrades to `model=default`,
+/// `stream=false`.
+fn extract_multipart_fields(body: &[u8]) -> (String, bool) {
+    let text = String::from_utf8_lossy(body);
+    let mut model = String::from("default");
+    let mut is_stream = false;
+
+    for field_name in ["model", "stream"] {
+        // Match `name="field_name"` (with or without quotes).
+        let needle = format!("name=\"{field_name}\"");
+        if let Some(idx) = text.find(&needle) {
+            // Find the blank line (\r\n\r\n) that separates headers from value.
+            let rest = &text[idx + needle.len()..];
+            if let Some(header_end) = rest.find("\r\n\r\n") {
+                let value_start = header_end + 4;
+                let value_rest = &rest[value_start..];
+                // Value ends at the next boundary (starts with --).
+                let value = if let Some(boundary_idx) = value_rest.find("\r\n--") {
+                    &value_rest[..boundary_idx]
+                } else {
+                    value_rest
+                };
+                if field_name == "model" {
+                    model = value.to_string();
+                } else if field_name == "stream" {
+                    is_stream = value.eq_ignore_ascii_case("true");
+                }
+            }
+        }
+    }
+
+    (model, is_stream)
+}
+
+/// Handle POST /v1/images/edits.
+///
+/// OpenAI Images edits endpoint. The request body is multipart/form-data
+/// and is forwarded to the upstream provider as raw bytes (no model
+/// override, no IR round-trip). The original Content-Type header
+/// (including the multipart boundary) is preserved.
+pub(super) async fn handle_images_edits(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    let _permit = acquire_permit(&state).await?;
+
+    let codec = ImagesEditsCodec::new();
+    let ingress_protocol = codec.id().clone();
+
+    // Per-route body-limit enforcement — multipart bodies use the
+    // multimodal limit.
+    let content_type = headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok());
+    enforce_body_limit(&state, content_type, body.len() as u64)?;
+
+    let started = Instant::now();
+    let request_id = uuid::Uuid::now_v7().to_string();
+
+    let trace_ctx = crate::ingress::observability::extract_trace(&headers);
+
+    // Extract model and stream flag from the multipart body for routing.
+    let (virtual_model, is_stream) = extract_multipart_fields(&body);
+
+    // Build a redacted RawEnvelope — the multipart body is binary,
+    // not JSON, so we do not store it in envelope.body (audit safety).
+    // Headers are still redacted via the Redactor to scrub
+    // Authorization and other sensitive headers.
+    let raw_env = crate::ingress::observability::build_redacted_envelope_raw(
+        &state,
+        "POST",
+        "/v1/images/edits",
+        body.len() as u64,
+        &headers,
+    );
+
+    let mut scope = crate::ingress::observability::RequestScope::new(
+        &state,
+        request_id.clone(),
+        &virtual_model,
+        ingress_protocol.clone(),
+        trace_ctx.clone(),
+        started,
+    );
+    scope.set_envelope(raw_env.clone());
+
+    let api_key = crate::ingress::observability::resolve_api_key(&state, &headers).await;
+    scope.set_api_key_id(api_key.key_id.clone());
+    match crate::ingress::observability::check_quota(&state, &api_key.key_id, &api_key.spec, 1)
+        .await
+    {
+        crate::ingress::observability::QuotaOutcome::Allow => {}
+        crate::ingress::observability::QuotaOutcome::Deny { retry_after, .. } => {
+            let app_err =
+                AppError::new(StatusCode::TOO_MANY_REQUESTS, "quota exceeded".to_string())
+                    .with_retry_after(retry_after.as_secs().max(1));
+            let http_status = app_err.http_status().as_u16();
+            scope.emit_error("quota_exceeded", Some(http_status));
+            return Err(app_err);
+        }
+    }
+
+    let targets = match state.current_config().routing_table.resolve(&virtual_model) {
+        Some(t) => t,
+        None => {
+            let app_err = AppError::new(
+                StatusCode::NOT_FOUND,
+                format!("No route found for model: {virtual_model}"),
+            );
+            let http_status = app_err.http_status().as_u16();
+            scope.emit_error("route_not_found", Some(http_status));
+            return Err(app_err);
+        }
+    };
+
+    // Images edits always uses raw-bytes passthrough (same suite). We do
+    // not call compute_pass_through because the raw body lives in the
+    // Bytes extractor, not in raw_envelope.body.
+    let content_type_str = content_type.unwrap_or("multipart/form-data").to_string();
+
+    let outcome = execute_with_fallback(
+        &state,
+        &mut scope,
+        &targets,
+        &virtual_model,
+        &request_id,
+        |target| {
+            let body = body.clone();
+            let content_type_str = content_type_str.clone();
+            Box::pin(execute_images_edits_upstream(
+                &state,
+                target,
+                is_stream,
+                body,
+                content_type_str,
                 &trace_ctx,
                 &request_id,
                 &headers,

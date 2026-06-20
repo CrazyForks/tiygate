@@ -64,6 +64,20 @@ impl Provider for ZenMuxProvider {
     }
 
     fn egress_protocol_for_model(&self, model_id: &str) -> ProtocolEndpoint {
+        let body = model_id.split(':').next().unwrap_or(model_id);
+        let body = body.rsplit('/').next().unwrap_or(body);
+        let body = body.to_ascii_lowercase();
+
+        // Image models route to the images-generations endpoint within
+        // the OpenAI-compatible suite (not the default chat-completions).
+        if body.contains("image") || body.contains("dall-e") {
+            return ProtocolEndpoint::new(
+                ProtocolSuite::OpenAiCompatible,
+                "images-generations",
+                "v1",
+            );
+        }
+
         suite_for_model(model_id).default_endpoint()
     }
 
@@ -79,6 +93,14 @@ fn suite_for_model(model_id: &str) -> ProtocolSuite {
     let body = model_id.split(':').next().unwrap_or(model_id);
     let body = body.rsplit('/').next().unwrap_or(body);
     let body = body.to_ascii_lowercase();
+
+    // Image models (gpt-image-*, dall-e-*) use the images-generations
+    // endpoint within the OpenAI-compatible suite — must be checked
+    // before the `gpt` branch below, which would otherwise route them
+    // to the Responses API.
+    if body.contains("image") || body.contains("dall-e") {
+        return ProtocolSuite::OpenAiCompatible;
+    }
 
     if body.contains("gpt") {
         ProtocolSuite::OpenAiResponses
@@ -183,6 +205,31 @@ mod tests {
             provider.egress_protocol_for_model("unknown-model").suite,
             ProtocolSuite::OpenAiCompatible
         );
+    }
+
+    #[test]
+    fn test_zenmux_egress_protocol_for_image_model() {
+        let provider = ZenMuxProvider::new();
+
+        // gpt-image-2 must NOT be routed to OpenAiResponses even though
+        // it contains the "gpt" prefix.
+        let endpoint = provider.egress_protocol_for_model("gpt-image-2");
+        assert_eq!(endpoint.suite, ProtocolSuite::OpenAiCompatible);
+        assert_eq!(endpoint.name, "images-generations");
+
+        let endpoint = provider.egress_protocol_for_model("dall-e-3");
+        assert_eq!(endpoint.name, "images-generations");
+    }
+
+    #[test]
+    fn test_zenmux_suite_for_image_model() {
+        // The suite helper must also return OpenAiCompatible for image
+        // models, even when prefixed with a maker segment.
+        assert_eq!(
+            suite_for_model("openai/gpt-image-2"),
+            ProtocolSuite::OpenAiCompatible
+        );
+        assert_eq!(suite_for_model("dall-e-3"), ProtocolSuite::OpenAiCompatible);
     }
 
     #[test]

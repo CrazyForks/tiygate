@@ -431,11 +431,13 @@ const zh: Translation = {
     protocolResponses: "OpenAI Responses",
     protocolEmbeddings: "OpenAI Embeddings",
     protocolGemini: "Gemini generateContent",
+    protocolImages: "OpenAI Images",
     protocolOpenaiPath: "POST {{path}}",
     protocolAnthropicPath: "POST {{path}}",
     protocolResponsesPath: "POST {{path}}",
     protocolEmbeddingsPath: "POST {{path}}",
     protocolGeminiPath: "POST {{path}}",
+    protocolImagesPath: "POST {{path}}",
     protocolOpenaiDesc:
       "兼容 OpenAI 的 chat：messages、tools、流式输出、JSON 模式。",
     protocolAnthropicDesc:
@@ -444,6 +446,7 @@ const zh: Translation = {
       "OpenAI Responses API，面向有状态、可调用工具的 Agent。",
     protocolEmbeddingsDesc: "兼容 OpenAI 的 embeddings，内置结果缓存。",
     protocolGeminiDesc: "Google Gemini generateContent，用于 Gemini 系列模型。",
+    protocolImagesDesc: "OpenAI Images — 文生图，支持流式输出 partial image。",
     troubleshootTitle: "排错",
     troubleshootDesc: "常见错误码及对应处理页面。",
     tip: {

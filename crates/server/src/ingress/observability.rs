@@ -452,6 +452,34 @@ pub(super) fn build_redacted_envelope(
     }
 }
 
+/// Build a `RawEnvelope` for a non-JSON (e.g. multipart/form-data)
+/// request body. The body is **not** stored (binary content), but
+/// headers are still redacted via the same `Redactor` used by
+/// `build_redacted_envelope` so that Authorization and other
+/// sensitive request headers are scrubbed before the envelope is
+/// persisted to the audit log.
+pub(super) fn build_redacted_envelope_raw(
+    state: &AppState,
+    method: &str,
+    path: &str,
+    original_body_size: u64,
+    raw_headers: &axum::http::HeaderMap,
+) -> RawEnvelope {
+    let raw_iter = raw_headers
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()));
+    let redacted = state.redactor.redact_headers(raw_iter);
+    RawEnvelope {
+        method: method.to_string(),
+        path: path.to_string(),
+        headers: redacted.into_iter().collect(),
+        body: None,
+        truncated: false,
+        original_body_size,
+        timestamp: Utc::now(),
+    }
+}
+
 /// Strip inline base64 media payloads from a JSON body string,
 /// replacing them with metadata objects `{"_media_meta": {"mime":
 /// "...", "size_bytes": N, "sha256_hex": "..."}}`. This is a

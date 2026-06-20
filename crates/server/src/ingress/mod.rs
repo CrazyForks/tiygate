@@ -17,7 +17,8 @@ mod streaming;
 
 use handlers::{
     handle_chat_completions, handle_embeddings, handle_gemini_generate, handle_healthz,
-    handle_messages, handle_readyz, handle_responses,
+    handle_images_edits, handle_images_generations, handle_messages, handle_readyz,
+    handle_responses,
 };
 
 use std::sync::Arc;
@@ -342,6 +343,8 @@ fn build_data_plane_router(
         .route("/v1/messages", post(handle_messages))
         .route("/v1/embeddings", post(handle_embeddings))
         .route("/v1/responses", post(handle_responses))
+        .route("/v1/images/generations", post(handle_images_generations))
+        .route("/v1/images/edits", post(handle_images_edits))
         // OpenAI-compatible model discovery (see
         // docs/models-endpoint-protocol.md). Baseline: lists the
         // virtual models in the live routing table.

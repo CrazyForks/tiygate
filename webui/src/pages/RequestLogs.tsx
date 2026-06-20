@@ -1,9 +1,35 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type MouseEvent,
+  type ReactNode,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { useQuery } from "@tanstack/react-query";
-import { ArrowLeft, ArrowRight, Check, ChevronRight, Copy, Eye, Info } from "lucide-react";
-import { apiKeysApi, providersApi, requestsApi, type RequestFilter } from "@/api/resources";
-import type { ApiKey, Provider, RequestLogEntry, RequestReplay } from "@/api/types";
+import {
+  ArrowLeft,
+  ArrowRight,
+  Check,
+  ChevronRight,
+  Copy,
+  Eye,
+  Info,
+} from "lucide-react";
+import {
+  apiKeysApi,
+  providersApi,
+  requestsApi,
+  type RequestFilter,
+} from "@/api/resources";
+import type {
+  ApiKey,
+  Provider,
+  RequestLogEntry,
+  RequestReplay,
+} from "@/api/types";
 import {
   Badge,
   Button,
@@ -117,7 +143,8 @@ function resolveOptionValue(options: FilterOption[], value: string) {
   return (
     options.find(
       (option) =>
-        option.value.toLowerCase() === lower || option.label.toLowerCase() === lower,
+        option.value.toLowerCase() === lower ||
+        option.label.toLowerCase() === lower,
     )?.value ?? trimmed
   );
 }
@@ -138,7 +165,10 @@ function SearchableFilter({
   const { t } = useTranslation();
   const [open, setOpen] = useState(false);
   const inputValue = displayValue(options, value);
-  const visibleOptions = useMemo(() => filterOptions(options, inputValue), [options, inputValue]);
+  const visibleOptions = useMemo(
+    () => filterOptions(options, inputValue),
+    [options, inputValue],
+  );
 
   return (
     <div className="relative">
@@ -179,7 +209,11 @@ function SearchableFilter({
                 key={option.value}
                 type="button"
                 className="block w-full truncate rounded-sm px-2.5 py-1.5 text-left text-sm text-text hover:bg-surface-muted"
-                title={option.value === option.label ? option.label : `${option.label} (${option.value})`}
+                title={
+                  option.value === option.label
+                    ? option.label
+                    : `${option.label} (${option.value})`
+                }
                 onMouseDown={(e) => e.preventDefault()}
                 onClick={() => {
                   onChange(option.value);
@@ -330,7 +364,9 @@ export default function RequestLogs() {
     }
     setFilter({
       model: draft.model?.trim() || undefined,
-      provider: resolveOptionValue(providerFilterOptions, draft.provider ?? "") || undefined,
+      provider:
+        resolveOptionValue(providerFilterOptions, draft.provider ?? "") ||
+        undefined,
       status: draft.status?.trim() || undefined,
       error_class: draft.error_class?.trim() || undefined,
       limit,
@@ -366,7 +402,9 @@ export default function RequestLogs() {
   // Tracks horizontal scroll position to conditionally show left/right
   // edge shadows on the fixed Time and Detail columns.
   const scrollRef = useRef<HTMLDivElement>(null);
-  const [scrollState, setScrollState] = useState<"start" | "middle" | "end">("start");
+  const [scrollState, setScrollState] = useState<"start" | "middle" | "end">(
+    "start",
+  );
 
   useEffect(() => {
     const el = scrollRef.current;
@@ -408,7 +446,9 @@ export default function RequestLogs() {
               aria-label={t("requests.requestId")}
               placeholder={t("requests.requestId")}
               value={draft.request_id ?? ""}
-              onChange={(e) => setDraft({ ...draft, request_id: e.target.value })}
+              onChange={(e) =>
+                setDraft({ ...draft, request_id: e.target.value })
+              }
               className="min-w-48 flex-1 basis-48"
             />
             <div className="min-w-48 flex-1 basis-48">
@@ -489,16 +529,24 @@ export default function RequestLogs() {
             />
           ) : (
             <Table
-              maxHeight={["max-h-[calc(100vh-21rem)]", "lg:max-h-[calc(100vh-17rem)]"]}
+              maxHeight={[
+                "max-h-[calc(100vh-21rem)]",
+                "lg:max-h-[calc(100vh-17rem)]",
+              ]}
               tableClassName="min-w-max border-separate border-spacing-0"
               containerRef={scrollRef}
             >
               <Thead>
                 <tr>
-                  <Th className={cn(
-                    "sticky left-0 z-30 w-80 bg-surface-muted",
-                    scrollState !== "start" && "shadow-[6px_0_10px_-4px_rgba(0,0,0,0.25)]",
-                  )}>{t("requests.ts")}</Th>
+                  <Th
+                    className={cn(
+                      "sticky left-0 z-30 w-80 bg-surface-muted",
+                      scrollState !== "start" &&
+                        "shadow-[6px_0_10px_-4px_rgba(0,0,0,0.25)]",
+                    )}
+                  >
+                    {t("requests.ts")}
+                  </Th>
                   <Th>{t("requests.status")}</Th>
                   <Th className="text-right">{t("requests.httpStatus")}</Th>
                   <Th>{t("requests.model")}</Th>
@@ -509,23 +557,35 @@ export default function RequestLogs() {
                   <Th className="text-right">{t("requests.ttfb")}</Th>
                   <Th className="text-right">{t("requests.outputRate")}</Th>
                   <Th>{t("requests.finishReason")}</Th>
-                  <Th className={cn(
-                    "sticky right-0 z-30 bg-surface-muted text-right",
-                    scrollState !== "end" && "shadow-[-6px_0_10px_-4px_rgba(0,0,0,0.25)]",
-                  )}>{t("requests.detail")}</Th>
+                  <Th
+                    className={cn(
+                      "sticky right-0 z-30 bg-surface-muted text-right",
+                      scrollState !== "end" &&
+                        "shadow-[-6px_0_10px_-4px_rgba(0,0,0,0.25)]",
+                    )}
+                  >
+                    {t("requests.detail")}
+                  </Th>
                 </tr>
               </Thead>
               <tbody>
                 {entries.map((r) => (
                   <Tr key={r.request_id}>
-                    <Td className={cn(
-                      "sticky left-0 z-10 w-80 bg-surface group-hover:bg-surface-muted text-xs text-text-muted",
-                      scrollState !== "start" && "shadow-[6px_0_10px_-4px_rgba(0,0,0,0.25)]",
-                    )}>
+                    <Td
+                      className={cn(
+                        "sticky left-0 z-10 w-80 bg-surface group-hover:bg-surface-muted text-xs text-text-muted",
+                        scrollState !== "start" &&
+                          "shadow-[6px_0_10px_-4px_rgba(0,0,0,0.25)]",
+                      )}
+                    >
                       <div>{fmtTime(r.ts)}</div>
                       <div className="mt-0.5 flex items-center gap-1 font-mono text-[11px] text-text-subtle min-w-0">
                         <span className="truncate">{r.request_id}</span>
-                        <CopyButton value={r.request_id} ariaLabel={t("requests.copyId")} className="shrink-0" />
+                        <CopyButton
+                          value={r.request_id}
+                          ariaLabel={t("requests.copyId")}
+                          className="shrink-0"
+                        />
                       </div>
                     </Td>
                     <Td>
@@ -569,18 +629,20 @@ export default function RequestLogs() {
                       r.stream_duration_ms > 0 &&
                       r.completion_tokens
                         ? fmtThroughput(
-                            r.completion_tokens /
-                              (r.stream_duration_ms / 1000),
+                            r.completion_tokens / (r.stream_duration_ms / 1000),
                           )
                         : "—"}
                     </Td>
                     <Td className="text-xs text-text-muted">
                       {r.finish_reason || "—"}
                     </Td>
-                    <Td className={cn(
-                      "sticky right-0 z-10 bg-surface group-hover:bg-surface-muted text-right",
-                      scrollState !== "end" && "shadow-[-6px_0_10px_-4px_rgba(0,0,0,0.25)]",
-                    )}>
+                    <Td
+                      className={cn(
+                        "sticky right-0 z-10 bg-surface group-hover:bg-surface-muted text-right",
+                        scrollState !== "end" &&
+                          "shadow-[-6px_0_10px_-4px_rgba(0,0,0,0.25)]",
+                      )}
+                    >
                       <Tooltip content={t("requests.viewDetail")}>
                         <Button
                           variant="ghost"
@@ -654,8 +716,7 @@ export default function RequestLogs() {
               status={detail?.status ?? ""}
               errorClass={detail?.error_class}
               truncationReason={
-                replayQuery.data?.truncation_reason ??
-                detail?.truncation_reason
+                replayQuery.data?.truncation_reason ?? detail?.truncation_reason
               }
             />
             {detail?.http_status != null && (
@@ -665,8 +726,12 @@ export default function RequestLogs() {
             )}
             {replayQuery.data?.payload_archive_status && (
               <Badge
-                tone={archiveStatusTone(replayQuery.data.payload_archive_status)}
-                title={archiveStatusTitle(replayQuery.data.payload_archive_status)}
+                tone={archiveStatusTone(
+                  replayQuery.data.payload_archive_status,
+                )}
+                title={archiveStatusTitle(
+                  replayQuery.data.payload_archive_status,
+                )}
               >
                 {replayQuery.data.payload_archive_status}
               </Badge>
@@ -688,8 +753,7 @@ export default function RequestLogs() {
                   <MetricCell
                     label={t("requests.apiKeyId")}
                     value={
-                      resolveApiKeyName(detail.api_key_id) ??
-                      detail.api_key_id
+                      resolveApiKeyName(detail.api_key_id) ?? detail.api_key_id
                     }
                   />
                 )}
@@ -711,8 +775,7 @@ export default function RequestLogs() {
                 <MetricCell
                   label={t("requests.finishReason")}
                   value={
-                    replayQuery.data?.finish_reason ??
-                    detail?.finish_reason
+                    replayQuery.data?.finish_reason ?? detail?.finish_reason
                   }
                 />
                 <MetricCell
@@ -973,9 +1036,7 @@ function MetricCell({
   badge?: ReactNode;
 }) {
   const display =
-    value === null || value === undefined || value === ""
-      ? "—"
-      : String(value);
+    value === null || value === undefined || value === "" ? "—" : String(value);
   return (
     <div>
       <div className="text-xs text-text-subtle">{label}</div>
@@ -1044,7 +1105,9 @@ function PayloadTabGroup({
           ))}
         </div>
       </div>
-      <div className="space-y-2 pt-1" role="tabpanel">{tabs[active]?.content}</div>
+      <div className="space-y-2 pt-1" role="tabpanel">
+        {tabs[active]?.content}
+      </div>
     </div>
   );
 }
@@ -1056,9 +1119,7 @@ function PayloadTabGroup({
  * `[[k, v], ...]` array form when needed, and returns `null` when
  * the payload is missing or unparseable.
  */
-function parseHeaders(
-  json?: string | null,
-): [string, string][] | null {
+function parseHeaders(json?: string | null): [string, string][] | null {
   if (!json) return null;
   let parsed: unknown;
   try {
@@ -1068,7 +1129,8 @@ function parseHeaders(
   }
   if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
     return Object.entries(parsed as Record<string, unknown>).map(
-      ([k, v]) => [k, typeof v === "string" ? v : JSON.stringify(v)] as [string, string],
+      ([k, v]) =>
+        [k, typeof v === "string" ? v : JSON.stringify(v)] as [string, string],
     );
   }
   if (Array.isArray(parsed)) {
@@ -1116,9 +1178,7 @@ function HeadersBlock({
       <p className="text-xs text-text-subtle">{emptyHint}</p>
     ) : null;
   }
-  const serialized = headers
-    .map(([k, v]) => `${k}: ${v}`)
-    .join("\n");
+  const serialized = headers.map(([k, v]) => `${k}: ${v}`).join("\n");
   return (
     <details className="group">
       <summary className="flex cursor-pointer list-none items-center gap-1 text-xs font-medium text-text-muted select-none [&::-webkit-details-marker]:hidden">
@@ -1130,7 +1190,11 @@ function HeadersBlock({
         {label ? (
           <CopyButton value={serialized} ariaLabel={copyAllLabel} />
         ) : (
-          <CopyButton value={serialized} ariaLabel={copyAllLabel} className="ml-auto" />
+          <CopyButton
+            value={serialized}
+            ariaLabel={copyAllLabel}
+            className="ml-auto"
+          />
         )}
       </summary>
       <div className="mt-1 max-h-64 overflow-auto rounded-md bg-surface-muted p-3 font-mono text-xs text-text">
@@ -1387,11 +1451,14 @@ function CopyButton({
   );
 }
 
-function protocolCategory(p?: string | null): { label: string; tone: BadgeTone } | null {
+function protocolCategory(
+  p?: string | null,
+): { label: string; tone: BadgeTone } | null {
   if (!p) return null;
   // Three-segment form `suite/name/version` → category derived from the name.
   const parts = p.split("/");
-  const name = parts.length >= 3 ? parts[1] : (parts.length === 2 ? parts[1] : parts[0]);
+  const name =
+    parts.length >= 3 ? parts[1] : parts.length === 2 ? parts[1] : parts[0];
   switch (name) {
     case "chat-completions":
       return { label: "OpenAI-Compatible", tone: "primary" };
@@ -1403,6 +1470,9 @@ function protocolCategory(p?: string | null): { label: string; tone: BadgeTone }
       return { label: "Gemini", tone: "info" };
     case "embeddings":
       return { label: "Embedding", tone: "neutral" };
+    case "images-generations":
+    case "images-edits":
+      return { label: "OpenAI-Images", tone: "primary" };
     default:
       return { label: name, tone: "neutral" };
   }

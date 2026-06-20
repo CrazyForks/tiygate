@@ -65,7 +65,7 @@ impl Provider for OpenCodeZenProvider {
     }
 
     fn egress_protocol_for_model(&self, model_id: &str) -> ProtocolEndpoint {
-        suite_for_model(model_id).default_endpoint()
+        opencode_egress_protocol_for_model(model_id)
     }
 }
 
@@ -87,7 +87,7 @@ impl Provider for OpenCodeGoProvider {
     }
 
     fn egress_protocol_for_model(&self, model_id: &str) -> ProtocolEndpoint {
-        suite_for_model(model_id).default_endpoint()
+        opencode_egress_protocol_for_model(model_id)
     }
 }
 
@@ -107,6 +107,21 @@ fn opencode_metadata(display_name: &str, base_url: &str) -> ProviderMetadata {
     }
 }
 
+/// Shared egress protocol derivation for OpenCode providers. Image
+/// models route to the images-generations endpoint within the
+/// OpenAI-compatible suite; all others use `suite_for_model`.
+fn opencode_egress_protocol_for_model(model_id: &str) -> ProtocolEndpoint {
+    let body = model_id.split(':').next().unwrap_or(model_id);
+    let body = body.rsplit('/').next().unwrap_or(body);
+    let body = body.to_ascii_lowercase();
+
+    if body.contains("image") || body.contains("dall-e") {
+        return ProtocolEndpoint::new(ProtocolSuite::OpenAiCompatible, "images-generations", "v1");
+    }
+
+    suite_for_model(model_id).default_endpoint()
+}
+
 /// Pick the egress protocol suite for an OpenCode target from its egress model
 /// id. The model id may be of the form `maker/model:provider`, where the
 /// `maker/` prefix and `:provider` suffix are both optional.
@@ -114,6 +129,12 @@ fn suite_for_model(model_id: &str) -> ProtocolSuite {
     let body = model_id.split(':').next().unwrap_or(model_id);
     let body = body.rsplit('/').next().unwrap_or(body);
     let body = body.to_ascii_lowercase();
+
+    // Image models use the images-generations endpoint within the
+    // OpenAI-compatible suite — must be checked before `gpt`.
+    if body.contains("image") || body.contains("dall-e") {
+        return ProtocolSuite::OpenAiCompatible;
+    }
 
     if body.contains("gpt") {
         ProtocolSuite::OpenAiResponses

@@ -33,11 +33,19 @@ impl OpenAiCompatibleProvider {
                 base_url: base_url.clone(),
                 auth_mode: AuthMode::Bearer,
                 channels: vec!["default".to_string()],
-                protocols: vec![ProtocolEndpoint::new(
-                    ProtocolSuite::OpenAiCompatible,
-                    "chat-completions",
-                    "v1",
-                )],
+                protocols: vec![
+                    ProtocolEndpoint::new(
+                        ProtocolSuite::OpenAiCompatible,
+                        "chat-completions",
+                        "v1",
+                    ),
+                    ProtocolEndpoint::new(
+                        ProtocolSuite::OpenAiCompatible,
+                        "images-generations",
+                        "v1",
+                    ),
+                    ProtocolEndpoint::new(ProtocolSuite::OpenAiCompatible, "images-edits", "v1"),
+                ],
                 defaults: serde_json::json!({}),
             },
         })
@@ -61,9 +69,22 @@ impl Provider for OpenAiCompatibleProvider {
         Arc::new(BearerAuthApplier)
     }
 
-    fn egress_protocol_for_model(&self, _model_id: &str) -> ProtocolEndpoint {
-        ProtocolSuite::OpenAiCompatible.default_endpoint()
+    fn egress_protocol_for_model(&self, model_id: &str) -> ProtocolEndpoint {
+        if is_image_model(model_id) {
+            ProtocolEndpoint::new(ProtocolSuite::OpenAiCompatible, "images-generations", "v1")
+        } else {
+            ProtocolSuite::OpenAiCompatible.default_endpoint()
+        }
     }
+}
+
+/// Heuristic: return `true` when the model id looks like an image
+/// generation model (e.g. `gpt-image-1`, `dall-e-3`).
+fn is_image_model(model_id: &str) -> bool {
+    let body = model_id.split(':').next().unwrap_or(model_id);
+    let body = body.rsplit('/').next().unwrap_or(body);
+    let body = body.to_ascii_lowercase();
+    body.contains("image") || body.contains("dall-e")
 }
 
 inventory::submit! {
@@ -78,11 +99,23 @@ inventory::submit! {
                     base_url: "http://localhost:8080/v1".to_string(),
                     auth_mode: AuthMode::Bearer,
                     channels: vec!["default".to_string()],
-                    protocols: vec![ProtocolEndpoint::new(
-                        ProtocolSuite::OpenAiCompatible,
-                        "chat-completions",
-                        "v1",
-                    )],
+                    protocols: vec![
+                        ProtocolEndpoint::new(
+                            ProtocolSuite::OpenAiCompatible,
+                            "chat-completions",
+                            "v1",
+                        ),
+                        ProtocolEndpoint::new(
+                            ProtocolSuite::OpenAiCompatible,
+                            "images-generations",
+                            "v1",
+                        ),
+                        ProtocolEndpoint::new(
+                            ProtocolSuite::OpenAiCompatible,
+                            "images-edits",
+                            "v1",
+                        ),
+                    ],
                     defaults: serde_json::json!({}),
                 },
             }
@@ -125,5 +158,48 @@ mod tests {
         assert!(!protocols.is_empty());
         assert_eq!(protocols[0].suite, ProtocolSuite::OpenAiCompatible);
         std::env::remove_var("OPENAI_COMPATIBLE_BASE_URL");
+    }
+
+    #[test]
+    fn test_openai_compatible_egress_protocol_for_image_model() {
+        let provider =
+            OpenAiCompatibleProvider::from_env().unwrap_or_else(|| OpenAiCompatibleProvider {
+                base_url: String::new(),
+                api_key: String::new(),
+                metadata: ProviderMetadata {
+                    display_name: "OpenAI Compatible".to_string(),
+                    base_url: String::new(),
+                    auth_mode: AuthMode::Bearer,
+                    channels: vec!["default".to_string()],
+                    protocols: vec![],
+                    defaults: serde_json::json!({}),
+                },
+            });
+        let endpoint = provider.egress_protocol_for_model("gpt-image-1");
+        assert_eq!(endpoint.suite, ProtocolSuite::OpenAiCompatible);
+        assert_eq!(endpoint.name, "images-generations");
+
+        let endpoint = provider.egress_protocol_for_model("dall-e-3");
+        assert_eq!(endpoint.name, "images-generations");
+    }
+
+    #[test]
+    fn test_openai_compatible_egress_protocol_for_chat_model() {
+        let provider =
+            OpenAiCompatibleProvider::from_env().unwrap_or_else(|| OpenAiCompatibleProvider {
+                base_url: String::new(),
+                api_key: String::new(),
+                metadata: ProviderMetadata {
+                    display_name: "OpenAI Compatible".to_string(),
+                    base_url: String::new(),
+                    auth_mode: AuthMode::Bearer,
+                    channels: vec!["default".to_string()],
+                    protocols: vec![],
+                    defaults: serde_json::json!({}),
+                },
+            });
+        let endpoint = provider.egress_protocol_for_model("llama-3");
+        assert_eq!(endpoint.suite, ProtocolSuite::OpenAiCompatible);
+        assert_eq!(endpoint.name, "chat-completions");
     }
 }
