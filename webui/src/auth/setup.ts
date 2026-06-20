@@ -12,15 +12,15 @@
 
 /** Whether the app is running inside a Tauri webview. */
 export function isTauri(): boolean {
-  return (
-    typeof window !== "undefined" &&
-    "__TAURI_INTERNALS__" in window
-  );
+  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
 
 // Lazily load the Tauri invoke shim. We use a dynamic import wrapped in
 // a helper so the module graph stays optional.
-async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+async function invoke<T>(
+  cmd: string,
+  args?: Record<string, unknown>,
+): Promise<T> {
   const mod = await import("@tauri-apps/api/core");
   return mod.invoke<T>(cmd, args);
 }
@@ -101,4 +101,111 @@ export async function tauriGetMasterKey(): Promise<string | null> {
  */
 export async function tauriApplyMasterKey(key: string): Promise<void> {
   await invoke<void>("apply_master_key", { key });
+}
+
+// ---------------------------------------------------------------------------
+// Remote instance management
+// ---------------------------------------------------------------------------
+
+/** A user-configured remote TiyGate instance. */
+export interface InstanceEntry {
+  id: string;
+  label: string;
+  url: string;
+  skip_tls_verify: boolean;
+}
+
+/** Information about the currently active instance. */
+export interface ActiveInstance {
+  kind: "local" | "remote";
+  id?: string;
+  label?: string;
+  url?: string;
+}
+
+/** Categorical health status for the instance indicator. */
+export type HealthStatus = "ok" | "warning" | "error" | "unreachable";
+
+/** List all user-added remote instances (local sidecar not included). */
+export async function tauriListInstances(): Promise<InstanceEntry[]> {
+  if (!isTauri()) return [];
+  try {
+    return await invoke<InstanceEntry[]>("list_instances");
+  } catch {
+    return [];
+  }
+}
+
+/** Add a new remote instance and persist it. Returns the created entry. */
+export async function tauriAddInstance(
+  label: string,
+  url: string,
+  skipTlsVerify: boolean,
+): Promise<InstanceEntry> {
+  return await invoke<InstanceEntry>("add_instance", {
+    label,
+    url,
+    skipTlsVerify,
+  });
+}
+
+/** Update an existing remote instance by id. */
+export async function tauriUpdateInstance(
+  id: string,
+  label: string,
+  url: string,
+  skipTlsVerify: boolean,
+): Promise<void> {
+  await invoke<void>("update_instance", {
+    id,
+    label,
+    url,
+    skipTlsVerify,
+  });
+}
+
+/** Remove a remote instance by id. */
+export async function tauriRemoveInstance(id: string): Promise<void> {
+  await invoke<void>("remove_instance", { id });
+}
+
+/** Return information about the currently active instance. */
+export async function tauriGetActiveInstance(): Promise<ActiveInstance | null> {
+  if (!isTauri()) return null;
+  try {
+    return await invoke<ActiveInstance>("get_active_instance");
+  } catch {
+    return null;
+  }
+}
+
+/** Switch the active instance. `null` selects the local sidecar. */
+export async function tauriSwitchInstance(id: string | null): Promise<void> {
+  await invoke<void>("switch_instance", { id });
+}
+
+/** Return the last-selected instance id (`null` = local). */
+export async function tauriGetLastInstanceId(): Promise<string | null> {
+  if (!isTauri()) return null;
+  try {
+    return await invoke<string | null>("get_last_instance_id");
+  } catch {
+    return null;
+  }
+}
+
+/** Probe a remote instance's healthz endpoint. */
+export async function tauriCheckInstanceHealth(
+  url: string,
+  skipTlsVerify: boolean,
+): Promise<HealthStatus> {
+  if (!isTauri()) return "unreachable";
+  try {
+    return await invoke<HealthStatus>("check_instance_health", {
+      url,
+      skipTlsVerify,
+    });
+  } catch {
+    return "unreachable";
+  }
 }

@@ -10,8 +10,10 @@
 //!   setup as done.
 //! - `get_server_port` — the port the sidecar is listening on.
 
+use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
 
+use crate::config::InstanceEntry;
 use crate::sidecar;
 use crate::AppState;
 
@@ -124,6 +126,254 @@ pub async fn enable_passwordless(
         cfg.admin_token.clone()
     };
     Ok(token)
+}
+
+// ---------------------------------------------------------------------------
+// Remote instance management commands
+// ---------------------------------------------------------------------------
+
+/// Serializable view of the currently active instance, returned by
+/// `get_active_instance`. In Tauri, `serde` rename flattens `kind` to
+/// a lowercase string the frontend can switch on.
+#[derive(Debug, Clone, Serialize)]
+pub struct ActiveInstance {
+    /// `"local"` for the sidecar, `"remote"` for a user-added instance.
+    pub kind: String,
+    /// Instance id. `None` for the local sidecar.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Human-friendly label.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Base URL (without `/admin/v1`). For local, this is the
+    /// `http://127.0.0.1:{port}` origin. For remote, the user-entered
+    /// URL. The frontend appends `/admin/v1` itself.
+    pub url: Option<String>,
+}
+
+/// Categorical health status for the instance indicator.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthStatus {
+    /// 2xx from `/healthz`.
+    Ok,
+    /// Non-2xx but reachable (e.g. 503 unconfigured, 401).
+    Warning,
+    /// 4xx/5xx server error.
+    Error,
+    /// Connection failed entirely.
+    Unreachable,
+}
+
+/// List all user-added (remote) instances. The local sidecar is not
+/// included — it is always available implicitly.
+#[tauri::command]
+pub fn list_instances(state: State<'_, AppState>) -> Vec<InstanceEntry> {
+    state
+        .config
+        .lock()
+        .map(|cfg| cfg.instances.clone())
+        .unwrap_or_default()
+}
+
+/// Add a new remote instance and persist the config. Returns the
+/// created entry (with generated id and normalized URL).
+#[tauri::command]
+pub fn add_instance(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    label: String,
+    url: String,
+    skip_tls_verify: bool,
+) -> Result<InstanceEntry, String> {
+    let label = label.trim().to_string();
+    let url = url.trim().to_string();
+    if label.is_empty() {
+        return Err("label cannot be empty".into());
+    }
+    if url.is_empty() {
+        return Err("url cannot be empty".into());
+    }
+    let data_dir = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| format!("failed to resolve app_local_data_dir: {e}"))?;
+    let entry = {
+        let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
+        let new_entry = InstanceEntry {
+            id: String::new(),
+            label,
+            url,
+            skip_tls_verify,
+        };
+        let added = cfg.add_instance(new_entry);
+        let clone = added.clone();
+        cfg.save(&data_dir)
+            .map_err(|e| format!("failed to save config: {e}"))?;
+        clone
+    };
+    Ok(entry)
+}
+
+/// Update an existing remote instance by id.
+#[tauri::command]
+pub fn update_instance(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+    label: String,
+    url: String,
+    skip_tls_verify: bool,
+) -> Result<(), String> {
+    let label = label.trim().to_string();
+    let url = url.trim().to_string();
+    if label.is_empty() {
+        return Err("label cannot be empty".into());
+    }
+    if url.is_empty() {
+        return Err("url cannot be empty".into());
+    }
+    let data_dir = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| format!("failed to resolve app_local_data_dir: {e}"))?;
+    let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
+    if !cfg.update_instance(&id, label, url, skip_tls_verify) {
+        return Err("instance not found".into());
+    }
+    cfg.save(&data_dir)
+        .map_err(|e| format!("failed to save config: {e}"))
+}
+
+/// Remove a remote instance by id. If the removed instance was active,
+/// the active instance falls back to local.
+#[tauri::command]
+pub fn remove_instance(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
+    let data_dir = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| format!("failed to resolve app_local_data_dir: {e}"))?;
+    let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
+    if !cfg.remove_instance(&id) {
+        return Err("instance not found".into());
+    }
+    cfg.save(&data_dir)
+        .map_err(|e| format!("failed to save config: {e}"))
+}
+
+/// Return information about the currently active instance. The
+/// frontend uses this to decide the API base URL.
+#[tauri::command]
+pub fn get_active_instance(state: State<'_, AppState>) -> ActiveInstance {
+    let (active_id, instances) = {
+        let cfg = state.config.lock();
+        match cfg {
+            Ok(c) => (c.active_instance_id.clone(), c.instances.clone()),
+            Err(_) => (None, Vec::new()),
+        }
+    };
+    let port = state.server_port.lock().map(|p| *p).unwrap_or(0);
+
+    // If a remote instance is active, return its info.
+    if let Some(ref id) = active_id {
+        if let Some(inst) = instances.iter().find(|i| &i.id == id) {
+            return ActiveInstance {
+                kind: "remote".into(),
+                id: Some(inst.id.clone()),
+                label: Some(inst.label.clone()),
+                url: Some(inst.url.clone()),
+            };
+        }
+    }
+    // Fall back to local sidecar.
+    ActiveInstance {
+        kind: "local".into(),
+        id: None,
+        label: None,
+        url: Some(format!("http://127.0.0.1:{port}")),
+    }
+}
+
+/// Switch the active instance. `id = None` selects the local sidecar.
+/// Updates both `active_instance_id` and `last_instance_id`, then
+/// persists. Does NOT restart the sidecar — it keeps running.
+#[tauri::command]
+pub fn switch_instance(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: Option<String>,
+) -> Result<(), String> {
+    // Validate that the id refers to an existing remote instance.
+    if let Some(ref inst_id) = id {
+        let exists = state
+            .config
+            .lock()
+            .map(|cfg| cfg.instances.iter().any(|i| &i.id == inst_id))
+            .map_err(|e| e.to_string())?;
+        if !exists {
+            return Err("instance not found".into());
+        }
+    }
+    let data_dir = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| format!("failed to resolve app_local_data_dir: {e}"))?;
+    let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
+    cfg.set_active_instance(id.clone());
+    cfg.set_last_instance(id);
+    cfg.save(&data_dir)
+        .map_err(|e| format!("failed to save config: {e}"))
+}
+
+/// Return the last-selected instance id so the Setup wizard can
+/// default to it. `None` means local.
+#[tauri::command]
+pub fn get_last_instance_id(state: State<'_, AppState>) -> Option<String> {
+    state
+        .config
+        .lock()
+        .ok()
+        .and_then(|cfg| cfg.last_instance_id.clone())
+}
+
+/// Probe a remote instance's `/healthz` endpoint and return a
+/// categorical health status. Uses a permissive TLS client when
+/// `skip_tls_verify` is set so self-signed instances still work.
+#[tauri::command]
+pub async fn check_instance_health(
+    url: String,
+    skip_tls_verify: bool,
+) -> Result<HealthStatus, String> {
+    let base = url.trim_end_matches('/');
+    if base.is_empty() {
+        return Err("url cannot be empty".into());
+    }
+    let health_url = format!("{base}/healthz");
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .danger_accept_invalid_certs(skip_tls_verify)
+        .build()
+        .map_err(|e| format!("failed to build HTTP client: {e}"))?;
+
+    let resp = client.get(&health_url).send().await;
+    match resp {
+        Ok(r) => {
+            let status = r.status().as_u16();
+            if (200..300).contains(&status) {
+                Ok(HealthStatus::Ok)
+            } else if status == 401 || status == 403 || status == 503 {
+                Ok(HealthStatus::Warning)
+            } else {
+                Ok(HealthStatus::Error)
+            }
+        }
+        Err(_) => Ok(HealthStatus::Unreachable),
+    }
 }
 
 /// Restart the sidecar using the current configuration values. This is

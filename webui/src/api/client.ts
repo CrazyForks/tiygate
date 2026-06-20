@@ -4,8 +4,9 @@ import { getToken, clearToken } from "@/auth/token";
  * Resolve the API base URL. In a browser (non-Tauri) environment the
  * SPA is served by the same origin as the API, so a relative path
  * works. In a Tauri webview the SPA is served from `tauri://localhost`
- * while the API lives on `http://127.0.0.1:{port}`, so we need an
- * absolute URL. The port is fetched from the Tauri backend and cached.
+ * while the API lives on a remote or local server, so we need an
+ * absolute URL. The active instance info is fetched from the Tauri
+ * backend and cached.
  */
 let apiBaseUrl = "/admin/v1";
 let portResolved = false;
@@ -19,10 +20,16 @@ async function ensureApiBase(): Promise<void> {
     return;
   }
   try {
+    // Fetch the active instance from the Rust backend. For local
+    // instances this returns the 127.0.0.1 origin + port; for remote
+    // instances it returns the user-configured URL.
     const mod = await import("@tauri-apps/api/core");
-    const port = await mod.invoke<number>("get_server_port");
-    if (port > 0) {
-      apiBaseUrl = `http://127.0.0.1:${port}/admin/v1`;
+    const active = await mod.invoke<{
+      kind: string;
+      url?: string;
+    }>("get_active_instance");
+    if (active?.url) {
+      apiBaseUrl = `${active.url.replace(/\/+$/, "")}/admin/v1`;
     }
   } catch {
     // Degrade to relative path — will fail with connection errors,
@@ -31,7 +38,17 @@ async function ensureApiBase(): Promise<void> {
   portResolved = true;
 }
 
-/** Reset the cached port (used when the sidecar restarts on a new port). */
+/**
+ * Force-set the API base URL after an instance switch, bypassing the
+ * ensureApiBase lookup. The caller passes the full base (origin for
+ * local, URL for remote); this function appends `/admin/v1`.
+ */
+export function setActiveInstance(baseUrl: string): void {
+  apiBaseUrl = `${baseUrl.replace(/\/+$/, "")}/admin/v1`;
+  portResolved = true;
+}
+
+/** Reset the cached base URL (used when switching instances or when the sidecar restarts on a new port). */
 export function resetApiBase(): void {
   portResolved = false;
   apiBaseUrl = "/admin/v1";
@@ -90,10 +107,7 @@ interface RequestOptions {
   allowEmpty?: boolean;
 }
 
-function buildUrl(
-  path: string,
-  query?: RequestOptions["query"],
-): string {
+function buildUrl(path: string, query?: RequestOptions["query"]): string {
   const url = `${apiBaseUrl}${path}`;
   if (!query) return url;
   const params = new URLSearchParams();
@@ -149,7 +163,10 @@ export async function apiRequest<T>(
  * login page can display the version before the user has a token.
  * Returns `null` on any error so callers can degrade gracefully.
  */
-export async function fetchServerInfo(): Promise<{ name: string; version: string } | null> {
+export async function fetchServerInfo(): Promise<{
+  name: string;
+  version: string;
+} | null> {
   await ensureApiBase();
   try {
     const res = await fetch(buildUrl("/info"));

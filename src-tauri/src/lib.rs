@@ -38,9 +38,7 @@ pub fn run() {
             // latter, so we set it at runtime as well).
             #[cfg(target_os = "macos")]
             {
-                if let Err(e) =
-                    handle.set_activation_policy(tauri::ActivationPolicy::Accessory)
-                {
+                if let Err(e) = handle.set_activation_policy(tauri::ActivationPolicy::Accessory) {
                     tracing::warn!("failed to set activation policy to Accessory: {e}");
                 }
             }
@@ -81,6 +79,7 @@ pub fn run() {
             })?;
 
             client_config.server_port = Some(port);
+            client_config.reconcile_active_instance();
             client_config.save(&data_dir)?;
 
             app.manage(AppState {
@@ -105,10 +104,9 @@ pub fn run() {
             // must be pure-black pixels with an alpha channel; the system
             // handles inversion. The PNG is embedded at compile time via
             // `include_bytes!` so no filesystem access is needed at runtime.
-            let tray_icon = tauri::image::Image::from_bytes(include_bytes!(
-                "../icons/tray-icon-template.png"
-            ))
-            .map_err(|e| anyhow::anyhow!("failed to load tray icon: {e}"))?;
+            let tray_icon =
+                tauri::image::Image::from_bytes(include_bytes!("../icons/tray-icon-template.png"))
+                    .map_err(|e| anyhow::anyhow!("failed to load tray icon: {e}"))?;
 
             TrayIconBuilder::with_id("main-tray")
                 .icon(tray_icon)
@@ -172,6 +170,14 @@ pub fn run() {
             commands::get_server_port,
             commands::get_master_key,
             commands::apply_master_key,
+            commands::list_instances,
+            commands::add_instance,
+            commands::update_instance,
+            commands::remove_instance,
+            commands::get_active_instance,
+            commands::switch_instance,
+            commands::get_last_instance_id,
+            commands::check_instance_health,
         ])
         .on_window_event(|window, event| {
             // When the main window close is requested (e.g. clicking the

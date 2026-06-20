@@ -226,15 +226,17 @@ function resolveDefaultBaseUrl(): string {
   return origin;
 }
 
-/** In Tauri, fetch the sidecar port and build the base URL. Returns
- *  `null` in non-Tauri environments. */
+/** In Tauri, fetch the active instance URL and build the base URL.
+ *  Returns `null` in non-Tauri environments. */
 async function getServerBaseUrl(): Promise<string | null> {
   const isTauri = "__TAURI_INTERNALS__" in window;
   if (!isTauri) return null;
   try {
     const mod = await import("@tauri-apps/api/core");
-    const port = await mod.invoke<number>("get_server_port");
-    if (port > 0) return `http://127.0.0.1:${port}`;
+    const active = await mod.invoke<{ kind: string; url?: string }>(
+      "get_active_instance",
+    );
+    if (active?.url) return active.url.replace(/\/+$/, "");
   } catch {
     // ignore
   }
@@ -795,17 +797,20 @@ export default function IntegrationGuide() {
   );
   const [copied, setCopied] = useState(false);
 
-  // In Tauri, resolve the sidecar port and override the default base URL.
+  // In Tauri, the API base URL is determined by the active instance
+  // (local sidecar or remote). Always sync from the backend so that
+  // switching instances updates the Integration Guide immediately.
   useEffect(() => {
+    if (!("__TAURI_INTERNALS__" in window)) return;
+    let cancelled = false;
     getServerBaseUrl().then((url) => {
-      if (url) {
-        // Only override if the user hasn't customized it.
-        const stored = readStoredString(STORAGE.baseUrl, "");
-        if (!stored || stored === DEFAULT_API_BASE) {
-          setBaseUrl(url);
-        }
+      if (!cancelled && url) {
+        setBaseUrl(url);
       }
     });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {

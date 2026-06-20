@@ -1,12 +1,7 @@
 import { useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useQuery } from "@tanstack/react-query";
-import {
-  apiKeysApi,
-  healthApi,
-  providersApi,
-  statsApi,
-} from "@/api/resources";
+import { apiKeysApi, healthApi, providersApi, statsApi } from "@/api/resources";
 import type { CircuitBreaker, StatBucket, StatsResponse } from "@/api/types";
 import {
   Badge,
@@ -23,6 +18,7 @@ import {
   Tr,
 } from "@/components/ui";
 import { PageHeader } from "@/components/PageHeader";
+import { InstanceIndicator } from "@/components/InstanceIndicator";
 import { TokenSummaryBar } from "@/components/TokenSummaryBar";
 import { TokenHeatmap } from "@/components/TokenHeatmap";
 import { fmtTokens } from "@/lib/format";
@@ -35,11 +31,15 @@ function fmtThroughput(value?: number | null): string {
 }
 
 /** Two-line cell: primary name on top, faint id below as fallback / context. */
-function BucketCell({ primary, secondary }: { primary: string; secondary?: string }) {
+function BucketCell({
+  primary,
+  secondary,
+}: {
+  primary: string;
+  secondary?: string;
+}) {
   if (!secondary || secondary === primary) {
-    return (
-      <span className="font-medium text-text">{primary || "—"}</span>
-    );
+    return <span className="font-medium text-text">{primary || "—"}</span>;
   }
   return (
     <div className="flex flex-col leading-tight">
@@ -205,7 +205,9 @@ function StatsTableContent({
 
 export default function Dashboard() {
   const { t } = useTranslation();
-  const [statsTab, setStatsTab] = useState<"model" | "provider" | "apiKey" | "target">("model");
+  const [statsTab, setStatsTab] = useState<
+    "model" | "provider" | "apiKey" | "target"
+  >("model");
 
   const byModel = useQuery({
     queryKey: ["stats", "by-model"],
@@ -282,31 +284,25 @@ export default function Dashboard() {
     },
     [providerNameById],
   );
-  const resolveTargetSecondary = useCallback(
-    (bucket: string) => {
-      const idx = bucket.indexOf(" / ");
-      if (idx === -1) return undefined;
-      return bucket.slice(0, idx);
-    },
-    [],
-  );
+  const resolveTargetSecondary = useCallback((bucket: string) => {
+    const idx = bucket.indexOf(" / ");
+    if (idx === -1) return undefined;
+    return bucket.slice(0, idx);
+  }, []);
 
   // Aggregate top-line metrics from the by-model buckets.
   const modelBuckets = byModel.data?.buckets ?? [];
   const totalRequests = modelBuckets.reduce((s, b) => s + b.count, 0);
   const totalErrors = modelBuckets.reduce((s, b) => s + b.error_count, 0);
   const totalTokens = modelBuckets.reduce((s, b) => s + b.total_tokens, 0);
-  const errorRate =
-    totalRequests > 0 ? (totalErrors / totalRequests) * 100 : 0;
+  const errorRate = totalRequests > 0 ? (totalErrors / totalRequests) * 100 : 0;
 
   const targets = breakers.data?.targets ?? [];
   const unhealthy = targets.filter((b) => !b.healthy).length;
 
   return (
     <div className="space-y-6">
-      <PageHeader
-        title={t("dashboard.title")}
-      />
+      <PageHeader title={t("dashboard.title")} action={<InstanceIndicator />} />
 
       {/* 1. Token Activity Heatmap + Summary cards — side by side */}
       <div className="flex flex-col xl:flex-row gap-4 xl:items-stretch">
@@ -315,8 +311,13 @@ export default function Dashboard() {
           {tokenActivity.error || tokenSummary.error ? (
             <div className="p-4">
               <ErrorBox
-                message={((tokenActivity.error ?? tokenSummary.error) as Error).message}
-                onRetry={() => { tokenActivity.refetch(); tokenSummary.refetch(); }}
+                message={
+                  ((tokenActivity.error ?? tokenSummary.error) as Error).message
+                }
+                onRetry={() => {
+                  tokenActivity.refetch();
+                  tokenSummary.refetch();
+                }}
                 retryLabel={t("common.retry")}
               />
             </div>
@@ -374,9 +375,7 @@ export default function Dashboard() {
           />
           <Metric
             label={t("dashboard.totalRequests")}
-            value={
-              byModel.isLoading ? "…" : numberFmt.format(totalRequests)
-            }
+            value={byModel.isLoading ? "…" : numberFmt.format(totalRequests)}
             caption={t("dashboard.summaryCaption")}
           />
         </div>
@@ -407,9 +406,7 @@ export default function Dashboard() {
               </button>
             ))}
           </div>
-          {statsTab === "model" && (
-            <StatsTableContent query={byModel} />
-          )}
+          {statsTab === "model" && <StatsTableContent query={byModel} />}
           {statsTab === "provider" && (
             <StatsTableContent
               query={byProvider}
@@ -470,7 +467,7 @@ export default function Dashboard() {
                   const primary =
                     b.provider_name && b.model_id !== undefined
                       ? `${b.provider_name} / ${b.model_id || "—"}`
-                      : b.provider_name ?? b.target;
+                      : (b.provider_name ?? b.target);
                   return (
                     <Tr key={b.target}>
                       <Td className="align-top">
@@ -489,7 +486,9 @@ export default function Dashboard() {
                             {b.remaining_seconds != null && (
                               <span className="text-xs text-text-subtle">
                                 {t("dashboard.breakerRemainingTime", {
-                                  time: formatRemainingTime(b.remaining_seconds),
+                                  time: formatRemainingTime(
+                                    b.remaining_seconds,
+                                  ),
                                 })}
                               </span>
                             )}
@@ -502,7 +501,9 @@ export default function Dashboard() {
                             {b.remaining_seconds != null && (
                               <span className="text-xs text-text-subtle">
                                 {t("dashboard.breakerRemainingTime", {
-                                  time: formatRemainingTime(b.remaining_seconds),
+                                  time: formatRemainingTime(
+                                    b.remaining_seconds,
+                                  ),
                                 })}
                               </span>
                             )}
@@ -520,7 +521,9 @@ export default function Dashboard() {
 
       {/* Circuit breaker rules explanation */}
       <div className="rounded-lg border border-border bg-surface p-5 text-sm text-text-subtle space-y-3">
-        <h3 className="text-sm font-medium text-text">{t("dashboard.breakerRulesTitle")}</h3>
+        <h3 className="text-sm font-medium text-text">
+          {t("dashboard.breakerRulesTitle")}
+        </h3>
         <ul className="list-disc list-inside space-y-1.5 leading-relaxed">
           <li>{t("dashboard.breakerRuleKey")}</li>
           <li>{t("dashboard.breakerRuleTrip")}</li>

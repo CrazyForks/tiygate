@@ -10,7 +10,12 @@ import {
 import { useQueryClient } from "@tanstack/react-query";
 import { setUnauthorizedHandler } from "@/api/client";
 import { clearToken, getToken, setToken } from "./token";
-import { isTauri, tauriGetAdminToken, checkIsFirstRun } from "./setup";
+import {
+  isTauri,
+  tauriGetAdminToken,
+  checkIsFirstRun,
+  tauriGetActiveInstance,
+} from "./setup";
 
 interface AuthState {
   token: string | null;
@@ -44,18 +49,18 @@ export function AuthProvider({ children }: PropsWithChildren) {
     queryClient.clear();
   }, [queryClient]);
 
-  const login = useCallback(
-    (newToken: string, remember: boolean) => {
-      setToken(newToken, remember);
-      setTokenState(newToken);
-    },
-    [],
-  );
+  const login = useCallback((newToken: string, remember: boolean) => {
+    setToken(newToken, remember);
+    setTokenState(newToken);
+  }, []);
 
   // In Tauri environments, attempt to auto-login on mount:
   // - If first-run is not complete, do nothing (the Setup page handles it).
-  // - If first-run is complete, fetch the stored token and auto-login.
-  //   This is the passwordless flow — mark it so the logout button is hidden.
+  // - If first-run is complete, check the active instance:
+  //   - Local sidecar → fetch the stored token and auto-login
+  //     (passwordless flow). Mark it so the logout button is hidden.
+  //   - Remote instance → do NOT auto-login; the user must enter the
+  //     Admin Token manually on the Login page.
   useEffect(() => {
     if (!tauri) {
       setIsInitializing(false);
@@ -66,12 +71,23 @@ export function AuthProvider({ children }: PropsWithChildren) {
       try {
         const firstRun = await checkIsFirstRun();
         if (!firstRun) {
-          const storedToken = await tauriGetAdminToken();
-          if (storedToken && !cancelled) {
-            setToken(storedToken, true);
-            setTokenState(storedToken);
-            setIsPasswordless(true);
+          const active = await tauriGetActiveInstance();
+          // Only auto-login for the local sidecar. Remote instances
+          // require manual token entry.
+          if (active?.kind === "local") {
+            const storedToken = await tauriGetAdminToken();
+            if (storedToken && !cancelled) {
+              setToken(storedToken, true);
+              setTokenState(storedToken);
+              setIsPasswordless(true);
+            }
+          } else if (active?.kind === "remote") {
+            // Clear any cached React Query data from a previous
+            // instance to prevent cross-instance data leakage.
+            queryClient.clear();
           }
+          // For remote instances, isInitializing completes without
+          // setting a token, so ProtectedRoute will redirect to /login.
         }
       } catch {
         // Degrade gracefully — user can use the login page manually.
@@ -82,7 +98,7 @@ export function AuthProvider({ children }: PropsWithChildren) {
     return () => {
       cancelled = true;
     };
-  }, [tauri]);
+  }, [tauri, queryClient]);
 
   // Wire the API client's 401 handler so any rejected request drops
   // the session and bounces the user back to login.
@@ -107,7 +123,15 @@ export function AuthProvider({ children }: PropsWithChildren) {
       login,
       logout,
     }),
-    [token, tauri, isInitializing, isPasswordless, setPasswordless, login, logout],
+    [
+      token,
+      tauri,
+      isInitializing,
+      isPasswordless,
+      setPasswordless,
+      login,
+      logout,
+    ],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
