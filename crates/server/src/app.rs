@@ -422,6 +422,12 @@ async fn bootstrap_settings(store: &Arc<DbConfigStore>, cfg: &ServerConfig) {
         &cfg.raw_envelope_capture_media.to_string(),
     )
     .await;
+    let _ = ensure_setting(
+        store,
+        sk::INGRESS_REQUIRE_API_KEY,
+        &cfg.require_api_key.to_string(),
+    )
+    .await;
 
     // Upstream
     let _ = ensure_setting(

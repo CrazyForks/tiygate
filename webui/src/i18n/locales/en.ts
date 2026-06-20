@@ -591,6 +591,9 @@ const en = {
       rawEnvelopeCaptureMedia: "Capture Inline Media",
       rawEnvelopeCaptureMediaHint:
         "Store inline base64 media in raw envelopes.",
+      requireApiKey: "Require API Key",
+      requireApiKeyHint:
+        "When enabled, requests without a valid API key are rejected with 401/403.",
     },
     upstream: {
       title: "Upstream Tuning",

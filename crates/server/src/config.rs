@@ -170,6 +170,14 @@ pub struct ServerConfig {
     /// Whether to capture inline media (base64) inside raw envelopes
     /// (default `false` — store metadata only, per §4.1).
     pub raw_envelope_capture_media: bool,
+    /// Whether to require a valid API key on every data-plane request
+    /// (default `true`). When `true`, requests without a credential,
+    /// with an unknown credential, or with a disabled credential are
+    /// rejected with 401/403 before reaching the upstream. When
+    /// `false`, the gateway falls back to the legacy anonymous path
+    /// (unlimited quota, no 401/403). Set via
+    /// `TIYGATE_REQUIRE_API_KEY`.
+    pub require_api_key: bool,
     /// Payload detail archiving to S3-compatible object storage.
     pub payload_archive: PayloadArchiveConfig,
     /// Extra header names appended to the request-direction (client →
@@ -205,6 +213,7 @@ impl Default for ServerConfig {
             routing_strategy: RoutingStrategyName::Weighted,
             database_url: None,
             raw_envelope_capture_media: false,
+            require_api_key: true,
             payload_archive: PayloadArchiveConfig::default(),
             forward_request_header_deny_extra: Vec::new(),
             forward_response_header_deny_extra: Vec::new(),
@@ -276,6 +285,9 @@ impl ServerConfig {
         }
         if let Ok(v) = std::env::var("TIYGATE_RAW_ENVELOPE_CAPTURE_MEDIA") {
             cfg.raw_envelope_capture_media = parse_bool(&v);
+        }
+        if let Ok(v) = std::env::var("TIYGATE_REQUIRE_API_KEY") {
+            cfg.require_api_key = parse_bool(&v);
         }
         cfg.payload_archive = PayloadArchiveConfig::from_env();
         if let Ok(v) = std::env::var("TIYGATE_FORWARD_REQUEST_HEADER_DENY") {

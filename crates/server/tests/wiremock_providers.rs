@@ -26,7 +26,11 @@ use tower::ServiceExt;
 
 /// Build a test app with a single OpenAI-compatible route to a wiremock upstream.
 fn build_openai_test_app(upstream_url: String, model: &str) -> axum::Router {
-    build_test_app_with_config(upstream_url, model, ServerConfig::default())
+    {
+        let mut cfg = ServerConfig::default();
+        cfg.require_api_key = false;
+        build_test_app_with_config(upstream_url, model, cfg)
+    }
 }
 
 /// Build a test app with a single OpenAI-compatible route to a wiremock upstream
@@ -85,7 +89,8 @@ fn build_anthropic_test_app(upstream_url: String, model: &str) -> axum::Router {
 
     let config_store = ConfigStore::with_routing_table(routing_table);
     let health = Arc::new(HealthRegistry::with_defaults());
-    let server_config = ServerConfig::default();
+    let mut server_config = ServerConfig::default();
+    server_config.require_api_key = false;
     ingress::router(config_store, health, &server_config)
 }
 
@@ -117,7 +122,8 @@ fn build_openai_compatible_test_app(
 
     let config_store = ConfigStore::with_routing_table(routing_table);
     let health = Arc::new(HealthRegistry::with_defaults());
-    let server_config = ServerConfig::default();
+    let mut server_config = ServerConfig::default();
+    server_config.require_api_key = false;
     ingress::router(config_store, health, &server_config)
 }
 
@@ -336,6 +342,7 @@ async fn test_429_propagates_with_retry_after() {
 async fn test_413_payload_too_large() {
     // Build app with a very small body limit
     let mut server_config = ServerConfig::default();
+    server_config.require_api_key = false;
     server_config.max_request_body_bytes = 100; // 100 bytes
     let config_store = ConfigStore::default();
     let health = Arc::new(HealthRegistry::with_defaults());
@@ -417,6 +424,7 @@ async fn test_concurrency_overflow_returns_503() {
     // max_inflight=1 + max_queue_depth=0 + acquire_timeout=0 ⇒ any
     // second concurrent request is rejected with 503.
     let mut server_config = ServerConfig::default();
+    server_config.require_api_key = false;
     server_config.max_inflight_requests = 1;
     server_config.max_queue_depth = 0;
     server_config.acquire_timeout_secs = 0;
@@ -521,7 +529,11 @@ async fn test_multi_target_fallback_5xx_transfers() {
     );
     let config_store = ConfigStore::with_routing_table(routing_table);
     let health = Arc::new(HealthRegistry::with_defaults());
-    let app = ingress::router(config_store, health, &ServerConfig::default());
+    let app = {
+        let mut cfg = ServerConfig::default();
+        cfg.require_api_key = false;
+        ingress::router(config_store, health, &cfg)
+    };
 
     let body = json!({
         "model": "gpt-4o",
@@ -885,7 +897,11 @@ fn build_chat_ingress_anthropic_egress_app(upstream_url: String, model: &str) ->
     );
     let config_store = ConfigStore::with_routing_table(routing_table);
     let health = Arc::new(HealthRegistry::with_defaults());
-    ingress::router(config_store, health, &ServerConfig::default())
+    {
+        let mut cfg = ServerConfig::default();
+        cfg.require_api_key = false;
+        ingress::router(config_store, health, &cfg)
+    }
 }
 
 /// Build a test app whose ingress entrypoint is Anthropic Messages but whose
@@ -912,7 +928,11 @@ fn build_messages_ingress_openai_egress_app(upstream_url: String, model: &str) -
     );
     let config_store = ConfigStore::with_routing_table(routing_table);
     let health = Arc::new(HealthRegistry::with_defaults());
-    ingress::router(config_store, health, &ServerConfig::default())
+    {
+        let mut cfg = ServerConfig::default();
+        cfg.require_api_key = false;
+        ingress::router(config_store, health, &cfg)
+    }
 }
 
 #[tokio::test]
@@ -1278,6 +1298,7 @@ async fn test_slow_large_stream_not_capped_by_request_read_timeout() {
     let upstream = spawn_slow_anthropic_sse_server(DELTA_FRAMES, per_frame).await;
 
     let mut cfg = ServerConfig::default();
+    cfg.require_api_key = false;
     cfg.request_read_timeout_secs = 2; // the old (buggy) cap would fire at 2s
                                        // Keep the SSE idle window at its default 120s so the only thing that
                                        // could (wrongly) kill the stream is the request_read_timeout.
@@ -1349,7 +1370,11 @@ fn build_responses_ingress_openai_egress_app(upstream_url: String, model: &str) 
     );
     let config_store = ConfigStore::with_routing_table(routing_table);
     let health = Arc::new(HealthRegistry::with_defaults());
-    ingress::router(config_store, health, &ServerConfig::default())
+    {
+        let mut cfg = ServerConfig::default();
+        cfg.require_api_key = false;
+        ingress::router(config_store, health, &cfg)
+    }
 }
 
 /// Build an app whose ingress is Google Gemini but whose route targets an
@@ -1376,7 +1401,11 @@ fn build_gemini_ingress_openai_egress_app(upstream_url: String, model: &str) -> 
     );
     let config_store = ConfigStore::with_routing_table(routing_table);
     let health = Arc::new(HealthRegistry::with_defaults());
-    ingress::router(config_store, health, &ServerConfig::default())
+    {
+        let mut cfg = ServerConfig::default();
+        cfg.require_api_key = false;
+        ingress::router(config_store, health, &cfg)
+    }
 }
 
 #[tokio::test]
@@ -1608,7 +1637,11 @@ fn build_responses_same_protocol_app(upstream_url: String, model: &str) -> axum:
     );
     let config_store = ConfigStore::with_routing_table(routing_table);
     let health = Arc::new(HealthRegistry::with_defaults());
-    ingress::router(config_store, health, &ServerConfig::default())
+    {
+        let mut cfg = ServerConfig::default();
+        cfg.require_api_key = false;
+        ingress::router(config_store, health, &cfg)
+    }
 }
 
 /// Build a same-protocol Gemini app (Gemini ingress → Gemini upstream).
@@ -1634,7 +1667,11 @@ fn build_gemini_same_protocol_app(upstream_url: String, model: &str) -> axum::Ro
     );
     let config_store = ConfigStore::with_routing_table(routing_table);
     let health = Arc::new(HealthRegistry::with_defaults());
-    ingress::router(config_store, health, &ServerConfig::default())
+    {
+        let mut cfg = ServerConfig::default();
+        cfg.require_api_key = false;
+        ingress::router(config_store, health, &cfg)
+    }
 }
 
 #[tokio::test]
@@ -1720,4 +1757,131 @@ async fn test_nonstream_gemini_same_protocol_passthrough() {
     assert!(serde_json::to_string(&v)
         .unwrap()
         .contains("Gemini same protocol"));
+}
+
+// ---------------------------------------------------------------------------
+// require_api_key toggle — verify the auth gate rejects anonymous
+// requests when enabled and passes them through when disabled.
+//
+// These tests use the legacy in-memory path (no DbConfigStore), so
+// `find_api_key_by_secret` always returns `Ok(None)` → the outcome
+// is `UnknownCredential` for any credential and `NoCredential` when
+// no header is supplied.
+// ---------------------------------------------------------------------------
+
+fn build_app_with_require_api_key(
+    upstream_url: String,
+    model: &str,
+    require_api_key: bool,
+) -> axum::Router {
+    let mut routing_table = RoutingTable::new();
+    routing_table.insert(
+        model.to_string(),
+        vec![tiygate_core::RoutingTarget {
+            provider_id: "openai".to_string(),
+            model_id: "gpt-4o".to_string(),
+            api_base: upstream_url,
+            api_key: "sk-test".to_string(),
+            api_protocol: ProtocolEndpoint::new(
+                ProtocolSuite::OpenAiCompatible,
+                "chat-completions",
+                "v1",
+            ),
+            account_label: None,
+            api_key_override: None,
+            api_base_override: None,
+            weight: 1.0,
+        }],
+    );
+    let config_store = ConfigStore::with_routing_table(routing_table);
+    let health = Arc::new(HealthRegistry::with_defaults());
+    let mut cfg = ServerConfig::default();
+    cfg.require_api_key = require_api_key;
+    ingress::router(config_store, health, &cfg)
+}
+
+#[tokio::test]
+async fn test_require_api_key_rejects_missing_credential() {
+    let mock_server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "model": "gpt-4o",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let app = build_app_with_require_api_key(mock_server.uri(), "gpt-4o", true);
+
+    // No Authorization header → 401
+    let body = json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]});
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_require_api_key_rejects_unknown_credential() {
+    let mock_server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "model": "gpt-4o",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let app = build_app_with_require_api_key(mock_server.uri(), "gpt-4o", true);
+
+    // Unknown credential → 401 (in-memory path always returns None)
+    let body = json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]});
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer sk-unknown")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_require_api_key_disabled_allows_anonymous() {
+    let mock_server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/chat/completions"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "model": "gpt-4o",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let app = build_app_with_require_api_key(mock_server.uri(), "gpt-4o", false);
+
+    // No credential, but require_api_key=false → upstream is hit, 200
+    let body = json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]});
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
 }

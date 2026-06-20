@@ -70,6 +70,29 @@ pub(super) struct ResolvedApiKey {
     /// trace / audit log. Never persisted.
     #[allow(dead_code)]
     pub secret: Option<String>,
+    /// Why the lookup turned out the way it did. Used by
+    /// [`enforce_auth`] to decide whether to reject the request when
+    /// `require_api_key` is enabled.
+    pub outcome: KeyLookupOutcome,
+}
+
+/// The outcome of resolving an inbound credential against the
+/// `api_keys` table. `Authenticated` means the caller supplied a
+/// valid, active key; the other variants describe the reason the
+/// request was treated as anonymous.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum KeyLookupOutcome {
+    /// Credential matched an active row in `api_keys`.
+    Authenticated,
+    /// No `Authorization` / `x-api-key` / `x-goog-api-key` header
+    /// was present, or the header value was empty.
+    NoCredential,
+    /// A credential was supplied but no matching row was found in
+    /// the `api_keys` table, or the DB lookup failed (fail-open).
+    UnknownCredential,
+    /// A credential was supplied and matched a row, but the key's
+    /// status was `Disabled` or `Revoked`.
+    DisabledCredential,
 }
 
 /// Extract the credential from the inbound headers, hash it, and
@@ -91,6 +114,7 @@ pub(super) async fn resolve_api_key(
             key_id: "anonymous".to_string(),
             spec: tiygate_core::quota::QuotaSpec::default(),
             secret: None,
+            outcome: KeyLookupOutcome::NoCredential,
         };
     };
     // Best-effort lookup. A `None` result (key not present, or
@@ -120,6 +144,7 @@ pub(super) async fn resolve_api_key(
                     key_id: "anonymous".to_string(),
                     spec: tiygate_core::quota::QuotaSpec::default(),
                     secret: Some(secret),
+                    outcome: KeyLookupOutcome::DisabledCredential,
                 };
             }
             let spec = tiygate_core::quota::QuotaSpec::from_json(&api_key.quota_json);
@@ -127,18 +152,60 @@ pub(super) async fn resolve_api_key(
                 key_id: api_key.id,
                 spec,
                 secret: Some(secret),
+                outcome: KeyLookupOutcome::Authenticated,
             }
         }
         Ok(None) => ResolvedApiKey {
             key_id: "anonymous".to_string(),
             spec: tiygate_core::quota::QuotaSpec::default(),
             secret: Some(secret),
+            outcome: KeyLookupOutcome::UnknownCredential,
         },
         Err(_) => ResolvedApiKey {
             key_id: "anonymous".to_string(),
             spec: tiygate_core::quota::QuotaSpec::default(),
             secret: Some(secret),
+            outcome: KeyLookupOutcome::UnknownCredential,
         },
+    }
+}
+
+/// Enforce API key authentication when `require_api_key` is enabled
+/// in the runtime tunables. Returns `Ok(())` when the request is
+/// allowed to proceed (either the key is authenticated, or
+/// `require_api_key` is `false`). Returns `Err((AppError, class))`
+/// with a suitable status code and error class when the request must
+/// be rejected:
+///
+/// * `NoCredential` → 401 "missing api key" (`auth_missing`)
+/// * `UnknownCredential` → 401 "invalid api key" (`auth_invalid`)
+/// * `DisabledCredential` → 403 "api key disabled" (`auth_disabled`)
+///
+/// The caller is responsible for calling `scope.emit_error(class,
+/// …)` on the rejected path so the terminal `RequestEvent` is
+/// persisted.
+pub(super) fn enforce_auth(
+    state: &AppState,
+    api_key: &ResolvedApiKey,
+) -> Result<(), (AppError, &'static str)> {
+    use http::StatusCode;
+    if !state.tunables().require_api_key {
+        return Ok(());
+    }
+    match api_key.outcome {
+        KeyLookupOutcome::Authenticated => Ok(()),
+        KeyLookupOutcome::NoCredential => Err((
+            AppError::new(StatusCode::UNAUTHORIZED, "missing api key".to_string()),
+            "auth_missing",
+        )),
+        KeyLookupOutcome::UnknownCredential => Err((
+            AppError::new(StatusCode::UNAUTHORIZED, "invalid api key".to_string()),
+            "auth_invalid",
+        )),
+        KeyLookupOutcome::DisabledCredential => Err((
+            AppError::new(StatusCode::FORBIDDEN, "api key disabled".to_string()),
+            "auth_disabled",
+        )),
     }
 }
 

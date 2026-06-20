@@ -253,6 +253,10 @@ pub(super) async fn handle_chat_completions(
     // RequestEvent attributes the row to the right caller.
     let api_key = crate::ingress::observability::resolve_api_key(&state, &headers).await;
     scope.set_api_key_id(api_key.key_id.clone());
+    if let Err((err, class)) = crate::ingress::observability::enforce_auth(&state, &api_key) {
+        scope.emit_error(class, Some(err.http_status().as_u16()));
+        return Err(err);
+    }
     match crate::ingress::observability::check_quota(&state, &api_key.key_id, &api_key.spec, 1)
         .await
     {
@@ -402,6 +406,10 @@ pub(super) async fn handle_messages(
     // the row to the right caller.
     let api_key = crate::ingress::observability::resolve_api_key(&state, &headers).await;
     scope.set_api_key_id(api_key.key_id.clone());
+    if let Err((err, class)) = crate::ingress::observability::enforce_auth(&state, &api_key) {
+        scope.emit_error(class, Some(err.http_status().as_u16()));
+        return Err(err);
+    }
     match crate::ingress::observability::check_quota(&state, &api_key.key_id, &api_key.spec, 1)
         .await
     {
@@ -540,6 +548,10 @@ pub(super) async fn handle_embeddings(
     // `requests_per_day` bucket as chat completions.
     let api_key = crate::ingress::observability::resolve_api_key(&state, &headers).await;
     scope.set_api_key_id(api_key.key_id.clone());
+    if let Err((err, class)) = crate::ingress::observability::enforce_auth(&state, &api_key) {
+        scope.emit_error(class, Some(err.http_status().as_u16()));
+        return Err(err);
+    }
     match crate::ingress::observability::check_quota(&state, &api_key.key_id, &api_key.spec, 1)
         .await
     {
@@ -731,6 +743,10 @@ pub(super) async fn handle_responses(
     // row to the right caller (used by the per-key quota dashboard).
     let api_key = crate::ingress::observability::resolve_api_key(&state, &headers).await;
     scope.set_api_key_id(api_key.key_id.clone());
+    if let Err((err, class)) = crate::ingress::observability::enforce_auth(&state, &api_key) {
+        scope.emit_error(class, Some(err.http_status().as_u16()));
+        return Err(err);
+    }
     // Phase 4 §4.6: quota enforcement on the request hot path.
     // Parity with the chat-completions / anthropic-messages paths.
     match crate::ingress::observability::check_quota(&state, &api_key.key_id, &api_key.spec, 1)
@@ -890,6 +906,10 @@ pub(super) async fn handle_gemini_generate(
     // row to the right caller (used by the per-key quota dashboard).
     let api_key = crate::ingress::observability::resolve_api_key(&state, &headers).await;
     scope.set_api_key_id(api_key.key_id.clone());
+    if let Err((err, class)) = crate::ingress::observability::enforce_auth(&state, &api_key) {
+        scope.emit_error(class, Some(err.http_status().as_u16()));
+        return Err(err);
+    }
     // Phase 4 §4.6: quota enforcement on the request hot path.
     // Parity with the chat-completions / anthropic-messages paths.
     match crate::ingress::observability::check_quota(&state, &api_key.key_id, &api_key.spec, 1)
@@ -1036,6 +1056,10 @@ pub(super) async fn handle_images_generations(
 
     let api_key = crate::ingress::observability::resolve_api_key(&state, &headers).await;
     scope.set_api_key_id(api_key.key_id.clone());
+    if let Err((err, class)) = crate::ingress::observability::enforce_auth(&state, &api_key) {
+        scope.emit_error(class, Some(err.http_status().as_u16()));
+        return Err(err);
+    }
     match crate::ingress::observability::check_quota(&state, &api_key.key_id, &api_key.spec, 1)
         .await
     {
@@ -1226,6 +1250,10 @@ pub(super) async fn handle_images_edits(
 
     let api_key = crate::ingress::observability::resolve_api_key(&state, &headers).await;
     scope.set_api_key_id(api_key.key_id.clone());
+    if let Err((err, class)) = crate::ingress::observability::enforce_auth(&state, &api_key) {
+        scope.emit_error(class, Some(err.http_status().as_u16()));
+        return Err(err);
+    }
     match crate::ingress::observability::check_quota(&state, &api_key.key_id, &api_key.spec, 1)
         .await
     {

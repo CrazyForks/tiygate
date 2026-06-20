@@ -569,6 +569,8 @@ const zh: Translation = {
       secondsHint: "秒。0 表示禁用。",
       rawEnvelopeCaptureMedia: "捕获内联媒体",
       rawEnvelopeCaptureMediaHint: "在 raw envelope 中存储内联 base64 媒体。",
+      requireApiKey: "要求 API Key",
+      requireApiKeyHint: "开启后，未提供有效 API Key 的请求将被拒绝（401/403）。",
     },
     upstream: {
       title: "上游调优",

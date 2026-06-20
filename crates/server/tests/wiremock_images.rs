@@ -56,7 +56,12 @@ fn build_images_test_app(
 
     let config_store = ConfigStore::with_routing_table(routing_table);
     let health = Arc::new(HealthRegistry::with_defaults());
-    let server_config = ServerConfig::default();
+    let mut server_config = ServerConfig::default();
+    // Tests use the legacy in-memory path (no DbConfigStore), so
+    // api key resolution always returns anonymous. Disable the
+    // require_api_key guard to keep these tests focused on routing
+    // and passthrough behaviour.
+    server_config.require_api_key = false;
     ingress::router(config_store, health, &server_config)
 }
 

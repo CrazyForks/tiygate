@@ -81,6 +81,12 @@ pub struct RuntimeTunables {
     pub routing_strategy: crate::config::RoutingStrategyName,
     /// Whether to capture inline base64 media in raw envelopes.
     pub raw_envelope_capture_media: bool,
+    /// Whether to require a valid API key on every data-plane
+    /// request. When `true`, requests without a credential, with an
+    /// unknown credential, or with a disabled credential are rejected
+    /// with 401/403 before reaching the upstream. Hot-reloadable via
+    /// `gateway.ingress.require_api_key`.
+    pub require_api_key: bool,
     /// Bidirectional header forwarding policy.
     pub header_policy: Arc<tiygate_core::HeaderForwardPolicy>,
     /// Standard request body limit (bytes).
@@ -311,6 +317,7 @@ fn build_data_plane_router(
     let tunables = RuntimeTunables {
         routing_strategy: server_config.routing_strategy,
         raw_envelope_capture_media: server_config.raw_envelope_capture_media,
+        require_api_key: server_config.require_api_key,
         header_policy: Arc::new(
             tiygate_core::HeaderForwardPolicy::with_defaults()
                 .with_request_deny_extra(server_config.forward_request_header_deny_extra.iter())
@@ -443,6 +450,8 @@ pub(crate) fn spawn_tunables_reloader(
                 false,
             )
             .await;
+            let require_api_key =
+                sk::get_bool(store.as_ref(), sk::INGRESS_REQUIRE_API_KEY, true).await;
             let current_t = state.tunables();
             let max_request_body_bytes = sk::get_u64(
                 store.as_ref(),
@@ -515,6 +524,7 @@ pub(crate) fn spawn_tunables_reloader(
             state.reload_tunables(RuntimeTunables {
                 routing_strategy,
                 raw_envelope_capture_media,
+                require_api_key,
                 header_policy,
                 max_request_body_bytes,
                 max_inflight,

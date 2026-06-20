@@ -42,6 +42,7 @@ pub const INGRESS_MAX_INFLIGHT: &str = "gateway.ingress.max_inflight";
 pub const INGRESS_MAX_QUEUE_DEPTH: &str = "gateway.ingress.max_queue_depth";
 pub const INGRESS_ACQUIRE_TIMEOUT_SECS: &str = "gateway.ingress.acquire_timeout_secs";
 pub const INGRESS_RAW_ENVELOPE_CAPTURE_MEDIA: &str = "gateway.ingress.raw_envelope_capture_media";
+pub const INGRESS_REQUIRE_API_KEY: &str = "gateway.ingress.require_api_key";
 
 // --- Upstream ---
 pub const UPSTREAM_STREAM_IDLE_TIMEOUT_SECS: &str = "gateway.upstream.stream_idle_timeout_secs";
@@ -79,6 +80,7 @@ pub const PLAIN_KEYS: &[&str] = &[
     INGRESS_MAX_QUEUE_DEPTH,
     INGRESS_ACQUIRE_TIMEOUT_SECS,
     INGRESS_RAW_ENVELOPE_CAPTURE_MEDIA,
+    INGRESS_REQUIRE_API_KEY,
     UPSTREAM_STREAM_IDLE_TIMEOUT_SECS,
     UPSTREAM_STREAM_TOTAL_TIMEOUT_SECS,
     UPSTREAM_TCP_KEEPALIVE_SECS,

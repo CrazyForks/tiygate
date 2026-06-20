@@ -47,6 +47,7 @@ const KEYS = {
   ingressMaxQueueDepth: "gateway.ingress.max_queue_depth",
   ingressAcquireTimeout: "gateway.ingress.acquire_timeout_secs",
   ingressRawMedia: "gateway.ingress.raw_envelope_capture_media",
+  ingressRequireApiKey: "gateway.ingress.require_api_key",
   upstreamIdleTimeout: "gateway.upstream.stream_idle_timeout_secs",
   upstreamTotalTimeout: "gateway.upstream.stream_total_timeout_secs",
   upstreamTcpKeepalive: "gateway.upstream.tcp_keepalive_secs",
@@ -493,6 +494,17 @@ export default function SettingsPage() {
               checked={getField(KEYS.ingressRawMedia, "false") === "true"}
               onCheckedChange={(checked: boolean) =>
                 updateField(KEYS.ingressRawMedia, String(checked))
+              }
+            />
+          </Field>
+          <Field
+            label={t("settings.routingIngress.requireApiKey")}
+            hint={t("settings.routingIngress.requireApiKeyHint")}
+          >
+            <Switch
+              checked={getField(KEYS.ingressRequireApiKey, "true") === "true"}
+              onCheckedChange={(checked: boolean) =>
+                updateField(KEYS.ingressRequireApiKey, String(checked))
               }
             />
           </Field>
