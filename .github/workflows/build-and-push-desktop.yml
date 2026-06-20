@@ -1,0 +1,206 @@
+name: Build and Upload Desktop Assets
+
+on:
+  release:
+    types: [prereleased, released]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            platform: macos
+            arch: aarch64
+            target: aarch64-apple-darwin
+          - os: macos-14
+            platform: macos
+            arch: x86_64
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            platform: windows
+            arch: x86_64
+            target: x86_64-pc-windows-msvc
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get release tag
+        id: get-tag
+        shell: bash
+        run: echo "tag=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: webui/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          cache-targets: true
+          cache-all-crates: true
+          key: ${{ matrix.target }}
+
+      - name: Install tauri-cli
+        run: cargo install tauri-cli --version "^2" --locked --quiet
+
+      - name: Set version from tag
+        shell: bash
+        run: |
+          TAG="${{ steps.get-tag.outputs.tag }}"
+          VERSION=${TAG#v}
+          # MSI requires pure numeric version (no pre-release suffix like -rc.1)
+          BUNDLE_VERSION=$(echo "$VERSION" | sed 's/-.*//')
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "BUNDLE_VERSION=$BUNDLE_VERSION" >> "$GITHUB_ENV"
+
+          # Patch tauri.conf.json bundle version (MSI compatibility)
+          node -e "
+            const fs = require('fs');
+            const conf = JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json', 'utf8'));
+            conf.version = '$BUNDLE_VERSION';
+            fs.writeFileSync('src-tauri/tauri.conf.json', JSON.stringify(conf, null, 2) + '\n');
+          "
+          # Patch workspace Cargo.toml version (aligned with git tag)
+          sed -i.bak "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
+          rm -f Cargo.toml.bak
+          echo "Tag version: $VERSION, Bundle version: $BUNDLE_VERSION"
+
+      - name: Install webui dependencies
+        run: cd webui && npm ci
+
+      - name: Build webui
+        run: cd webui && TAURI_ENV=1 npm run build
+
+      - name: Build sidecar binary
+        shell: bash
+        run: |
+          SIDECAR_FEATURES="webui,admin,cache,providers,control-plane,tracing"
+          TARGET="${{ matrix.target }}"
+
+          cargo build -p tiygate-server \
+            --features "$SIDECAR_FEATURES" \
+            --release \
+            --target "$TARGET"
+
+          BIN_NAME="tiygate"
+          if [[ "$TARGET" == *"windows"* ]]; then
+            BIN_NAME="tiygate.exe"
+          fi
+
+          mkdir -p src-tauri/binaries
+          if [[ "$TARGET" == *"windows"* ]]; then
+            cp "target/$TARGET/release/$BIN_NAME" "src-tauri/binaries/tiygate-$TARGET.exe"
+          else
+            cp "target/$TARGET/release/$BIN_NAME" "src-tauri/binaries/tiygate-$TARGET"
+            chmod +x "src-tauri/binaries/tiygate-$TARGET"
+          fi
+          echo "Sidecar binary ready: src-tauri/binaries/tiygate-$TARGET"
+
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Updater signing key (required for createUpdaterArtifacts)
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # macOS code signing (cert-based, applied by tauri-action)
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          tauriScript: cargo tauri
+          args: --target ${{ matrix.target }}
+          releaseId: ""
+
+      - name: Submit notarization (async)
+        if: matrix.platform == 'macos'
+        continue-on-error: true
+        run: |
+          BUNDLE_DIR="src-tauri/target/${{ matrix.target }}/release/bundle"
+          for dmg in "$BUNDLE_DIR"/dmg/*.dmg; do
+            [ -f "$dmg" ] || continue
+            echo "Submitting $dmg for notarization..."
+            xcrun notarytool submit "$dmg" \
+              --apple-id "$APPLE_ID" \
+              --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+              --team-id "$APPLE_TEAM_ID"
+          done
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+      - name: Collect release artifacts
+        shell: bash
+        run: |
+          mkdir -p release-artifacts
+          BUNDLE_DIR="src-tauri/target/${{ matrix.target }}/release/bundle"
+
+          if [ "${{ matrix.platform }}" = "macos" ]; then
+            cp "$BUNDLE_DIR"/dmg/*.dmg release-artifacts/ 2>/dev/null || true
+            # Updater artifacts: rename to include arch suffix
+            ARCH_SUFFIX="${{ matrix.arch }}"
+            for f in "$BUNDLE_DIR"/macos/*.app.tar.gz; do
+              [ -f "$f" ] || continue
+              BASENAME=$(basename "$f")
+              RENAMED="${BASENAME/.app.tar.gz/_${ARCH_SUFFIX}.app.tar.gz}"
+              cp "$f" "release-artifacts/${RENAMED}"
+            done
+            for f in "$BUNDLE_DIR"/macos/*.app.tar.gz.sig; do
+              [ -f "$f" ] || continue
+              BASENAME=$(basename "$f")
+              RENAMED="${BASENAME/.app.tar.gz.sig/_${ARCH_SUFFIX}.app.tar.gz.sig}"
+              cp "$f" "release-artifacts/${RENAMED}"
+            done
+          elif [ "${{ matrix.platform }}" = "windows" ]; then
+            # NSIS installer + updater signature
+            cp "$BUNDLE_DIR"/nsis/*-setup.exe release-artifacts/ 2>/dev/null || true
+            cp "$BUNDLE_DIR"/nsis/*-setup.exe.sig release-artifacts/ 2>/dev/null || true
+            # MSI installer + updater signature
+            cp "$BUNDLE_DIR"/msi/*.msi release-artifacts/ 2>/dev/null || true
+            cp "$BUNDLE_DIR"/msi/*.msi.sig release-artifacts/ 2>/dev/null || true
+          fi
+
+          # Rename artifacts from bundle version to full version (e.g. 0.1.0 → 0.1.0-rc.1)
+          if [ "$BUNDLE_VERSION" != "$VERSION" ]; then
+            for artifact in release-artifacts/*; do
+              [ -f "$artifact" ] || continue
+              renamed_artifact="${artifact//$BUNDLE_VERSION/$VERSION}"
+              if [ "$renamed_artifact" != "$artifact" ]; then
+                mv "$artifact" "$renamed_artifact"
+              fi
+            done
+          fi
+
+          echo "Collected artifacts:"
+          ls -la release-artifacts/
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.get-tag.outputs.tag }}
+          files: release-artifacts/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Save artifacts for later use
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.platform }}-${{ matrix.arch }}
+          path: release-artifacts/*
+          retention-days: 30
