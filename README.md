@@ -62,7 +62,7 @@ tiygate/
 | Edition | Best for | How to get it |
 |---|---|---|
 | 🖥️ **Desktop** (recommended for personal use) | Individual users who want a one-click local gateway with a native UI — no Docker, no server setup. macOS (Apple Silicon / Intel) and Windows installers are published on the [Releases](https://github.com/tiylabs/tiygate/releases) page. | Download the installer for your platform from the latest [Release](https://github.com/tiylabs/tiygate/releases) and run it. |
-| 🐳 **Docker** (recommended for enterprise / production) | Teams and production deployments that need horizontal scaling, multi-node data/control plane separation, and container orchestration (K8s, Swarm, etc.). | `docker run -d -p 3000:3000 ghcr.io/tiylabs/tiygate:latest` — see the [Docker image](https://github.com/tiylabs/tiygate/pkgs/container/tiygate) and deployment modes below. |
+| 🐳 **Docker** (recommended for enterprise / production) | Teams and production deployments that need horizontal scaling, multi-node data/control plane separation, and container orchestration (K8s, Swarm, etc.). | `docker run -d -p 3000:3000 jorbenzhu/tiygate:latest` — see the [Docker image](https://hub.docker.com/r/jorbenzhu/tiygate) and deployment modes below. |
 
 > Don't want to choose? Both editions share the same core engine and Admin Console — you can start with Desktop for local exploration and switch to Docker when you're ready to scale.
 

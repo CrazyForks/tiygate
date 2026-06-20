@@ -62,7 +62,7 @@ tiygate/
 | 版本 | 适用场景 | 获取方式 |
 |---|---|---|
 | 🖥️ **桌面版**(个人使用推荐) | 想要一键安装、原生 UI 的本地网关,无需 Docker、无需服务器配置的个人用户。macOS(Apple Silicon / Intel)和 Windows 安装包发布在 [Releases](https://github.com/tiylabs/tiygate/releases) 页面。 | 从最新的 [Release](https://github.com/tiylabs/tiygate/releases) 下载对应平台的安装包并运行。 |
-| 🐳 **Docker 版**(企业级 / 生产环境推荐) | 需要水平扩展、多节点数据面/控制面分离、容器编排(K8s、Swarm 等)的团队和生产部署。 | `docker run -d -p 3000:3000 ghcr.io/tiylabs/tiygate:latest` —— 详见 [Docker 镜像](https://github.com/tiylabs/tiygate/pkgs/container/tiygate)及下方部署模式。 |
+| 🐳 **Docker 版**(企业级 / 生产环境推荐) | 需要水平扩展、多节点数据面/控制面分离、容器编排(K8s、Swarm 等)的团队和生产部署。 | `docker run -d -p 3000:3000 jorbenzhu/tiygate:latest` —— 详见 [Docker 镜像](https://hub.docker.com/r/jorbenzhu/tiygate)及下方部署模式。 |
 
 > 两个版本共享同一套核心引擎和管理控制台 —— 你可以先用桌面版本地探索,准备好扩展时再切换到 Docker。
 
