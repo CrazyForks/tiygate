@@ -15,7 +15,6 @@
 //! requires. Two independent migration sequences are tracked in a
 //! shared `_migrations` table (one row per `(sequence, version)` pair).
 
-use std::path::Path;
 use std::sync::Once;
 
 use thiserror::Error;
@@ -31,8 +30,6 @@ pub enum DbError {
     UnsupportedUrl(String),
     #[error("migration error: {0}")]
     Migration(String),
-    #[error("migration file read error: {0}")]
-    Io(#[from] std::io::Error),
 }
 
 const CONFIG_SEQUENCE: &str = "config";
@@ -161,11 +158,12 @@ pub async fn run_migrations(pool: &DbPool) -> Result<(), DbError> {
     Ok(())
 }
 
-/// Return the migration directories for a given backend.
+/// Return the migration directories for a given backend, expressed as
+/// paths *within* the embedded `migrations/` folder.
 fn migration_dirs(kind: DbKind) -> (&'static str, &'static str) {
     match kind {
-        DbKind::Sqlite => ("migrations/config", "migrations/log"),
-        DbKind::Postgres => ("migrations/postgres/config", "migrations/postgres/log"),
+        DbKind::Sqlite => ("config", "log"),
+        DbKind::Postgres => ("postgres/config", "postgres/log"),
     }
 }
 
@@ -212,34 +210,67 @@ pub async fn list_applied(pool: &DbPool) -> Result<Vec<(String, i64, String)>, D
     Ok(rows)
 }
 
+/// Embedded migration SQL files, compiled into the binary at build
+/// time via `rust-embed`. This decouples migration loading from the
+/// filesystem path derived from `CARGO_MANIFEST_DIR`, which is only
+/// valid on the build machine and breaks distributed/packaged builds
+/// (Tauri sidecar, Docker image) where the source tree is absent.
+///
+/// The `folder` points at the `migrations/` directory relative to
+/// this crate's `Cargo.toml`, so the embedded paths are of the form
+/// `config/20260101000001_init.sql`, `log/...`, and the postgres
+/// variants under `postgres/...`.
+#[derive(rust_embed::RustEmbed)]
+#[folder = "migrations/"]
+struct MigrationAssets;
+
 struct MigrationFile {
     version: i64,
     sql: String,
 }
 
-fn read_migration_dir(dir: &str) -> Result<Vec<MigrationFile>, DbError> {
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let abs = Path::new(manifest_dir).join(dir);
+/// Load migration files for a sequence from the embedded assets.
+///
+/// `relative_dir` is the path *within* the `migrations/` folder, e.g.
+/// `config`, `log`, `postgres/config`, `postgres/log`. Files are
+/// filtered to `*.sql`, parsed for a leading `<version>_` numeric
+/// prefix, and sorted by version.
+fn read_migration_dir(relative_dir: &str) -> Result<Vec<MigrationFile>, DbError> {
+    // rust-embed keys use `/` separators on every platform.
+    let prefix = if relative_dir.is_empty() {
+        String::new()
+    } else {
+        format!("{relative_dir}/")
+    };
+
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(&abs)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_file() {
-            continue;
-        }
-        let path = entry.path();
-        let file_name = match path.file_name().and_then(|s| s.to_str()) {
-            Some(n) => n,
+    for file_name in MigrationAssets::iter() {
+        let file_name = file_name.as_ref();
+        // Match exactly `<prefix>...sql` — reject nested subdirectories
+        // (e.g. `postgres/...` entries when loading `config`).
+        let rest = match file_name.strip_prefix(&prefix) {
+            Some(r) => r,
             None => continue,
         };
-        if !file_name.ends_with(".sql") {
+        if rest.is_empty() || rest.contains('/') {
             continue;
         }
-        let version: i64 = file_name
+        if !rest.ends_with(".sql") {
+            continue;
+        }
+
+        let basename = rest;
+        let version: i64 = basename
             .split('_')
             .next()
             .and_then(|s| s.parse().ok())
             .ok_or_else(|| DbError::Migration(format!("bad migration name: {file_name}")))?;
-        let sql = std::fs::read_to_string(&path)?;
+
+        let asset = MigrationAssets::get(file_name)
+            .ok_or_else(|| DbError::Migration(format!("missing embedded asset: {file_name}")))?;
+        let sql = std::str::from_utf8(asset.data.as_ref())
+            .map_err(|e| DbError::Migration(format!("migration {file_name} is not valid UTF-8: {e}")))?
+            .to_string();
         out.push(MigrationFile { version, sql });
     }
     out.sort_by_key(|m| m.version);
@@ -302,8 +333,8 @@ mod tests {
 
     #[test]
     fn read_migration_dir_reads_real_files() {
-        let cfg = read_migration_dir("migrations/config").expect("config migrations");
-        let log = read_migration_dir("migrations/log").expect("log migrations");
+        let cfg = read_migration_dir("config").expect("config migrations");
+        let log = read_migration_dir("log").expect("log migrations");
         assert!(!cfg.is_empty(), "config migrations empty");
         assert!(!log.is_empty(), "log migrations empty");
         for w in cfg.windows(2) {
@@ -319,8 +350,8 @@ mod tests {
 
     #[test]
     fn read_postgres_migration_dir_reads_real_files() {
-        let cfg = read_migration_dir("migrations/postgres/config").expect("pg config migrations");
-        let log = read_migration_dir("migrations/postgres/log").expect("pg log migrations");
+        let cfg = read_migration_dir("postgres/config").expect("pg config migrations");
+        let log = read_migration_dir("postgres/log").expect("pg log migrations");
         assert!(!cfg.is_empty(), "pg config migrations empty");
         assert!(!log.is_empty(), "pg log migrations empty");
         for w in cfg.windows(2) {
@@ -341,21 +372,21 @@ mod tests {
     fn migration_dirs_returns_correct_paths() {
         assert_eq!(
             migration_dirs(DbKind::Sqlite),
-            ("migrations/config", "migrations/log")
+            ("config", "log")
         );
         assert_eq!(
             migration_dirs(DbKind::Postgres),
-            ("migrations/postgres/config", "migrations/postgres/log")
+            ("postgres/config", "postgres/log")
         );
     }
 
     #[test]
     fn sqlite_and_postgres_migration_versions_stay_aligned() {
-        let sqlite_cfg = read_migration_dir("migrations/config").expect("sqlite config migrations");
-        let sqlite_log = read_migration_dir("migrations/log").expect("sqlite log migrations");
+        let sqlite_cfg = read_migration_dir("config").expect("sqlite config migrations");
+        let sqlite_log = read_migration_dir("log").expect("sqlite log migrations");
         let pg_cfg =
-            read_migration_dir("migrations/postgres/config").expect("pg config migrations");
-        let pg_log = read_migration_dir("migrations/postgres/log").expect("pg log migrations");
+            read_migration_dir("postgres/config").expect("pg config migrations");
+        let pg_log = read_migration_dir("postgres/log").expect("pg log migrations");
 
         let sqlite_cfg_versions = sqlite_cfg.iter().map(|m| m.version).collect::<Vec<_>>();
         let sqlite_log_versions = sqlite_log.iter().map(|m| m.version).collect::<Vec<_>>();

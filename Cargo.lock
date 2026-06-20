@@ -5618,6 +5618,7 @@ dependencies = [
  "parking_lot",
  "rand 0.8.6",
  "reqwest 0.12.28",
+ "rust-embed",
  "serde",
  "serde_json",
  "serial_test",

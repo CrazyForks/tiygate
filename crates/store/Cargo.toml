@@ -15,6 +15,7 @@ thiserror.workspace = true
 tracing.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
+rust-embed.workspace = true
 chrono.workspace = true
 uuid.workspace = true
 aes-gcm.workspace = true
