@@ -2103,10 +2103,10 @@ pub async fn aggregate_by_target(
                 COALESCE(SUM(cache_read_tokens), 0) AS crt, \
                 COALESCE(SUM(cache_write_tokens), 0) AS cwt, \
                 COALESCE(SUM(total_tokens), 0) AS tt, \
-                AVG(ttfb_ms) AS alat, \
+                AVG(ttfb_ms)::double precision AS alat, \
                 CASE WHEN SUM(stream_duration_ms) > 0 \
                      THEN SUM(completion_tokens) * 1000.0 / SUM(stream_duration_ms) \
-                     ELSE NULL END AS atps \
+                     ELSE NULL END::double precision AS atps \
          FROM request_logs \
          WHERE ts >= $1 AND ts < $2 \
          GROUP BY resolved_provider, resolved_model \
