@@ -269,7 +269,9 @@ fn read_migration_dir(relative_dir: &str) -> Result<Vec<MigrationFile>, DbError>
         let asset = MigrationAssets::get(file_name)
             .ok_or_else(|| DbError::Migration(format!("missing embedded asset: {file_name}")))?;
         let sql = std::str::from_utf8(asset.data.as_ref())
-            .map_err(|e| DbError::Migration(format!("migration {file_name} is not valid UTF-8: {e}")))?
+            .map_err(|e| {
+                DbError::Migration(format!("migration {file_name} is not valid UTF-8: {e}"))
+            })?
             .to_string();
         out.push(MigrationFile { version, sql });
     }
@@ -370,10 +372,7 @@ mod tests {
 
     #[test]
     fn migration_dirs_returns_correct_paths() {
-        assert_eq!(
-            migration_dirs(DbKind::Sqlite),
-            ("config", "log")
-        );
+        assert_eq!(migration_dirs(DbKind::Sqlite), ("config", "log"));
         assert_eq!(
             migration_dirs(DbKind::Postgres),
             ("postgres/config", "postgres/log")
@@ -384,8 +383,7 @@ mod tests {
     fn sqlite_and_postgres_migration_versions_stay_aligned() {
         let sqlite_cfg = read_migration_dir("config").expect("sqlite config migrations");
         let sqlite_log = read_migration_dir("log").expect("sqlite log migrations");
-        let pg_cfg =
-            read_migration_dir("postgres/config").expect("pg config migrations");
+        let pg_cfg = read_migration_dir("postgres/config").expect("pg config migrations");
         let pg_log = read_migration_dir("postgres/log").expect("pg log migrations");
 
         let sqlite_cfg_versions = sqlite_cfg.iter().map(|m| m.version).collect::<Vec<_>>();
