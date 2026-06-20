@@ -2,7 +2,6 @@ import {
   useCallback,
   useEffect,
   useMemo,
-  useRef,
   useState,
   type MouseEvent,
   type ReactNode,
@@ -49,6 +48,7 @@ import {
   Th,
   Tooltip,
   Tr,
+  useStickyTableScroll,
   useToast,
   type BadgeTone,
 } from "@/components/ui";
@@ -397,43 +397,10 @@ export default function RequestLogs() {
   }
 
   const entries = data?.entries ?? [];
-
-  // --- Sticky column edge shadows ---
-  // Tracks horizontal scroll position to conditionally show left/right
-  // edge shadows on the fixed Time and Detail columns.
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const [scrollState, setScrollState] = useState<"start" | "middle" | "end">(
-    "start",
-  );
-
-  useEffect(() => {
-    const el = scrollRef.current;
-    if (!el) return;
-    const update = () => {
-      const { scrollLeft, scrollWidth, clientWidth } = el;
-      const maxScroll = scrollWidth - clientWidth;
-      if (maxScroll <= 1) {
-        setScrollState("start");
-      } else if (scrollLeft <= 0) {
-        setScrollState("start");
-      } else if (scrollLeft >= maxScroll - 1) {
-        setScrollState("end");
-      } else {
-        setScrollState("middle");
-      }
-    };
-    update();
-    el.addEventListener("scroll", update, { passive: true });
-    // ResizeObserver catches content-width changes (e.g. auto-refresh with
-    // different request IDs) and container resizes without relying on window resize.
-    const ro = new ResizeObserver(update);
-    ro.observe(el);
-    ro.observe(el.querySelector("table") ?? el);
-    return () => {
-      el.removeEventListener("scroll", update);
-      ro.disconnect();
-    };
-  }, [isLoading, entries.length]);
+  const { scrollRef, scrollState } = useStickyTableScroll([
+    isLoading,
+    entries.length,
+  ]);
 
   return (
     <div className="space-y-4">

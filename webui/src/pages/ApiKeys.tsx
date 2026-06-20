@@ -22,9 +22,11 @@ import {
   Td,
   Th,
   Tr,
+  useStickyTableScroll,
   useToast,
 } from "@/components/ui";
 import { PageHeader, fmtTime } from "@/components/PageHeader";
+import { cn } from "@/lib/cn";
 
 const QUOTA_FIELDS: Array<{ key: keyof QuotaSpec; label: string }> = [
   { key: "requests_per_minute", label: "apiKeys.rpm" },
@@ -50,6 +52,10 @@ export default function ApiKeys() {
     queryKey: ["api-keys"],
     queryFn: apiKeysApi.list,
   });
+  const { scrollRef, scrollState } = useStickyTableScroll([
+    isLoading,
+    data?.length ?? 0,
+  ]);
 
   const invalidate = () => qc.invalidateQueries({ queryKey: ["api-keys"] });
 
@@ -200,6 +206,8 @@ export default function ApiKeys() {
           ) : (
             <Table
               maxHeight={["max-h-[calc(100vh-9.5rem)]", "lg:max-h-[calc(100vh-5.5rem)]"]}
+              tableClassName="min-w-max border-separate border-spacing-0"
+              containerRef={scrollRef}
             >
               <colgroup>
                 <col style={{ width: "20rem" }} />
@@ -211,18 +219,40 @@ export default function ApiKeys() {
               </colgroup>
               <Thead>
                 <tr>
-                  <Th>{t("common.name")}</Th>
+                  <Th
+                    className={cn(
+                      "sticky left-0 z-30 w-80 bg-surface-muted",
+                      scrollState !== "start" &&
+                        "shadow-[6px_0_10px_-4px_rgba(0,0,0,0.25)]",
+                    )}
+                  >
+                    {t("common.name")}
+                  </Th>
                   <Th>{t("apiKeys.keyHash")}</Th>
                   <Th>{t("apiKeys.quota")}</Th>
                   <Th className="text-center">{t("common.status")}</Th>
                   <Th>{t("common.createdAt")}</Th>
-                  <Th className="text-right">{t("common.actions")}</Th>
+                  <Th
+                    className={cn(
+                      "sticky right-0 z-30 bg-surface-muted text-right",
+                      scrollState !== "end" &&
+                        "shadow-[-6px_0_10px_-4px_rgba(0,0,0,0.25)]",
+                    )}
+                  >
+                    {t("common.actions")}
+                  </Th>
                 </tr>
               </Thead>
               <tbody>
                 {(data ?? []).map((k) => (
                   <Tr key={k.id}>
-                    <Td className="align-middle">
+                    <Td
+                      className={cn(
+                        "sticky left-0 z-10 w-80 bg-surface align-middle group-hover:bg-surface-muted",
+                        scrollState !== "start" &&
+                          "shadow-[6px_0_10px_-4px_rgba(0,0,0,0.25)]",
+                      )}
+                    >
                       <div
                         className="truncate font-medium text-text"
                         title={k.name}
@@ -258,7 +288,13 @@ export default function ApiKeys() {
                     <Td className="whitespace-nowrap text-xs text-text-muted">
                       {fmtTime(k.created_at)}
                     </Td>
-                    <Td className="text-right">
+                    <Td
+                      className={cn(
+                        "sticky right-0 z-10 bg-surface text-right group-hover:bg-surface-muted",
+                        scrollState !== "end" &&
+                          "shadow-[-6px_0_10px_-4px_rgba(0,0,0,0.25)]",
+                      )}
+                    >
                       <RowActions
                         label={t("common.rowActions")}
                         items={[

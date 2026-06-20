@@ -18,9 +18,11 @@ import {
   Th,
   Tooltip,
   Tr,
+  useStickyTableScroll,
 } from "@/components/ui";
 import { PageHeader, fmtTime } from "@/components/PageHeader";
 import { Pagination } from "@/components/Pagination";
+import { cn } from "@/lib/cn";
 
 const DEFAULT_PAGE_SIZE = 50;
 const PAGE_SIZE_OPTIONS = [25, 50, 100, 200] as const;
@@ -167,6 +169,10 @@ export default function Audit() {
   const page = Math.floor(offset / limit) + 1;
   const pageCount = total === 0 ? 1 : Math.ceil(total / limit);
   const entries = data?.entries ?? [];
+  const { scrollRef, scrollState } = useStickyTableScroll([
+    isLoading,
+    entries.length,
+  ]);
 
   function setPageSize(n: number) {
     setFilter((f) => ({ ...f, limit: n, offset: 0 }));
@@ -194,20 +200,46 @@ export default function Audit() {
           ) : (
             <Table
               maxHeight={["max-h-[calc(100vh-14rem)]", "lg:max-h-[calc(100vh-10rem)]"]}
+              tableClassName="min-w-max border-separate border-spacing-0"
+              containerRef={scrollRef}
             >
               <Thead>
                 <tr>
-                  <Th>{t("audit.ts")}</Th>
+                  <Th
+                    className={cn(
+                      "sticky left-0 z-30 w-56 bg-surface-muted",
+                      scrollState !== "start" &&
+                        "shadow-[6px_0_10px_-4px_rgba(0,0,0,0.25)]",
+                    )}
+                  >
+                    {t("audit.ts")}
+                  </Th>
                   <Th>{t("audit.actor")}</Th>
                   <Th>{t("audit.action")}</Th>
                   <Th>{t("audit.target")}</Th>
-                  <Th className="text-right">{t("audit.details")}</Th>
+                  <Th
+                    className={cn(
+                      "sticky right-0 z-30 bg-surface-muted text-right",
+                      scrollState !== "end" &&
+                        "shadow-[-6px_0_10px_-4px_rgba(0,0,0,0.25)]",
+                    )}
+                  >
+                    {t("audit.details")}
+                  </Th>
                 </tr>
               </Thead>
               <tbody>
                 {entries.map((e) => (
                   <Tr key={e.id}>
-                    <Td className="text-xs text-text-muted">{fmtTime(e.ts)}</Td>
+                    <Td
+                      className={cn(
+                        "sticky left-0 z-10 w-56 bg-surface text-xs text-text-muted group-hover:bg-surface-muted",
+                        scrollState !== "start" &&
+                          "shadow-[6px_0_10px_-4px_rgba(0,0,0,0.25)]",
+                      )}
+                    >
+                      {fmtTime(e.ts)}
+                    </Td>
                     <Td>{e.actor}</Td>
                     <Td>
                       <Badge tone="primary">{e.action}</Badge>
@@ -229,7 +261,13 @@ export default function Audit() {
                         );
                       })()}
                     </Td>
-                    <Td className="text-right">
+                    <Td
+                      className={cn(
+                        "sticky right-0 z-10 bg-surface text-right group-hover:bg-surface-muted",
+                        scrollState !== "end" &&
+                          "shadow-[-6px_0_10px_-4px_rgba(0,0,0,0.25)]",
+                      )}
+                    >
                       <Tooltip content={t("audit.viewDetails")}>
                         <Button
                           variant="ghost"

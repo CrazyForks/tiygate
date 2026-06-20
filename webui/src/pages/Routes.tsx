@@ -47,9 +47,11 @@ import {
   Th,
   Tooltip,
   Tr,
+  useStickyTableScroll,
   useToast,
 } from "@/components/ui";
 import { PageHeader, fmtTime } from "@/components/PageHeader";
+import { cn } from "@/lib/cn";
 
 interface FormState {
   id?: string;
@@ -98,6 +100,10 @@ export default function RoutesPage() {
     queryKey: ["providers"],
     queryFn: providersApi.list,
   });
+  const { scrollRef, scrollState } = useStickyTableScroll([
+    isLoading,
+    data?.length ?? 0,
+  ]);
   const providerNameById = useMemo(() => {
     const m = new Map<string, string>();
     (providers ?? []).forEach((p) => m.set(p.id, p.name));
@@ -305,6 +311,8 @@ export default function RoutesPage() {
           ) : (
             <Table
               maxHeight={["max-h-[calc(100vh-9.5rem)]", "lg:max-h-[calc(100vh-5.5rem)]"]}
+              tableClassName="min-w-max border-separate border-spacing-0"
+              containerRef={scrollRef}
             >
               <colgroup>
                 <col style={{ width: "20rem" }} />
@@ -315,17 +323,39 @@ export default function RoutesPage() {
               </colgroup>
               <Thead>
                 <tr>
-                  <Th>{t("routes.virtualModel")}</Th>
+                  <Th
+                    className={cn(
+                      "sticky left-0 z-30 w-80 bg-surface-muted",
+                      scrollState !== "start" &&
+                        "shadow-[6px_0_10px_-4px_rgba(0,0,0,0.25)]",
+                    )}
+                  >
+                    {t("routes.virtualModel")}
+                  </Th>
                   <Th>{t("routes.targets")}</Th>
                   <Th className="text-center">{t("common.status")}</Th>
                   <Th>{t("common.updatedAt")}</Th>
-                  <Th className="text-right">{t("common.actions")}</Th>
+                  <Th
+                    className={cn(
+                      "sticky right-0 z-30 bg-surface-muted text-right",
+                      scrollState !== "end" &&
+                        "shadow-[-6px_0_10px_-4px_rgba(0,0,0,0.25)]",
+                    )}
+                  >
+                    {t("common.actions")}
+                  </Th>
                 </tr>
               </Thead>
               <tbody>
                 {(data ?? []).map((r) => (
                   <Tr key={r.id}>
-                    <Td className="align-middle">
+                    <Td
+                      className={cn(
+                        "sticky left-0 z-10 w-80 bg-surface align-middle group-hover:bg-surface-muted",
+                        scrollState !== "start" &&
+                          "shadow-[6px_0_10px_-4px_rgba(0,0,0,0.25)]",
+                      )}
+                    >
                       <div className="flex items-center gap-1.5">
                         <span
                           className="truncate font-medium text-text"
@@ -344,7 +374,7 @@ export default function RoutesPage() {
                         {r.id}
                       </div>
                     </Td>
-                    <Td className="align-middle">
+                    <Td className="max-w-[60rem] align-middle">
                       <TargetBadges
                         targets={r.targets}
                         resolveProvider={resolveProvider}
@@ -360,7 +390,13 @@ export default function RoutesPage() {
                     <Td className="text-xs text-text-muted">
                       {fmtTime(r.updated_at)}
                     </Td>
-                    <Td className="text-right">
+                    <Td
+                      className={cn(
+                        "sticky right-0 z-10 bg-surface text-right group-hover:bg-surface-muted",
+                        scrollState !== "end" &&
+                          "shadow-[-6px_0_10px_-4px_rgba(0,0,0,0.25)]",
+                      )}
+                    >
                       <div className="flex justify-end">
                         <RowActions
                           label={t("common.rowActions")}
@@ -725,7 +761,7 @@ function TargetBadges({
   return (
     <div
       ref={containerRef}
-      className="flex max-h-[3.25rem] flex-wrap gap-1 overflow-hidden"
+      className="flex max-h-[3.25rem] max-w-full flex-wrap gap-1 overflow-hidden"
     >
       {shown.map((tg, i) => (
         <Badge

@@ -24,9 +24,11 @@ import {
   Td,
   Th,
   Tr,
+  useStickyTableScroll,
   useToast,
 } from "@/components/ui";
 import { PageHeader, fmtTime } from "@/components/PageHeader";
+import { cn } from "@/lib/cn";
 import { VendorIcon } from "@/lib/vendors";
 
 const AUTH_MODES = ["api_key", "oauth"];
@@ -81,6 +83,10 @@ export default function Providers() {
     queryKey: ["provider-catalog"],
     queryFn: providerCatalogApi.list,
   });
+  const { scrollRef, scrollState } = useStickyTableScroll([
+    isLoading,
+    data?.length ?? 0,
+  ]);
 
   // Map catalog id → display name for the table's vendor column.
   const catalogLabel = useMemo(() => {
@@ -282,6 +288,8 @@ export default function Providers() {
           ) : (
             <Table
               maxHeight={["max-h-[calc(100vh-9.5rem)]", "lg:max-h-[calc(100vh-5.5rem)]"]}
+              tableClassName="min-w-max border-separate border-spacing-0"
+              containerRef={scrollRef}
             >
               <colgroup>
                 <col style={{ width: "20rem" }} />
@@ -294,19 +302,41 @@ export default function Providers() {
               </colgroup>
               <Thead>
                 <tr>
-                  <Th>{t("common.name")}</Th>
+                  <Th
+                    className={cn(
+                      "sticky left-0 z-30 w-80 bg-surface-muted",
+                      scrollState !== "start" &&
+                        "shadow-[6px_0_10px_-4px_rgba(0,0,0,0.25)]",
+                    )}
+                  >
+                    {t("common.name")}
+                  </Th>
                   <Th>{t("providers.vendor")}</Th>
                   <Th>{t("providers.apiBase")}</Th>
                   <Th>{t("providers.authMode")}</Th>
                   <Th className="text-center">{t("common.status")}</Th>
                   <Th>{t("common.updatedAt")}</Th>
-                  <Th className="text-right">{t("common.actions")}</Th>
+                  <Th
+                    className={cn(
+                      "sticky right-0 z-30 bg-surface-muted text-right",
+                      scrollState !== "end" &&
+                        "shadow-[-6px_0_10px_-4px_rgba(0,0,0,0.25)]",
+                    )}
+                  >
+                    {t("common.actions")}
+                  </Th>
                 </tr>
               </Thead>
               <tbody>
                 {(data ?? []).map((p) => (
                   <Tr key={p.id}>
-                    <Td className="align-middle">
+                    <Td
+                      className={cn(
+                        "sticky left-0 z-10 w-80 bg-surface align-middle group-hover:bg-surface-muted",
+                        scrollState !== "start" &&
+                          "shadow-[6px_0_10px_-4px_rgba(0,0,0,0.25)]",
+                      )}
+                    >
                       <div
                         className="truncate font-medium text-text"
                         title={p.name}
@@ -349,7 +379,13 @@ export default function Providers() {
                     <Td className="text-xs text-text-muted whitespace-nowrap">
                       {fmtTime(p.updated_at)}
                     </Td>
-                    <Td className="text-right">
+                    <Td
+                      className={cn(
+                        "sticky right-0 z-10 bg-surface text-right group-hover:bg-surface-muted",
+                        scrollState !== "end" &&
+                          "shadow-[-6px_0_10px_-4px_rgba(0,0,0,0.25)]",
+                      )}
+                    >
                       <RowActions
                         label={t("common.rowActions")}
                         items={[

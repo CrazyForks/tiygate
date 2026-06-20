@@ -5,7 +5,8 @@ export type { BadgeTone } from "./badge";
 export { Input, Textarea, PasswordInput } from "./input";
 export { Label, Field } from "./field";
 export { Card, CardHeader, CardBody, Metric } from "./card";
-export { Table, Thead, Th, Td, Tr } from "./table";
+export { Table, Thead, Th, Td, Tr, useStickyTableScroll } from "./table";
+export type { StickyTableScrollState } from "./table";
 export {
   Spinner,
   Skeleton,
