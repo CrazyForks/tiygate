@@ -4,8 +4,17 @@ import { useTranslation } from "react-i18next";
 import { probeToken, fetchServerInfo, ApiError } from "@/api/client";
 import { useAuth } from "./AuthContext";
 import { checkIsFirstRun } from "./setup";
-import { Button, Card, ErrorBox, Field, PasswordInput, Spinner, Switch } from "@/components/ui";
+import {
+  Button,
+  Card,
+  ErrorBox,
+  Field,
+  PasswordInput,
+  Spinner,
+  Switch,
+} from "@/components/ui";
 import { LanguageSwitcher } from "@/components/LanguageSwitcher";
+import { InstanceIndicator } from "@/components/InstanceIndicator";
 import { cn } from "@/lib/cn";
 
 export default function Login() {
@@ -81,12 +90,7 @@ export default function Login() {
               "flex h-12 w-12 items-center justify-center overflow-hidden rounded-lg",
             )}
           >
-            <img
-              src="./icon.svg"
-              alt=""
-              aria-hidden
-              className="h-12 w-12"
-            />
+            <img src="./icon.svg" alt="" aria-hidden className="h-12 w-12" />
           </span>
           <h1 className="mt-3 text-lg font-semibold tracking-[-0.01em] text-text">
             {t("app.title")}
@@ -137,9 +141,18 @@ export default function Login() {
           </form>
         </Card>
 
-        {version ? (
-          <p className="mt-6 text-center text-xs text-text-muted">v{version}</p>
-        ) : null}
+        {(isTauri || version) && (
+          <div className="mt-6 flex items-center justify-between gap-3">
+            {isTauri ? (
+              <InstanceIndicator className="max-w-[280px]" />
+            ) : (
+              <span />
+            )}
+            {version ? (
+              <p className="shrink-0 text-xs text-text-muted">v{version}</p>
+            ) : null}
+          </div>
+        )}
       </div>
     </div>
   );

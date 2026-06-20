@@ -65,7 +65,7 @@ function SidebarContent({
   onToggleCollapse?: () => void;
 }) {
   const { t } = useTranslation();
-  const { logout, isPasswordless, isTauri } = useAuth();
+  const { logout, isPasswordless } = useAuth();
   const [version, setVersion] = useState<string | null>(null);
 
   useEffect(() => {
@@ -180,7 +180,7 @@ function SidebarContent({
         {collapsed ? (
           <div className="flex flex-col items-center gap-2">
             <ThemeSwitcher />
-            {!isPasswordless && !isTauri && (
+            {!isPasswordless && (
               <button
                 type="button"
                 aria-label={t("app.logout")}
@@ -198,7 +198,7 @@ function SidebarContent({
               <LanguageSwitcher />
               <ThemeSwitcher />
             </div>
-            {!isPasswordless && !isTauri && (
+            {!isPasswordless && (
               <div className="flex items-center">
                 <button
                   type="button"

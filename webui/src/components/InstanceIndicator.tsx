@@ -12,6 +12,10 @@ import {
 } from "@/auth/setup";
 import { cn } from "@/lib/cn";
 
+type InstanceIndicatorProps = {
+  className?: string;
+};
+
 const POLL_INTERVAL_MS = 30_000;
 
 /** Colored status dot for the instance health indicator. */
@@ -49,7 +53,7 @@ function StatusDot({ status }: { status: HealthStatus | null }) {
  * Only rendered in Tauri environments — in a browser deployment the
  * API origin is always the same as the SPA origin.
  */
-export function InstanceIndicator() {
+export function InstanceIndicator({ className }: InstanceIndicatorProps = {}) {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const [active, setActive] = useState<ActiveInstance | null>(null);
@@ -99,14 +103,17 @@ export function InstanceIndicator() {
     <button
       type="button"
       onClick={() => navigate("/setup")}
-      className="flex items-center gap-2 rounded-md border border-border bg-surface px-3 py-1.5 text-left transition-colors hover:border-border-strong hover:bg-surface-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-      title={t("setup.switchInstance")}
+      className={cn(
+        "flex max-w-full min-w-0 items-center gap-2 rounded-md border border-border bg-surface px-3 py-1.5 text-left transition-colors hover:border-border-strong hover:bg-surface-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+        className,
+      )}
+      title={`${t("setup.switchInstance")}: ${displayLabel}${displayUrl ? `（${displayUrl}）` : ""}`}
     >
       <StatusDot status={health} />
-      <span className="text-xs font-medium text-text whitespace-nowrap">
+      <span className="min-w-0 truncate whitespace-nowrap text-xs font-medium text-text">
         {displayLabel}
         {displayUrl && (
-          <span className="text-text-subtle font-normal">（{displayUrl}）</span>
+          <span className="font-normal text-text-subtle">（{displayUrl}）</span>
         )}
       </span>
       <ArrowLeftRight
