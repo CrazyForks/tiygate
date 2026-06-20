@@ -1,25 +1,43 @@
 import { useEffect, useState, type FormEvent } from "react";
+import { useNavigate } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import { probeToken, fetchServerInfo, ApiError } from "@/api/client";
 import { useAuth } from "./AuthContext";
-import { Button, Card, ErrorBox, Field, PasswordInput, Switch } from "@/components/ui";
+import { checkIsFirstRun } from "./setup";
+import { Button, Card, ErrorBox, Field, PasswordInput, Spinner, Switch } from "@/components/ui";
 import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import { cn } from "@/lib/cn";
 
 export default function Login() {
   const { t } = useTranslation();
-  const { login } = useAuth();
+  const { login, isTauri } = useAuth();
+  const navigate = useNavigate();
   const [token, setToken] = useState("");
   const [remember, setRemember] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [version, setVersion] = useState<string | null>(null);
+  // In Tauri mode, suppress rendering until the first-run check completes
+  // to avoid flashing the login page before redirecting to /setup.
+  const [tauriCheckDone, setTauriCheckDone] = useState(!isTauri);
 
   useEffect(() => {
+    // In Tauri mode, redirect to setup on first run.
+    if (isTauri) {
+      checkIsFirstRun()
+        .then((firstRun) => {
+          if (firstRun) {
+            navigate("/setup", { replace: true });
+          } else {
+            setTauriCheckDone(true);
+          }
+        })
+        .catch(() => setTauriCheckDone(true));
+    }
     fetchServerInfo().then((info) => {
       if (info) setVersion(info.version);
     });
-  }, []);
+  }, [isTauri, navigate]);
 
   async function onSubmit(e: FormEvent) {
     e.preventDefault();
@@ -29,7 +47,9 @@ export default function Login() {
     try {
       await probeToken(token.trim());
       login(token.trim(), remember);
-      window.location.replace("/admin/ui/");
+      // In Tauri the SPA root is `/`; in browser it's `/admin/ui/`.
+      const tauriInternals = "__TAURI_INTERNALS__" in window;
+      window.location.replace(tauriInternals ? "/" : "/admin/ui/");
     } catch (err) {
       if (err instanceof ApiError) {
         if (err.status === 401) setError(t("login.invalid"));
@@ -41,6 +61,14 @@ export default function Login() {
     } finally {
       setBusy(false);
     }
+  }
+
+  if (isTauri && !tauriCheckDone) {
+    return (
+      <div className="flex min-h-full items-center justify-center bg-bg">
+        <Spinner />
+      </div>
+    );
   }
 
   return (

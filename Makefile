@@ -132,6 +132,39 @@ dev-web: webui-install ## 仅启动 WebUI 开发服务器(在 webui/ 下跑 npm 
 watch: ## 监听 Rust 代码变更并自动重新构建/运行(需要 cargo-watch)
 	cargo watch -x 'run -p $(SERVER_CRATE)'
 
+# =========================
+# 桌面客户端 (Tauri)
+# =========================
+# Sidecar features — 包含 webui 嵌入,排除 redis-quota/bedrock/dotenv
+# (dotenv 排除: Tauri 已显式注入所有 env,dotenvy 会搜索 CWD 下的 .env,
+#  若 workspace 在 ~/Documents 下会触发 macOS 文稿权限弹窗)
+SIDECAR_FEATURES ?= webui,admin,cache,providers,control-plane,tracing
+SIDECAR_SCRIPT   := scripts/build-sidecar.sh
+
+.PHONY: build-sidecar
+build-sidecar: ## 编译 tiygate-server 为 Tauri sidecar 二进制并复制到 src-tauri/binaries/(release)
+	bash $(SIDECAR_SCRIPT)
+
+.PHONY: build-sidecar-debug
+build-sidecar-debug: ## 编译 tiygate-server sidecar(debug 模式)
+	bash $(SIDECAR_SCRIPT) --debug
+
+.PHONY: dev-desktop
+dev-desktop: build-sidecar-debug ## 开发模式:编译 sidecar(debug)+ 启动 Tauri dev(webui 热更新)
+	cd src-tauri && cargo tauri dev
+
+.PHONY: desktop
+desktop: build-sidecar ## 构建桌面客户端安装包(release):编译 sidecar + webui + Tauri bundle(自动适配当前平台)
+	cd src-tauri && cargo tauri build
+
+.PHONY: desktop-check
+desktop-check: webui-install webui-build ## 检查 Tauri 客户端 crate 是否可编译
+	cd src-tauri && cargo check
+
+.PHONY: desktop-lint
+desktop-lint: webui-install webui-build ## Tauri 客户端 clippy 检查(需先构建 webui 以满足 generate_context!)
+	$(CARGO) clippy -p tiygate-desktop --all-targets -- -D warnings
+
 .PHONY: doc
 doc: ## 生成并打开 Rust 文档
 	$(CARGO) doc --workspace --all-features --no-deps --open

@@ -1,0 +1,36 @@
+[package]
+name = "tiygate-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "TiyGate local desktop client (Tauri 2 sidecar wrapper)"
+
+[lib]
+name = "tiygate_desktop_lib"
+crate-type = ["rlib"]
+
+[[bin]]
+name = "tiygate-desktop"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+rand = { workspace = true }
+hex = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+anyhow = { workspace = true }
+
+[features]
+# This feature is used for production builds or when a dev server is not
+# specified, DO NOT remove.
+custom-protocol = ["tauri/custom-protocol"]

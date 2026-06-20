@@ -1,0 +1,42 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "TiyGate",
+  "version": "0.1.0",
+  "identifier": "ai.tiy.tiygate",
+  "build": {
+    "frontendDist": "../webui/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "TiyGate",
+        "width": 1280,
+        "height": 860,
+        "minWidth": 900,
+        "minHeight": 600,
+        "resizable": true,
+        "fullscreen": false,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": null,
+      "capabilities": ["default"]
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "externalBin": ["binaries/tiygate"],
+    "resources": []
+  },
+  "plugins": {}
+}

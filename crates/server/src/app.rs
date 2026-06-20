@@ -12,6 +12,7 @@
 use std::sync::Arc;
 
 use axum::Router;
+use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
 use tracing::warn;
 
@@ -258,7 +259,20 @@ impl App {
         // The embedding cache is reachable from ingress via the
         // `AppState` in `router_with_telemetry`; nothing to wire
         // here at the router level.
-        router
+
+        // Apply permissive CORS so the Tauri desktop client (whose
+        // webview origin is `tauri://localhost`) can make cross-origin
+        // fetch calls to the sidecar's admin API. In standard server
+        // deployments behind a reverse proxy this is harmless because
+        // the proxy typically handles CORS, and the admin API is
+        // already token-gated.
+        let cors = CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods(Any)
+            .allow_headers(Any)
+            .expose_headers(Any);
+
+        router.layer(cors)
     }
 }
 

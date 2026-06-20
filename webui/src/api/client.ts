@@ -1,7 +1,41 @@
 import { getToken, clearToken } from "@/auth/token";
 
-/** Base path for the admin REST API. Same-origin with the SPA. */
-const API_BASE = "/admin/v1";
+/**
+ * Resolve the API base URL. In a browser (non-Tauri) environment the
+ * SPA is served by the same origin as the API, so a relative path
+ * works. In a Tauri webview the SPA is served from `tauri://localhost`
+ * while the API lives on `http://127.0.0.1:{port}`, so we need an
+ * absolute URL. The port is fetched from the Tauri backend and cached.
+ */
+let apiBaseUrl = "/admin/v1";
+let portResolved = false;
+
+async function ensureApiBase(): Promise<void> {
+  if (portResolved) return;
+  const tauriInternals =
+    typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+  if (!tauriInternals) {
+    portResolved = true;
+    return;
+  }
+  try {
+    const mod = await import("@tauri-apps/api/core");
+    const port = await mod.invoke<number>("get_server_port");
+    if (port > 0) {
+      apiBaseUrl = `http://127.0.0.1:${port}/admin/v1`;
+    }
+  } catch {
+    // Degrade to relative path — will fail with connection errors,
+    // but that's expected if the sidecar isn't running.
+  }
+  portResolved = true;
+}
+
+/** Reset the cached port (used when the sidecar restarts on a new port). */
+export function resetApiBase(): void {
+  portResolved = false;
+  apiBaseUrl = "/admin/v1";
+}
 
 /**
  * A normalized API error. The admin API uses two envelope shapes:
@@ -60,7 +94,7 @@ function buildUrl(
   path: string,
   query?: RequestOptions["query"],
 ): string {
-  const url = `${API_BASE}${path}`;
+  const url = `${apiBaseUrl}${path}`;
   if (!query) return url;
   const params = new URLSearchParams();
   for (const [k, v] of Object.entries(query)) {
@@ -76,6 +110,7 @@ export async function apiRequest<T>(
   path: string,
   opts: RequestOptions = {},
 ): Promise<T> {
+  await ensureApiBase();
   const token = getToken();
   const headers: Record<string, string> = {};
   if (token) headers["Authorization"] = `Bearer ${token}`;
@@ -115,6 +150,7 @@ export async function apiRequest<T>(
  * Returns `null` on any error so callers can degrade gracefully.
  */
 export async function fetchServerInfo(): Promise<{ name: string; version: string } | null> {
+  await ensureApiBase();
   try {
     const res = await fetch(buildUrl("/info"));
     if (!res.ok) return null;
@@ -130,6 +166,7 @@ export async function fetchServerInfo(): Promise<{ name: string; version: string
  * (e.g. 503 when TIYGATE_ADMIN_TOKEN is not configured server-side).
  */
 export async function probeToken(token: string): Promise<void> {
+  await ensureApiBase();
   const res = await fetch(buildUrl("/audit", { limit: 1 }), {
     headers: { Authorization: `Bearer ${token}` },
   });

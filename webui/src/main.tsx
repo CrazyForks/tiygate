@@ -19,8 +19,13 @@ const queryClient = new QueryClient({
   },
 });
 
+// In Tauri the SPA is served from `tauri://localhost/` (root), so the
+// router basename must be `/`. In a browser the SPA is served under
+// `/admin/ui/`, so the basename must match that prefix.
+const tauriInternals =
+  typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 const router = createBrowserRouter([{ path: "*", element: <App /> }], {
-  basename: "/admin/ui/",
+  basename: tauriInternals ? "/" : "/admin/ui/",
 });
 
 const rootEl = document.getElementById("root");

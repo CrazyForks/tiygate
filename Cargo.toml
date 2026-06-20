@@ -10,6 +10,7 @@ members = [
     "crates/admin",
     "crates/auth",
     "crates/server",
+    "src-tauri",
 ]
 
 [workspace.package]

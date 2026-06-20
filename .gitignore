@@ -52,3 +52,7 @@ coverage/
 
 # OS
 Thumbs.db
+
+# Tauri client
+/src-tauri/binaries/
+/src-tauri/gen/

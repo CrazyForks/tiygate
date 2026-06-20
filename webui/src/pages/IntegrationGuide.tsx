@@ -208,6 +208,13 @@ function resolveDefaultBaseUrl(): string {
   if (typeof window === "undefined" || !window.location)
     return DEFAULT_API_BASE;
   const { hostname, origin } = window.location;
+  // Tauri webview origin — the API lives on the sidecar port.
+  const isTauri = "__TAURI_INTERNALS__" in window;
+  if (isTauri) {
+    // Return a placeholder; the actual port is resolved asynchronously
+    // via getServerBaseUrl() and patched into state on mount.
+    return "http://127.0.0.1:13000";
+  }
   // 本地开发环境仍使用固定默认值，线上部署自动取当前域名
   if (
     hostname === "localhost" ||
@@ -217,6 +224,21 @@ function resolveDefaultBaseUrl(): string {
     return DEFAULT_API_BASE;
   }
   return origin;
+}
+
+/** In Tauri, fetch the sidecar port and build the base URL. Returns
+ *  `null` in non-Tauri environments. */
+async function getServerBaseUrl(): Promise<string | null> {
+  const isTauri = "__TAURI_INTERNALS__" in window;
+  if (!isTauri) return null;
+  try {
+    const mod = await import("@tauri-apps/api/core");
+    const port = await mod.invoke<number>("get_server_port");
+    if (port > 0) return `http://127.0.0.1:${port}`;
+  } catch {
+    // ignore
+  }
+  return null;
 }
 
 function readStoredString(key: string, fallback: string): string {
@@ -772,6 +794,19 @@ export default function IntegrationGuide() {
     () => readStoredString(STORAGE.language, "python") as LanguageId,
   );
   const [copied, setCopied] = useState(false);
+
+  // In Tauri, resolve the sidecar port and override the default base URL.
+  useEffect(() => {
+    getServerBaseUrl().then((url) => {
+      if (url) {
+        // Only override if the user hasn't customized it.
+        const stored = readStoredString(STORAGE.baseUrl, "");
+        if (!stored || stored === DEFAULT_API_BASE) {
+          setBaseUrl(url);
+        }
+      }
+    });
+  }, []);
 
   useEffect(() => {
     window.localStorage.setItem(STORAGE.baseUrl, baseUrl);

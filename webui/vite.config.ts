@@ -25,9 +25,12 @@ function trailingSlashPlugin(): PluginOption {
 
 // The SPA is mounted behind `/admin/ui` by the embedding server
 // (rust-embed in tiygate-server). The `base` must match that prefix
-// so all asset URLs resolve under it.
+// so all asset URLs resolve under it. When building for the Tauri
+// desktop client (TAURI_ENV=1), the SPA is served from the webview's
+// root origin, so `base` must be `/`.
+const isTauriBuild = process.env.TAURI_ENV === "1";
 export default defineConfig({
-  base: "/admin/ui/",
+  base: isTauriBuild ? "/" : "/admin/ui/",
   plugins: [trailingSlashPlugin(), react(), tailwindcss()],
   resolve: {
     alias: {

@@ -12,11 +12,13 @@ import Audit from "@/pages/Audit";
 import IntegrationGuide from "@/pages/IntegrationGuide";
 import ConfigManagement from "@/pages/ConfigManagement";
 import Settings from "@/pages/Settings";
+import Setup from "@/pages/Setup";
 
 export default function App() {
   return (
     <Routes>
       <Route path="/login" element={<Login />} />
+      <Route path="/setup" element={<Setup />} />
       <Route
         element={
           <ProtectedRoute>
