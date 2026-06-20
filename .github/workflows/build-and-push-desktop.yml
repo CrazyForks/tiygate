@@ -131,7 +131,7 @@ jobs:
         if: matrix.platform == 'macos'
         continue-on-error: true
         run: |
-          BUNDLE_DIR="src-tauri/target/${{ matrix.target }}/release/bundle"
+          BUNDLE_DIR="target/${{ matrix.target }}/release/bundle"
           for dmg in "$BUNDLE_DIR"/dmg/*.dmg; do
             [ -f "$dmg" ] || continue
             echo "Submitting $dmg for notarization..."
@@ -149,7 +149,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p release-artifacts
-          BUNDLE_DIR="src-tauri/target/${{ matrix.target }}/release/bundle"
+          BUNDLE_DIR="target/${{ matrix.target }}/release/bundle"
 
           if [ "${{ matrix.platform }}" = "macos" ]; then
             cp "$BUNDLE_DIR"/dmg/*.dmg release-artifacts/ 2>/dev/null || true
