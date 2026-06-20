@@ -1,35 +1,30 @@
 ---
 source: crates/protocols/src/images.rs
-expression: ir
+expression: snapshot
 ---
-IrRequest {
-    model: "gpt-image-1",
-    system: None,
-    messages: [],
-    tools: [],
-    params: GenerationParams {
-        max_tokens: None,
-        temperature: None,
-        top_p: None,
-        top_k: None,
-        stop: [],
-        frequency_penalty: None,
-        presence_penalty: None,
-        seed: None,
-        thinking: None,
-    },
-    response_format: None,
-    stream: false,
-    ingress_protocol: ProtocolEndpoint {
-        suite: OpenAiCompatible,
-        name: "images-generations",
-        version: "v1",
-    },
-    metadata: None,
-    extensions: {
+Object {
+    "extensions": Object {
         "images_extra": Object {
             "size": String("1024x1024"),
         },
         "prompt": String("A cute sea otter"),
     },
+    "ingress_protocol": Object {
+        "name": String("images-generations"),
+        "suite": String("open_ai_compatible"),
+        "version": String("v1"),
+    },
+    "messages": Array [],
+    "model": String("gpt-image-1"),
+    "params": Object {
+        "frequency_penalty": Null,
+        "max_tokens": Null,
+        "presence_penalty": Null,
+        "seed": Null,
+        "temperature": Null,
+        "top_k": Null,
+        "top_p": Null,
+    },
+    "stream": Bool(false),
+    "system": Null,
 }

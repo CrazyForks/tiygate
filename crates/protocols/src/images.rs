@@ -666,7 +666,10 @@ mod tests {
             "size": "1024x1024",
         });
         let ir = codec.decode_request(body, &env).unwrap();
-        insta::assert_debug_snapshot!(ir);
+        // Serialize to JSON Value for deterministic snapshot output, since the
+        // IR's `extensions` HashMap has non-deterministic iteration order.
+        let snapshot = serde_json::to_value(&ir).unwrap();
+        insta::assert_debug_snapshot!(snapshot);
     }
 
     #[test]
