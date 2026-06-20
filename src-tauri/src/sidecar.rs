@@ -52,6 +52,13 @@ impl SidecarManager {
             if let Err(e) = child.kill() {
                 tracing::warn!("failed to kill sidecar process: {e}");
             }
+            // Give the OS time to fully release the process and its
+            // file handles (especially SQLite's WAL/shm files on
+            // Windows, which are not released instantaneously after
+            // kill). Without this delay, a subsequent `spawn_sidecar`
+            // on the same DB can fail with `unable to open database
+            // file` (SQLite code 14).
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
 }
@@ -111,12 +118,30 @@ pub async fn spawn_sidecar(
 
     // Spawn a background task to drain stdout/stderr so the process
     // doesn't block on a full pipe buffer.
+    let health_port = port;
     tauri::async_runtime::spawn(async move {
         while let Some(event) = rx.recv().await {
             match event {
                 CommandEvent::Stdout(line_bytes) => {
                     let line = String::from_utf8_lossy(&line_bytes);
-                    tracing::info!("[sidecar] {}", line.trim_end());
+                    let line = line.trim_end();
+                    tracing::info!("[sidecar] {line}");
+                    // Detect early exit: if the sidecar logs an error
+                    // before becoming healthy, bail out immediately
+                    // instead of waiting for the full health-check
+                    // timeout. This typically happens when SQLite
+                    // cannot open the database file (e.g. the previous
+                    // process hasn't released its handles yet on
+                    // Windows).
+                    if line.contains("\"level\":\"ERROR\"")
+                        && (line.contains("server exited with error")
+                            || line.contains("unable to open database file"))
+                    {
+                        tracing::error!(
+                            "sidecar reported a fatal error before becoming healthy on port {health_port}"
+                        );
+                        break;
+                    }
                 }
                 CommandEvent::Stderr(line_bytes) => {
                     let line = String::from_utf8_lossy(&line_bytes);

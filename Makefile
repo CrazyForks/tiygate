@@ -150,11 +150,11 @@ build-sidecar-debug: ## 编译 tiygate-server sidecar(debug 模式)
 	bash $(SIDECAR_SCRIPT) --debug
 
 .PHONY: dev-desktop
-dev-desktop: build-sidecar-debug ## 开发模式:编译 sidecar(debug)+ 启动 Tauri dev(webui 热更新)
+dev-desktop: webui-install webui-build build-sidecar-debug ## 开发模式:编译 sidecar(debug)+ 启动 Tauri dev(webui 热更新)
 	cd src-tauri && cargo tauri dev
 
 .PHONY: desktop
-desktop: build-sidecar ## 构建桌面客户端安装包(release):编译 sidecar + webui + Tauri bundle(自动适配当前平台)
+desktop: webui-install webui-build build-sidecar ## 构建桌面客户端安装包(release):编译 sidecar + webui + Tauri bundle(自动适配当前平台)
 	cd src-tauri && cargo tauri build
 
 .PHONY: desktop-check

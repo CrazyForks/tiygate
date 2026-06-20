@@ -63,8 +63,13 @@ pub fn run() {
                 .ok_or_else(|| anyhow::anyhow!("no available port in range 13000-13099"))?;
 
             let db_path = data_dir.join("tiygate.db");
+            // Use `sqlite:` (not `sqlite://`) so the URL parser does not
+            // treat a Windows drive letter (e.g. `C:`) as the host part
+            // of an authority. With `sqlite://C:/…` the `url` crate
+            // parses `C` as host and strips it, leaving a relative path
+            // that SQLite cannot open. `sqlite:` keeps the path verbatim.
             let db_url = format!(
-                "sqlite://{}?mode=rwc",
+                "sqlite:{}?mode=rwc",
                 db_path.to_string_lossy().replace('\\', "/")
             );
 

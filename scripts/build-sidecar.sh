@@ -67,9 +67,12 @@ fi
 DEST_DIR="src-tauri/binaries"
 mkdir -p "$DEST_DIR"
 DEST_BIN="$DEST_DIR/tiygate-$TARGET"
+if [[ "$TARGET" == *"windows"* ]]; then
+    DEST_BIN="${DEST_BIN}.exe"
+fi
 
 echo ">> Copying $SRC_BIN → $DEST_BIN"
 cp "$SRC_BIN" "$DEST_BIN"
-chmod +x "$DEST_BIN"
+chmod +x "$DEST_BIN" 2>/dev/null || true
 
 echo ">> Sidecar binary ready: $DEST_BIN"
