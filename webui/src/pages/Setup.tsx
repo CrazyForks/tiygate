@@ -16,10 +16,11 @@ import {
   tauriGetLastInstanceId,
   tauriCheckInstanceHealth,
   tauriGetServerPort,
+  checkIsFirstRun,
   type InstanceEntry,
   type HealthStatus,
 } from "@/auth/setup";
-import { resetApiBase, setActiveInstance } from "@/api/client";
+import { resetApiBase } from "@/api/client";
 import {
   Alert,
   Button,
@@ -211,7 +212,8 @@ export default function Setup() {
     setError(null);
     try {
       if (selectedId) {
-        // Remote instance: switch active, reset API base, go to login.
+        // Remote instance: switch active, set API base + instance key,
+        // clear React Query cache, go to login.
         const inst = instances.find((i) => i.id === selectedId);
         if (!inst) {
           setError(t("setup.instanceNotFound"));
@@ -219,17 +221,23 @@ export default function Setup() {
           return;
         }
         await tauriSwitchInstance(inst.id);
-        setActiveInstance(inst.url);
         queryClient.clear();
-        // Remote instances require manual token entry.
-        navigate("/login", { replace: true });
+        // Reload so AuthContext re-initializes with the new instance
+        // key. If a remembered token exists in per-instance storage,
+        // the app will auto-login; otherwise it shows the login page.
+        window.location.replace("/");
       } else {
-        // Local instance: switch active, reset API base, continue
-        // to the existing token / master-key setup flow.
+        // Local instance: switch active and either enter first-run
+        // setup or reload into the existing local admin session.
         await tauriSwitchInstance(null);
         resetApiBase();
         queryClient.clear();
-        setMode("choose");
+        const firstRun = await checkIsFirstRun();
+        if (firstRun) {
+          setMode("choose");
+        } else {
+          window.location.replace("/");
+        }
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -301,7 +309,9 @@ export default function Setup() {
         await waitForSidecar(passwordlessToken);
         setPasswordless(true);
         login(passwordlessToken, true);
-        navigate("/", { replace: true });
+        // Full reload so AuthContext re-initializes with the local
+        // instance key and passwordless token.
+        window.location.replace("/");
       } else {
         // Set-token flow: wait for sidecar, then go to login.
         await waitForSidecar(token.trim());
@@ -386,8 +396,8 @@ export default function Setup() {
                     className={cn(
                       "flex w-full items-center gap-3 rounded-md border p-4 text-left transition-colors",
                       selectedId === null
-                        ? "border-accent bg-accent/5"
-                        : "border-border hover:border-accent hover:bg-accent/5",
+                        ? "border-primary bg-primary-soft"
+                        : "border-border hover:border-border-strong hover:bg-surface-muted",
                       "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
                     )}
                   >
@@ -401,7 +411,9 @@ export default function Setup() {
                       </p>
                     </div>
                     {selectedId === null && (
-                      <span className="text-xs font-medium text-accent">✓</span>
+                      <span className="text-xs font-medium text-primary">
+                        ✓
+                      </span>
                     )}
                   </button>
 
@@ -412,8 +424,8 @@ export default function Setup() {
                       className={cn(
                         "flex w-full items-center gap-3 rounded-md border p-4 transition-colors",
                         selectedId === inst.id
-                          ? "border-accent bg-accent/5"
-                          : "border-border",
+                          ? "border-primary bg-primary-soft"
+                          : "border-border hover:border-border-strong hover:bg-surface-muted",
                       )}
                     >
                       <button
@@ -429,7 +441,7 @@ export default function Setup() {
                           </p>
                         </div>
                         {selectedId === inst.id && (
-                          <span className="text-xs font-medium text-accent">
+                          <span className="text-xs font-medium text-primary">
                             ✓
                           </span>
                         )}
@@ -513,7 +525,7 @@ export default function Setup() {
                       }}
                       className={cn(
                         "flex w-full items-center justify-center gap-2 rounded-md border border-dashed border-border p-3 text-sm text-text-muted",
-                        "transition-colors hover:border-accent hover:text-accent",
+                        "transition-colors hover:border-border-strong hover:bg-surface-muted hover:text-text",
                       )}
                     >
                       + {t("setup.addRemote")}
@@ -544,7 +556,7 @@ export default function Setup() {
                   setMode("instance-select");
                   setError(null);
                 }}
-                className="mb-1 text-sm text-accent hover:underline"
+                className="mb-1 text-sm text-primary hover:underline"
               >
                 ← {t("setup.backToInstanceSelect")}
               </button>
@@ -556,7 +568,7 @@ export default function Setup() {
                 }}
                 className={cn(
                   "flex w-full items-start gap-3 rounded-md border border-border p-4 text-left",
-                  "transition-colors hover:border-accent hover:bg-accent/5",
+                  "transition-colors hover:border-border-strong hover:bg-surface-muted",
                   "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
                 )}
               >
@@ -574,7 +586,7 @@ export default function Setup() {
                 onClick={handlePasswordless}
                 className={cn(
                   "flex w-full items-start gap-3 rounded-md border border-border p-4 text-left",
-                  "transition-colors hover:border-accent hover:bg-accent/5",
+                  "transition-colors hover:border-border-strong hover:bg-surface-muted",
                   "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
                 )}
               >

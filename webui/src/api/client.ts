@@ -11,6 +11,14 @@ import { getToken, clearToken } from "@/auth/token";
 let apiBaseUrl = "/admin/v1";
 let portResolved = false;
 
+/**
+ * The instance key used to scope token storage. `"local"` for the
+ * sidecar, or a remote instance id. Set by `setActiveInstance` /
+ * `ensureApiBase` so that `apiRequest` reads the correct per-instance
+ * token from storage.
+ */
+let currentInstanceKey = "";
+
 async function ensureApiBase(): Promise<void> {
   if (portResolved) return;
   const tauriInternals =
@@ -26,11 +34,13 @@ async function ensureApiBase(): Promise<void> {
     const mod = await import("@tauri-apps/api/core");
     const active = await mod.invoke<{
       kind: string;
+      id?: string;
       url?: string;
     }>("get_active_instance");
     if (active?.url) {
       apiBaseUrl = `${active.url.replace(/\/+$/, "")}/admin/v1`;
     }
+    currentInstanceKey = active?.id ?? "local";
   } catch {
     // Degrade to relative path — will fail with connection errors,
     // but that's expected if the sidecar isn't running.
@@ -42,9 +52,11 @@ async function ensureApiBase(): Promise<void> {
  * Force-set the API base URL after an instance switch, bypassing the
  * ensureApiBase lookup. The caller passes the full base (origin for
  * local, URL for remote); this function appends `/admin/v1`.
+ * Also sets the instance key for per-instance token scoping.
  */
-export function setActiveInstance(baseUrl: string): void {
+export function setActiveInstance(baseUrl: string, instanceKey: string): void {
   apiBaseUrl = `${baseUrl.replace(/\/+$/, "")}/admin/v1`;
+  currentInstanceKey = instanceKey;
   portResolved = true;
 }
 
@@ -52,6 +64,7 @@ export function setActiveInstance(baseUrl: string): void {
 export function resetApiBase(): void {
   portResolved = false;
   apiBaseUrl = "/admin/v1";
+  currentInstanceKey = "";
 }
 
 /**
@@ -125,7 +138,7 @@ export async function apiRequest<T>(
   opts: RequestOptions = {},
 ): Promise<T> {
   await ensureApiBase();
-  const token = getToken();
+  const token = getToken(currentInstanceKey);
   const headers: Record<string, string> = {};
   if (token) headers["Authorization"] = `Bearer ${token}`;
   if (opts.body !== undefined) headers["Content-Type"] = "application/json";
@@ -139,7 +152,7 @@ export async function apiRequest<T>(
   if (res.status === 401) {
     // The token was rejected. Drop it and let the app route back to
     // the login screen.
-    clearToken();
+    clearToken(currentInstanceKey);
     onUnauthorized?.();
     throw await parseError(res);
   }

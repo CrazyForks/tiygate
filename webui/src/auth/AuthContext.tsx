@@ -8,7 +8,7 @@ import {
   type PropsWithChildren,
 } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { setUnauthorizedHandler } from "@/api/client";
+import { setUnauthorizedHandler, probeToken } from "@/api/client";
 import { clearToken, getToken, setToken } from "./token";
 import {
   isTauri,
@@ -38,29 +38,36 @@ const AuthContext = createContext<AuthState | null>(null);
 
 export function AuthProvider({ children }: PropsWithChildren) {
   const tauri = isTauri();
-  const [token, setTokenState] = useState<string | null>(() => getToken());
+  const [instanceKey, setInstanceKey] = useState<string>("");
+  const [token, setTokenState] = useState<string | null>(() =>
+    tauri ? null : getToken(""),
+  );
   const [isInitializing, setIsInitializing] = useState(tauri);
   const [isPasswordless, setIsPasswordless] = useState(false);
   const queryClient = useQueryClient();
 
   const logout = useCallback(() => {
-    clearToken();
+    clearToken(instanceKey);
     setTokenState(null);
     queryClient.clear();
-  }, [queryClient]);
+  }, [queryClient, instanceKey]);
 
-  const login = useCallback((newToken: string, remember: boolean) => {
-    setToken(newToken, remember);
-    setTokenState(newToken);
-  }, []);
+  const login = useCallback(
+    (newToken: string, remember: boolean) => {
+      setToken(newToken, remember, instanceKey);
+      setTokenState(newToken);
+    },
+    [instanceKey],
+  );
 
   // In Tauri environments, attempt to auto-login on mount:
   // - If first-run is not complete, do nothing (the Setup page handles it).
   // - If first-run is complete, check the active instance:
   //   - Local sidecar → fetch the stored token and auto-login
   //     (passwordless flow). Mark it so the logout button is hidden.
-  //   - Remote instance → do NOT auto-login; the user must enter the
-  //     Admin Token manually on the Login page.
+  //   - Remote instance → check for a remembered per-instance token
+  //     in localStorage. If found, auto-login; otherwise redirect
+  //     to /login for manual entry.
   useEffect(() => {
     if (!tauri) {
       setIsInitializing(false);
@@ -72,22 +79,38 @@ export function AuthProvider({ children }: PropsWithChildren) {
         const firstRun = await checkIsFirstRun();
         if (!firstRun) {
           const active = await tauriGetActiveInstance();
-          // Only auto-login for the local sidecar. Remote instances
-          // require manual token entry.
+          const key = active?.id ?? "local";
+          setInstanceKey(key);
           if (active?.kind === "local") {
+            // Local sidecar: use the Rust-side stored token for
+            // passwordless auto-login.
             const storedToken = await tauriGetAdminToken();
             if (storedToken && !cancelled) {
-              setToken(storedToken, true);
+              setToken(storedToken, true, key);
               setTokenState(storedToken);
               setIsPasswordless(true);
             }
           } else if (active?.kind === "remote") {
-            // Clear any cached React Query data from a previous
-            // instance to prevent cross-instance data leakage.
-            queryClient.clear();
+            // Remote instance: a remembered token must be verified
+            // before entering the dashboard. This prevents stale tokens
+            // from triggering many parallel dashboard requests and
+            // freezing the remote instance due to failed attempts.
+            const remembered = getToken(key);
+            if (remembered && !cancelled) {
+              try {
+                await probeToken(remembered);
+                if (!cancelled) setTokenState(remembered);
+              } catch {
+                clearToken(key);
+                setTokenState(null);
+                queryClient.clear();
+              }
+            } else {
+              clearToken(key);
+              setTokenState(null);
+              queryClient.clear();
+            }
           }
-          // For remote instances, isInitializing completes without
-          // setting a token, so ProtectedRoute will redirect to /login.
         }
       } catch {
         // Degrade gracefully — user can use the login page manually.
@@ -104,11 +127,12 @@ export function AuthProvider({ children }: PropsWithChildren) {
   // the session and bounces the user back to login.
   useEffect(() => {
     setUnauthorizedHandler(() => {
+      clearToken(instanceKey);
       setTokenState(null);
       queryClient.clear();
     });
     return () => setUnauthorizedHandler(null);
-  }, [queryClient]);
+  }, [queryClient, instanceKey]);
 
   const setPasswordless = useCallback((v: boolean) => setIsPasswordless(v), []);
 

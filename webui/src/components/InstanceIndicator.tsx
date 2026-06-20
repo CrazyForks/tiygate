@@ -99,7 +99,7 @@ export function InstanceIndicator() {
     <button
       type="button"
       onClick={() => navigate("/setup")}
-      className="flex items-center gap-2 rounded-md border border-border bg-surface px-3 py-1.5 text-left transition-colors hover:border-accent hover:bg-accent/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      className="flex items-center gap-2 rounded-md border border-border bg-surface px-3 py-1.5 text-left transition-colors hover:border-border-strong hover:bg-surface-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
       title={t("setup.switchInstance")}
     >
       <StatusDot status={health} />
