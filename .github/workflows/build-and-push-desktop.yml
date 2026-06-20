@@ -84,7 +84,10 @@ jobs:
         run: cd webui && npm ci
 
       - name: Build webui
-        run: cd webui && TAURI_ENV=1 npm run build
+        run: npm run build
+        working-directory: webui
+        env:
+          TAURI_ENV: "1"
 
       - name: Build sidecar binary
         shell: bash
@@ -115,9 +118,6 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Updater signing key (required for createUpdaterArtifacts)
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           # macOS code signing (cert-based, applied by tauri-action)
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -153,27 +153,11 @@ jobs:
 
           if [ "${{ matrix.platform }}" = "macos" ]; then
             cp "$BUNDLE_DIR"/dmg/*.dmg release-artifacts/ 2>/dev/null || true
-            # Updater artifacts: rename to include arch suffix
-            ARCH_SUFFIX="${{ matrix.arch }}"
-            for f in "$BUNDLE_DIR"/macos/*.app.tar.gz; do
-              [ -f "$f" ] || continue
-              BASENAME=$(basename "$f")
-              RENAMED="${BASENAME/.app.tar.gz/_${ARCH_SUFFIX}.app.tar.gz}"
-              cp "$f" "release-artifacts/${RENAMED}"
-            done
-            for f in "$BUNDLE_DIR"/macos/*.app.tar.gz.sig; do
-              [ -f "$f" ] || continue
-              BASENAME=$(basename "$f")
-              RENAMED="${BASENAME/.app.tar.gz.sig/_${ARCH_SUFFIX}.app.tar.gz.sig}"
-              cp "$f" "release-artifacts/${RENAMED}"
-            done
           elif [ "${{ matrix.platform }}" = "windows" ]; then
-            # NSIS installer + updater signature
+            # NSIS installer
             cp "$BUNDLE_DIR"/nsis/*-setup.exe release-artifacts/ 2>/dev/null || true
-            cp "$BUNDLE_DIR"/nsis/*-setup.exe.sig release-artifacts/ 2>/dev/null || true
-            # MSI installer + updater signature
+            # MSI installer
             cp "$BUNDLE_DIR"/msi/*.msi release-artifacts/ 2>/dev/null || true
-            cp "$BUNDLE_DIR"/msi/*.msi.sig release-artifacts/ 2>/dev/null || true
           fi
 
           # Rename artifacts from bundle version to full version (e.g. 0.1.0 → 0.1.0-rc.1)

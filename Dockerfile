@@ -17,6 +17,12 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
 COPY --from=webui-builder /app/webui/dist ./webui/dist
 
+# The workspace Cargo.toml lists `src-tauri` (the Tauri desktop crate) as a
+# member. It is not needed in the server-only Docker image and would pull in
+# the heavy Tauri dependency tree. Temporarily remove it from the workspace
+# so `cargo` does not try to parse its manifest.
+RUN sed -i '/src-tauri/d' Cargo.toml
+
 # Inject the release tag (e.g. v0.2.0) as the workspace version so
 # `env!("CARGO_PKG_VERSION")` and the `/admin/v1/info` endpoint
 # report the actual build version instead of the hardcoded default.
