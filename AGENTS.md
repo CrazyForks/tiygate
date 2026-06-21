@@ -14,6 +14,14 @@ This repository is a Cargo workspace with 8 crates and an embedded admin console
 - `docs/` holds architecture and protocol capability docs; `scripts/` contains helper checks such as `verify-deps.sh`.
 - Tests live in `crates/<crate>/tests/` for integration tests and inline `#[cfg(test)]` modules for unit tests.
 
+## Engineering Principles
+
+Keep changes aligned with three project constraints:
+
+- **Reliability first:** keep the request hot path resilient with fallback budgets, circuit breakers, ingress limits, graceful drain, and telemetry/logging off the hot path.
+- **Extensible by design:** add providers, protocols, routing strategies, cache backends, and log sinks through existing trait/registration boundaries instead of central rewrites.
+- **Maintainable layering:** keep `core` as canonical IR + traits only, use the IR to avoid N×N protocol coupling, document lossy protocol behavior in `docs/protocol-capability-matrix.md`, and isolate heavy dependencies in dedicated crates.
+
 ## Build, Test, and Development Commands
 
 Run commands from the repository root. Use `make help` for the full list.
