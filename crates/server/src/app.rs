@@ -52,6 +52,10 @@ pub struct App {
     /// control plane is disabled.
     #[allow(dead_code)]
     pub token_stats: Option<tiygate_store::token_stats::TokenStatsHandle>,
+    /// Handle for SQLite local maintenance. None when the control
+    /// plane is disabled or the pool is not SQLite.
+    #[allow(dead_code)]
+    pub sqlite_maintenance: Option<tiygate_store::sqlite_maintenance::SqliteMaintenanceHandle>,
     /// Handle for the payload archive background task. None when
     /// archiving is disabled or the control plane is absent.
     #[allow(dead_code)]
@@ -154,20 +158,30 @@ impl App {
         // rewrites the DbConfigStore's inner ConfigStore on every
         // admin write, so the data plane sees changes within
         // the configured poll interval seconds.
-        let (epoch_poll, retention, token_stats) = match &control_plane {
+        let (epoch_poll, retention, token_stats, sqlite_maintenance) = match &control_plane {
             Some(cp) => {
                 let pool = cp.pool.clone();
                 let store = cp.store.clone();
                 let retention_handle = tiygate_store::retention::spawn(pool.clone(), store.clone());
                 let epoch_handle = tiygate_store::retention::spawn_epoch_poll(store.clone());
+                let sqlite_maintenance_handle = if pool.kind() == tiygate_store::db::DbKind::Sqlite
+                {
+                    Some(tiygate_store::sqlite_maintenance::spawn(
+                        pool.clone(),
+                        store.clone(),
+                    ))
+                } else {
+                    None
+                };
                 let token_stats_handle = tiygate_store::token_stats::spawn(pool, store);
                 (
                     Some(epoch_handle),
                     Some(retention_handle),
                     Some(token_stats_handle),
+                    sqlite_maintenance_handle,
                 )
             }
-            None => (None, None, None),
+            None => (None, None, None, None),
         };
 
         Ok(Self {
@@ -182,6 +196,7 @@ impl App {
             epoch_poll,
             retention,
             token_stats,
+            sqlite_maintenance,
             payload_archive: payload_archive_handle,
             payload_archive_client,
         })
@@ -301,6 +316,38 @@ async fn bootstrap_settings(store: &Arc<DbConfigStore>, cfg: &ServerConfig) {
         store,
         sk::RETENTION_LOG_RETENTION_DAYS,
         &env_or("TIYGATE_LOG_RETENTION_DAYS", "30"),
+    )
+    .await;
+
+    // SQLite maintenance
+    let _ = ensure_setting(
+        store,
+        sk::SQLITE_MAINTENANCE_ENABLED,
+        &env_or("TIYGATE_SQLITE_MAINTENANCE_ENABLED", "false"),
+    )
+    .await;
+    let _ = ensure_setting(
+        store,
+        sk::SQLITE_MAINTENANCE_INTERVAL_SECS,
+        &env_or("TIYGATE_SQLITE_MAINTENANCE_INTERVAL_SECS", "86400"),
+    )
+    .await;
+    let _ = ensure_setting(
+        store,
+        sk::SQLITE_MAINTENANCE_VACUUM_ENABLED,
+        &env_or("TIYGATE_SQLITE_MAINTENANCE_VACUUM_ENABLED", "false"),
+    )
+    .await;
+    let _ = ensure_setting(
+        store,
+        sk::SQLITE_MAINTENANCE_MIN_FREELIST_PAGES,
+        &env_or("TIYGATE_SQLITE_MAINTENANCE_MIN_FREELIST_PAGES", "1024"),
+    )
+    .await;
+    let _ = ensure_setting(
+        store,
+        sk::SQLITE_MAINTENANCE_MIN_FREE_RATIO_PERCENT,
+        &env_or("TIYGATE_SQLITE_MAINTENANCE_MIN_FREE_RATIO_PERCENT", "20"),
     )
     .await;
 

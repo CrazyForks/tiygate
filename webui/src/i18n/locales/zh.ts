@@ -578,6 +578,23 @@ const zh: Translation = {
       tokenStatsLookback: "Token 统计回溯天数",
       tokenStatsLookbackHint: "聚合时包含的过去天数。",
     },
+    sqliteMaintenance: {
+      title: "SQLite 维护",
+      description:
+        "本地 SQLite 实例可定期执行 WAL checkpoint、刷新查询统计，并在日志保留任务删除数据后回收空闲页。",
+      enabled: "启用维护",
+      enabledHint: "按计划运行 SQLite checkpoint/optimize。",
+      vacuumEnabled: "允许 VACUUM",
+      vacuumEnabledHint: "仅在空闲页达到阈值时压缩数据库文件。",
+      interval: "维护间隔（秒）",
+      intervalHint: "检查本地 SQLite 数据库的频率。",
+      minFreelistPages: "最小空闲页数",
+      minFreelistPagesHint: "可回收页数至少达到该值时运行 VACUUM。",
+      minFreeRatioPercent: "最小空闲比例（%）",
+      minFreeRatioPercentHint: "空闲页占数据库比例达到该值时运行 VACUUM。",
+      vacuumWarning:
+        "VACUUM 会重写 SQLite 文件，并可能短暂阻塞本地写入。繁忙实例请保持保守阈值。",
+    },
     archive: {
       title: "Payload Archive",
       enabled: "启用",

@@ -601,6 +601,23 @@ const en = {
       tokenStatsLookback: "Token Stats Lookback (days)",
       tokenStatsLookbackHint: "How many past days to include in aggregation.",
     },
+    sqliteMaintenance: {
+      title: "SQLite Maintenance",
+      description:
+        "Local SQLite instances can periodically checkpoint WAL, refresh query statistics, and reclaim free pages after log retention deletes data.",
+      enabled: "Enable Maintenance",
+      enabledHint: "Run SQLite checkpoint/optimize passes on a schedule.",
+      vacuumEnabled: "Allow VACUUM",
+      vacuumEnabledHint: "Shrink the database file only when free-page thresholds are met.",
+      interval: "Maintenance Interval (seconds)",
+      intervalHint: "How often to check the local SQLite database.",
+      minFreelistPages: "Minimum Freelist Pages",
+      minFreelistPagesHint: "Run VACUUM when at least this many pages can be reclaimed.",
+      minFreeRatioPercent: "Minimum Free Ratio (%)",
+      minFreeRatioPercentHint: "Run VACUUM when the freelist reaches this share of the database.",
+      vacuumWarning:
+        "VACUUM rewrites the SQLite file and may briefly block local writes. Keep conservative thresholds for busy instances.",
+    },
     archive: {
       title: "Payload Archive",
       enabled: "Enabled",

@@ -1381,12 +1381,7 @@ async fn import_config(
 
 // ---- settings ----
 
-/// GET /admin/v1/settings — returns every setting as a flat
-/// `{ "settings": { "<key>": "<value>", ... } }` object. Encrypted
-/// keys are redacted via [`KeyEncryption::redact`] so the response
-/// never leaks a secret, mirroring the provider API-key view path.
-async fn list_settings(State(state): State<AdminState>) -> Result<Response, AdminError> {
-    let rows = state.store.list_settings().await?;
+fn settings_response(state: &AdminState, rows: Vec<(String, String)>) -> Response {
     let mut map = serde_json::Map::new();
     for (k, v) in rows {
         let value = if tiygate_store::settings_keys::is_encrypted_key(&k) {
@@ -1396,7 +1391,27 @@ async fn list_settings(State(state): State<AdminState>) -> Result<Response, Admi
         };
         map.insert(k, value);
     }
-    Ok(Json(json!({ "settings": map })).into_response())
+    let database_kind = match state.pool.kind() {
+        tiygate_store::db::DbKind::Sqlite => "sqlite",
+        tiygate_store::db::DbKind::Postgres => "postgres",
+    };
+    Json(json!({
+        "settings": map,
+        "database": {
+            "kind": database_kind,
+        },
+    }))
+    .into_response()
+}
+
+/// GET /admin/v1/settings — returns every setting as a flat
+/// `{ "settings": { "<key>": "<value>", ... }, "database": { "kind": "sqlite" | "postgres" } }`
+/// object. Encrypted keys are redacted via [`KeyEncryption::redact`]
+/// so the response never leaks a secret, mirroring the provider
+/// API-key view path.
+async fn list_settings(State(state): State<AdminState>) -> Result<Response, AdminError> {
+    let rows = state.store.list_settings().await?;
+    Ok(settings_response(&state, rows))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1474,16 +1489,7 @@ async fn update_settings(
     .await;
     // Return the fresh redacted view.
     let rows = state.store.list_settings().await?;
-    let mut map = serde_json::Map::new();
-    for (k, v) in rows {
-        let value = if is_encrypted_key(&k) {
-            serde_json::Value::String(KeyEncryption::redact(&v))
-        } else {
-            serde_json::Value::String(v)
-        };
-        map.insert(k, value);
-    }
-    Ok(Json(json!({ "settings": map })).into_response())
+    Ok(settings_response(&state, rows))
 }
 
 // ---- error type ----

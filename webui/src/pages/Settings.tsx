@@ -28,6 +28,13 @@ const KEYS = {
   epochPollInterval: "gateway.epoch_poll.interval_secs",
   tokenStatsInterval: "gateway.token_stats.interval_secs",
   tokenStatsLookback: "gateway.token_stats.lookback_days",
+  sqliteMaintenanceEnabled: "gateway.sqlite_maintenance.enabled",
+  sqliteMaintenanceInterval: "gateway.sqlite_maintenance.interval_secs",
+  sqliteMaintenanceVacuumEnabled: "gateway.sqlite_maintenance.vacuum_enabled",
+  sqliteMaintenanceMinFreelistPages:
+    "gateway.sqlite_maintenance.min_freelist_pages",
+  sqliteMaintenanceMinFreeRatioPercent:
+    "gateway.sqlite_maintenance.min_free_ratio_percent",
   archiveEnabled: "gateway.archive.enabled",
   archiveS3Endpoint: "gateway.archive.s3_endpoint",
   archiveS3Region: "gateway.archive.s3_region",
@@ -169,6 +176,8 @@ export default function SettingsPage() {
   const getField = (key: string, fallback = ""): string =>
     local[key] ?? fallback;
 
+  const isSqliteDatabase = data?.database?.kind === "sqlite";
+
   if (isLoading) {
     return (
       <div className="flex items-center justify-center py-20">
@@ -278,6 +287,98 @@ export default function SettingsPage() {
           </Field>
         </CardBody>
       </Card>
+
+      {/* SQLite Maintenance */}
+      {isSqliteDatabase && (
+        <Card>
+          <CardHeader title={t("settings.sqliteMaintenance.title")} />
+          <CardBody className="space-y-4">
+            <p className="text-sm text-muted-foreground">
+              {t("settings.sqliteMaintenance.description")}
+            </p>
+            <div className="grid gap-4 sm:grid-cols-2">
+              <Field
+                label={t("settings.sqliteMaintenance.enabled")}
+                hint={t("settings.sqliteMaintenance.enabledHint")}
+              >
+                <Switch
+                  checked={
+                    getField(KEYS.sqliteMaintenanceEnabled, "false") === "true"
+                  }
+                  onCheckedChange={(checked: boolean) =>
+                    updateField(KEYS.sqliteMaintenanceEnabled, String(checked))
+                  }
+                />
+              </Field>
+              <Field
+                label={t("settings.sqliteMaintenance.vacuumEnabled")}
+                hint={t("settings.sqliteMaintenance.vacuumEnabledHint")}
+              >
+                <Switch
+                  checked={
+                    getField(KEYS.sqliteMaintenanceVacuumEnabled, "false") ===
+                    "true"
+                  }
+                  onCheckedChange={(checked: boolean) =>
+                    updateField(
+                      KEYS.sqliteMaintenanceVacuumEnabled,
+                      String(checked),
+                    )
+                  }
+                />
+              </Field>
+              <Field
+                label={t("settings.sqliteMaintenance.interval")}
+                hint={t("settings.sqliteMaintenance.intervalHint")}
+              >
+                <Input
+                  type="number"
+                  value={getField(KEYS.sqliteMaintenanceInterval, "86400")}
+                  onChange={(e) =>
+                    updateField(KEYS.sqliteMaintenanceInterval, e.target.value)
+                  }
+                />
+              </Field>
+              <Field
+                label={t("settings.sqliteMaintenance.minFreelistPages")}
+                hint={t("settings.sqliteMaintenance.minFreelistPagesHint")}
+              >
+                <Input
+                  type="number"
+                  value={getField(KEYS.sqliteMaintenanceMinFreelistPages, "1024")}
+                  onChange={(e) =>
+                    updateField(
+                      KEYS.sqliteMaintenanceMinFreelistPages,
+                      e.target.value,
+                    )
+                  }
+                />
+              </Field>
+              <Field
+                label={t("settings.sqliteMaintenance.minFreeRatioPercent")}
+                hint={t("settings.sqliteMaintenance.minFreeRatioPercentHint")}
+              >
+                <Input
+                  type="number"
+                  value={getField(
+                    KEYS.sqliteMaintenanceMinFreeRatioPercent,
+                    "20",
+                  )}
+                  onChange={(e) =>
+                    updateField(
+                      KEYS.sqliteMaintenanceMinFreeRatioPercent,
+                      e.target.value,
+                    )
+                  }
+                />
+              </Field>
+            </div>
+            <p className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm text-amber-700 dark:text-amber-300">
+              {t("settings.sqliteMaintenance.vacuumWarning")}
+            </p>
+          </CardBody>
+        </Card>
+      )}
 
       {/* Payload Archive */}
       <Card>

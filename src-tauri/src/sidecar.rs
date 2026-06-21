@@ -112,6 +112,11 @@ pub async fn spawn_sidecar(
         .env("TIYGATE_DATABASE_URL", db_url)
         .env("TIYGATE_ADMIN_TOKEN", admin_token)
         .env("TIYGATE_MASTER_KEY", master_key)
+        .env("TIYGATE_SQLITE_MAINTENANCE_ENABLED", "true")
+        .env("TIYGATE_SQLITE_MAINTENANCE_VACUUM_ENABLED", "true")
+        .env("TIYGATE_SQLITE_MAINTENANCE_INTERVAL_SECS", "86400")
+        .env("TIYGATE_SQLITE_MAINTENANCE_MIN_FREELIST_PAGES", "1024")
+        .env("TIYGATE_SQLITE_MAINTENANCE_MIN_FREE_RATIO_PERCENT", "20")
         .env("RUST_LOG", "info");
 
     let (mut rx, child) = cmd.spawn().context("failed to spawn tiygate sidecar")?;

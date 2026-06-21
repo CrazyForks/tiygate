@@ -395,7 +395,13 @@ export interface ImportReport {
  * keys are redacted by the server (e.g. `[encrypted: abc…]`). */
 export type Settings = Record<string, string>;
 
+/** Runtime database metadata returned with authenticated settings. */
+export interface SettingsDatabaseInfo {
+  kind: "sqlite" | "postgres" | string;
+}
+
 /** Response body for `GET /admin/v1/settings` and `PUT /admin/v1/settings`. */
 export interface SettingsResponse {
   settings: Settings;
+  database?: SettingsDatabaseInfo;
 }

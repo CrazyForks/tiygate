@@ -11,6 +11,15 @@ use crate::config_store::{DbConfigStore, StoreError};
 pub const RETENTION_INTERVAL_SECS: &str = "gateway.retention.interval_secs";
 pub const RETENTION_LOG_RETENTION_DAYS: &str = "gateway.retention.log_retention_days";
 
+// --- SQLite maintenance ---
+pub const SQLITE_MAINTENANCE_ENABLED: &str = "gateway.sqlite_maintenance.enabled";
+pub const SQLITE_MAINTENANCE_INTERVAL_SECS: &str = "gateway.sqlite_maintenance.interval_secs";
+pub const SQLITE_MAINTENANCE_VACUUM_ENABLED: &str = "gateway.sqlite_maintenance.vacuum_enabled";
+pub const SQLITE_MAINTENANCE_MIN_FREELIST_PAGES: &str =
+    "gateway.sqlite_maintenance.min_freelist_pages";
+pub const SQLITE_MAINTENANCE_MIN_FREE_RATIO_PERCENT: &str =
+    "gateway.sqlite_maintenance.min_free_ratio_percent";
+
 // --- Epoch poll ---
 pub const EPOCH_POLL_INTERVAL_SECS: &str = "gateway.epoch_poll.interval_secs";
 
@@ -60,6 +69,11 @@ pub const FORWARD_RESPONSE_HEADER_DENY: &str = "gateway.forward.response_header_
 pub const PLAIN_KEYS: &[&str] = &[
     RETENTION_INTERVAL_SECS,
     RETENTION_LOG_RETENTION_DAYS,
+    SQLITE_MAINTENANCE_ENABLED,
+    SQLITE_MAINTENANCE_INTERVAL_SECS,
+    SQLITE_MAINTENANCE_VACUUM_ENABLED,
+    SQLITE_MAINTENANCE_MIN_FREELIST_PAGES,
+    SQLITE_MAINTENANCE_MIN_FREE_RATIO_PERCENT,
     EPOCH_POLL_INTERVAL_SECS,
     TOKEN_STATS_INTERVAL_SECS,
     TOKEN_STATS_LOOKBACK_DAYS,

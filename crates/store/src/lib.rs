@@ -24,6 +24,7 @@ pub mod log_sink;
 pub mod models;
 pub mod retention;
 pub mod settings_keys;
+pub mod sqlite_maintenance;
 pub mod token_stats;
 
 // Re-export the legacy in-memory `ConfigStore` so existing callers
