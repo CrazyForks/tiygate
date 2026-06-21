@@ -18,6 +18,10 @@ English | [简体中文](README_zh.md)
 
 ---
 
+<div align="center">
+  <img width="1546" height="1079" alt="TiyGate Dashboard 截图" src="https://github.com/user-attachments/assets/c95d421a-9274-4804-a160-a7c9cee7e36c" />
+</div>
+
 ## What is TiyGate?
 
 TiyGate is an **independent AI Gateway product** written in Rust. It sits between your applications and upstream LLM providers (OpenAI, Anthropic, Bedrock, and any OpenAI-compatible service) and gives you a single, stable control point for routing, observability, and policy.

@@ -18,6 +18,10 @@
 
 ---
 
+<div align="center">
+  <img width="1546" height="1079" alt="TiyGate Dashboard 截图" src="https://github.com/user-attachments/assets/c95d421a-9274-4804-a160-a7c9cee7e36c" />
+</div>
+
 ## TiyGate 是什么?
 
 TiyGate 是一款用 **Rust** 编写的**独立 AI 网关产品**。它位于应用与上游 LLM 服务商(OpenAI、Anthropic、Bedrock 以及任何 OpenAI 兼容服务)之间,为路由、可观测性与策略提供统一、稳定的控制点。
