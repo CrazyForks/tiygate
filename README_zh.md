@@ -19,7 +19,7 @@
 ---
 
 <div align="center">
-  <img width="1546" height="1079" alt="TiyGate Dashboard 截图" src="https://github.com/user-attachments/assets/c95d421a-9274-4804-a160-a7c9cee7e36c" />
+  <img width="3840" height="2160" alt="introduction" src="https://github.com/user-attachments/assets/8763f9fe-b931-4023-8e23-b5da1228078b" />
 </div>
 
 ## TiyGate 是什么?
