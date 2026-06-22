@@ -89,19 +89,13 @@ jobs:
         env:
           TAURI_ENV: "1"
 
-      - name: Build sidecar and Tauri Rust binaries
+      - name: Build sidecar binary
         shell: bash
         run: |
           TARGET="${{ matrix.target }}"
 
-          # Build both tiygate-server (sidecar) and tiygate-desktop (Tauri
-          # Rust app) in a single cargo invocation so dependencies are shared
-          # and compiled in parallel. tauri-action will then skip Rust
-          # compilation and go straight to bundling.
-          cargo build \
-            -p tiygate-server \
-            -p tiygate-desktop \
-            --features "tiygate-server/webui,admin,cache,providers,control-plane,tracing,tiygate-desktop/custom-protocol" \
+          cargo build -p tiygate-server \
+            --features "webui,admin,cache,providers,control-plane,tracing" \
             --release \
             --target "$TARGET"
 
@@ -118,6 +112,20 @@ jobs:
             chmod +x "src-tauri/binaries/tiygate-$TARGET"
           fi
           echo "Sidecar binary ready: src-tauri/binaries/tiygate-$TARGET"
+
+      - name: Pre-build Tauri Rust app
+        shell: bash
+        run: |
+          # Pre-compile the Tauri Rust app so tauri-action can skip Rust
+          # compilation and go straight to bundling. All shared dependencies
+          # from the sidecar build are reused — only the desktop crate and
+          # Tauri-specific deps are compiled here.
+          TARGET="${{ matrix.target }}"
+
+          cargo build -p tiygate-desktop \
+            --features "custom-protocol" \
+            --release \
+            --target "$TARGET"
 
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
