@@ -16,6 +16,7 @@ import {
   Copy,
   Eye,
   Info,
+  Leaf,
 } from "lucide-react";
 import {
   apiKeysApi,
@@ -623,7 +624,30 @@ export default function RequestLogs() {
                       {fmtTokens(r.total_tokens)}
                     </Td>
                     <Td className="text-right tabular-nums">
-                      {fmtTokens(r.cache_read_tokens)}
+                      {r.cache_read_tokens ? (
+                        <div className="flex flex-col leading-tight">
+                          <span>{fmtTokens(r.cache_read_tokens)}</span>
+                          {r.total_tokens ? (
+                            <span className="flex items-center justify-end gap-0.5 text-[11px] text-text-muted">
+                              {(r.cache_read_tokens / r.total_tokens) *
+                                100 >
+                                95 && (
+                                <Leaf
+                                  size={10}
+                                  className="text-success"
+                                />
+                              )}
+                              {(
+                                (r.cache_read_tokens / r.total_tokens) *
+                                100
+                              ).toFixed(1)}
+                              %
+                            </span>
+                          ) : null}
+                        </div>
+                      ) : (
+                        "—"
+                      )}
                     </Td>
                     <Td className="text-right tabular-nums">
                       {r.ttfb_ms ?? "—"}
@@ -775,12 +799,18 @@ export default function RequestLogs() {
                     value={detail.resolved_model}
                   />
                 )}
-                <MetricCell
-                  label={t("requests.finishReason")}
-                  value={
-                    replayQuery.data?.finish_reason ?? detail?.finish_reason
-                  }
-                />
+                {(detail?.status === "ok" ||
+                  detail?.status === "success") &&
+                  (replayQuery.data?.finish_reason ??
+                    detail?.finish_reason) && (
+                  <MetricCell
+                    label={t("requests.finishReason")}
+                    value={
+                      replayQuery.data?.finish_reason ??
+                      detail?.finish_reason
+                    }
+                  />
+                )}
                 {(replayQuery.data?.truncation_reason ??
                   detail?.truncation_reason) && (
                   <MetricCell
@@ -897,7 +927,16 @@ export default function RequestLogs() {
                 />
                 <MetricCell
                   label={t("requests.tokenCacheRead")}
-                  value={fmtTokens(detail?.cache_read_tokens)}
+                  value={
+                    detail?.cache_read_tokens
+                      ? detail.total_tokens
+                        ? `${fmtTokens(detail.cache_read_tokens)} (${(
+                            (detail.cache_read_tokens / detail.total_tokens) *
+                            100
+                          ).toFixed(1)}%)`
+                        : fmtTokens(detail.cache_read_tokens)
+                      : undefined
+                  }
                   mono
                 />
                 <MetricCell
