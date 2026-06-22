@@ -220,6 +220,7 @@ const en = {
     priority: "Priority",
     orderHint: "Top rows get the highest weight. Drag to reorder.",
     dragToReorder: "Drag to reorder target",
+    targetMoved: "Target moved to position {{position}} of {{total}}.",
     targetEnabled: "Enable target {{index}}",
     targetEnabledHeader: "On",
     strategy: "Routing strategy",

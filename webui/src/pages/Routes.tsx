@@ -6,6 +6,8 @@ import {
   useRef,
   useState,
   type MouseEvent,
+  type PointerEvent,
+  type KeyboardEvent,
 } from "react";
 import { useTranslation } from "react-i18next";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -53,12 +55,29 @@ import {
 import { PageHeader, fmtTime } from "@/components/PageHeader";
 import { cn } from "@/lib/cn";
 
+interface FormTarget extends RouteTarget {
+  uiKey: string;
+}
+
 interface FormState {
   id?: string;
   virtual_model: string;
-  targets: RouteTarget[];
+  targets: FormTarget[];
   routing_strategy: RoutingStrategyName | "";
   enabled: boolean;
+}
+
+let nextTargetUiKey = 0;
+
+function createFormTarget(target: Partial<RouteTarget> = {}): FormTarget {
+  nextTargetUiKey += 1;
+  return {
+    uiKey: `target-${nextTargetUiKey}`,
+    provider_id: target.provider_id ?? "",
+    model_id: target.model_id ?? "",
+    enabled: target.enabled ?? true,
+    ...(target.weight !== undefined ? { weight: target.weight } : {}),
+  };
 }
 
 // Strategies that consume a per-target numeric value (`weight`). For
@@ -81,7 +100,7 @@ function isTargetEnabled(tg: RouteTarget): boolean {
 function emptyForm(): FormState {
   return {
     virtual_model: "",
-    targets: [{ provider_id: "", model_id: "", enabled: true }],
+    targets: [createFormTarget()],
     routing_strategy: "",
     enabled: true,
   };
@@ -119,10 +138,25 @@ export default function RoutesPage() {
   const [form, setForm] = useState<FormState>(emptyForm());
   const [formError, setFormError] = useState<string | null>(null);
   const [pendingDelete, setPendingDelete] = useState<Route | null>(null);
-  // Index of the row currently being dragged, or `null` when no drag is
-  // active. Lives in component state so any drag-related UI (cursor,
-  // highlight) can react synchronously.
-  const [dragIndex, setDragIndex] = useState<number | null>(null);
+  // Pointer-driven reorder preview state. The underlying target array is not
+  // mutated until the pointer is released, so rows do not jump while dragging.
+  const [dragPreview, setDragPreview] = useState<{
+    from: number;
+    insertIndex: number;
+    offsetY: number;
+  } | null>(null);
+  const [reorderMessage, setReorderMessage] = useState("");
+  const dragStateRef = useRef<{
+    pointerId: number;
+    from: number;
+    insertIndex: number;
+    startY: number;
+  } | null>(null);
+  const targetRowRefs = useRef<Array<HTMLDivElement | null>>([]);
+
+  useEffect(() => {
+    targetRowRefs.current.length = form.targets.length;
+  }, [form.targets.length]);
 
   const invalidate = () => qc.invalidateQueries({ queryKey: ["routes"] });
 
@@ -187,12 +221,14 @@ export default function RoutesPage() {
       id: r.id,
       virtual_model: r.virtual_model,
       targets: r.targets.length
-        ? r.targets.map((tg) => ({
-            provider_id: tg.provider_id,
-            model_id: tg.model_id,
-            enabled: tg.enabled ?? true,
-          }))
-        : [{ provider_id: "", model_id: "", enabled: true }],
+        ? r.targets.map((tg) =>
+            createFormTarget({
+              provider_id: tg.provider_id,
+              model_id: tg.model_id,
+              enabled: tg.enabled ?? true,
+            }),
+          )
+        : [createFormTarget()],
       routing_strategy: r.routing_strategy ?? "",
       enabled: r.enabled,
     });
@@ -207,14 +243,146 @@ export default function RoutesPage() {
     }));
   }
 
-  function moveTarget(from: number, to: number) {
-    if (from === to) return;
+  function moveTarget(from: number, to: number): boolean {
+    if (from === to) return false;
     setForm((f) => {
+      if (
+        from < 0 ||
+        to < 0 ||
+        from >= f.targets.length ||
+        to >= f.targets.length
+      ) {
+        return f;
+      }
       const next = f.targets.slice();
       const [moved] = next.splice(from, 1);
+      if (!moved) return f;
       next.splice(to, 0, moved);
       return { ...f, targets: next };
     });
+    return true;
+  }
+
+  function commitTargetInsert(from: number, insertIndex: number): number | null {
+    const targetIndex = insertIndex > from ? insertIndex - 1 : insertIndex;
+    if (targetIndex === from) return null;
+    return moveTarget(from, targetIndex) ? targetIndex : null;
+  }
+
+  function getTargetInsertIndex(clientY: number, from: number): number {
+    const rows = targetRowRefs.current;
+    if (rows.length === 0) return from;
+
+    for (let i = 0; i < rows.length; i += 1) {
+      if (i === from) continue;
+      const row = rows[i];
+      if (!row) continue;
+      const rect = row.getBoundingClientRect();
+      if (clientY < rect.top + rect.height / 2) {
+        return i;
+      }
+    }
+    return rows.length;
+  }
+
+  function focusTargetHandle(idx: number) {
+    window.requestAnimationFrame(() => {
+      targetRowRefs.current[idx]
+        ?.querySelector<HTMLElement>("[data-reorder-handle='true']")
+        ?.focus({ preventScroll: true });
+    });
+  }
+
+  function shouldShowInsertBefore(idx: number): boolean {
+    return dragPreview !== null && dragPreview.insertIndex === idx;
+  }
+
+  function shouldShowInsertAfterLast(idx: number): boolean {
+    return (
+      dragPreview !== null &&
+      dragPreview.insertIndex === form.targets.length &&
+      idx === form.targets.length - 1
+    );
+  }
+
+  function endTargetPointerDrag(e: PointerEvent<HTMLElement>) {
+    const state = dragStateRef.current;
+    if (!state || state.pointerId !== e.pointerId) return;
+    if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    }
+    const targetIndex = commitTargetInsert(state.from, state.insertIndex);
+    if (targetIndex !== null) {
+      setReorderMessage(
+        t("routes.targetMoved", {
+          position: targetIndex + 1,
+          total: form.targets.length,
+        }),
+      );
+      focusTargetHandle(targetIndex);
+    }
+    dragStateRef.current = null;
+    setDragPreview(null);
+  }
+
+  function handleTargetPointerDown(
+    e: PointerEvent<HTMLElement>,
+    idx: number,
+  ) {
+    if (e.button !== 0) return;
+    e.stopPropagation();
+    e.currentTarget.focus({ preventScroll: true });
+    e.currentTarget.setPointerCapture(e.pointerId);
+    dragStateRef.current = {
+      pointerId: e.pointerId,
+      from: idx,
+      insertIndex: idx,
+      startY: e.clientY,
+    };
+    setDragPreview({ from: idx, insertIndex: idx, offsetY: 0 });
+  }
+
+  function handleTargetPointerMove(e: PointerEvent<HTMLElement>) {
+    const state = dragStateRef.current;
+    if (!state || state.pointerId !== e.pointerId) return;
+    e.preventDefault();
+    const insertIndex = getTargetInsertIndex(e.clientY, state.from);
+    dragStateRef.current = { ...state, insertIndex };
+    setDragPreview({
+      from: state.from,
+      insertIndex,
+      offsetY: e.clientY - state.startY,
+    });
+  }
+
+  function handleTargetPointerKeyDown(
+    e: KeyboardEvent<HTMLElement>,
+    idx: number,
+  ) {
+    let nextIndex = idx;
+    if (e.key === "ArrowUp") {
+      nextIndex = idx - 1;
+    } else if (e.key === "ArrowDown") {
+      nextIndex = idx + 1;
+    } else if (e.key === "Home") {
+      nextIndex = 0;
+    } else if (e.key === "End") {
+      nextIndex = form.targets.length - 1;
+    } else {
+      return;
+    }
+
+    e.preventDefault();
+    if (nextIndex < 0 || nextIndex >= form.targets.length) return;
+    if (moveTarget(idx, nextIndex)) {
+      setReorderMessage(
+        t("routes.targetMoved", {
+          position: nextIndex + 1,
+          total: form.targets.length,
+        }),
+      );
+      focusTargetHandle(nextIndex);
+    }
   }
 
   function submit() {
@@ -499,7 +667,7 @@ export default function RoutesPage() {
                     ...f,
                     targets: [
                       ...f.targets,
-                      { provider_id: "", model_id: "", enabled: true },
+                      createFormTarget(),
                     ],
                   }))
                 }
@@ -508,6 +676,14 @@ export default function RoutesPage() {
               </Button>
             </div>
             <div className="overflow-hidden rounded-md border border-border">
+              <span
+                className="sr-only"
+                role="status"
+                aria-live="polite"
+                aria-atomic="true"
+              >
+                {reorderMessage}
+              </span>
               <div
                 className="hidden border-b border-border bg-surface-muted/50 px-3 py-1.5 text-[11px] font-medium uppercase tracking-[0.04em] text-text-subtle sm:grid sm:grid-cols-[18px_minmax(0,1.2fr)_minmax(0,1fr)_36px_28px] sm:gap-2"
                 aria-hidden="true"
@@ -522,73 +698,77 @@ export default function RoutesPage() {
               </div>
               {form.targets.map((tg, idx) => {
                 const enabled = isTargetEnabled(tg);
+                const isDragging = dragPreview?.from === idx;
+                const showInsertBefore = shouldShowInsertBefore(idx);
+                const showInsertAfter = shouldShowInsertAfterLast(idx);
                 return (
                   <div
-                    key={idx}
-                    draggable
-                    onDragStart={(e) => {
-                      setDragIndex(idx);
-                      // Some browsers expect a dataTransfer payload to
-                      // initiate a drag — any string is fine.
-                      e.dataTransfer.effectAllowed = "move";
-                      e.dataTransfer.setData("text/plain", String(idx));
+                    key={tg.uiKey}
+                    ref={(node) => {
+                      targetRowRefs.current[idx] = node;
                     }}
-                    onDragOver={(e) => {
-                      // Prevent default to mark this row as a valid drop
-                      // target; otherwise the browser cancels the drop.
-                      e.preventDefault();
-                      e.dataTransfer.dropEffect = "move";
-                    }}
-                    onDrop={(e) => {
-                      e.preventDefault();
-                      if (dragIndex === null) return;
-                      moveTarget(dragIndex, idx);
-                      setDragIndex(null);
-                    }}
-                    onDragEnd={() => setDragIndex(null)}
-                    className={
-                      "grid grid-cols-1 gap-2 px-3 py-2 sm:items-center sm:grid-cols-[18px_minmax(0,1.2fr)_minmax(0,1fr)_36px_28px] sm:gap-2" +
-                      (idx > 0 ? " border-t border-border" : "") +
-                      (dragIndex === idx
-                        ? " opacity-60"
-                        : !enabled
-                          ? " opacity-50"
-                          : "")
+                    style={
+                      isDragging
+                        ? { transform: `translateY(${dragPreview.offsetY}px)` }
+                        : undefined
                     }
+                    className={cn(
+                      "relative grid grid-cols-[18px_minmax(0,1fr)_28px] gap-2 px-3 py-2 sm:items-center sm:grid-cols-[18px_minmax(0,1.2fr)_minmax(0,1fr)_36px_28px]",
+                      idx > 0 && "border-t border-border",
+                      !enabled && !isDragging && "opacity-50",
+                      isDragging &&
+                        "z-10 rounded-md border border-primary/40 bg-surface shadow-lg opacity-95 transition-none",
+                      showInsertBefore &&
+                        "before:absolute before:-top-px before:left-2 before:right-2 before:z-20 before:h-0.5 before:rounded-full before:bg-primary",
+                      showInsertAfter &&
+                        "after:absolute after:-bottom-px after:left-2 after:right-2 after:z-20 after:h-0.5 after:rounded-full after:bg-primary",
+                    )}
                   >
                     <span
-                      className="hidden cursor-grab items-center justify-center text-text-subtle transition-colors hover:text-text sm:flex"
+                      className={cn(
+                        "flex touch-none select-none items-center justify-center rounded text-text-subtle transition-colors hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary",
+                        isDragging ? "cursor-grabbing" : "cursor-grab",
+                      )}
+                      data-reorder-handle="true"
                       role="button"
+                      tabIndex={0}
                       aria-label={t("routes.dragToReorder")}
                       title={t("routes.dragToReorder")}
-                      onMouseDown={(e) => e.stopPropagation()}
+                      onPointerDown={(e) => handleTargetPointerDown(e, idx)}
+                      onPointerMove={handleTargetPointerMove}
+                      onPointerUp={endTargetPointerDrag}
+                      onPointerCancel={endTargetPointerDrag}
+                      onLostPointerCapture={endTargetPointerDrag}
+                      onKeyDown={(e) => handleTargetPointerKeyDown(e, idx)}
                     >
                       <GripVertical size={14} />
                     </span>
-                    <Select
-                      value={tg.provider_id}
-                      onValueChange={(v) => updateTarget(idx, { provider_id: v })}
-                      ariaLabel={t("routes.provider")}
-                      options={providerOptions}
-                      triggerTitle={
-                        tg.provider_id
-                          ? (providerLabelById.get(tg.provider_id) ?? tg.provider_id)
-                          : undefined
-                      }
-                    />
-                    <Input
-                      value={tg.model_id}
-                      placeholder={t("routes.model")}
-                      onChange={(e) => updateTarget(idx, { model_id: e.target.value })}
-                    />
-                    <div className="flex items-center justify-center">
-                      <Switch
-                        checked={enabled}
-                        onCheckedChange={(v) => updateTarget(idx, { enabled: v })}
-                        aria-label={t("routes.targetEnabled", {
-                          index: idx + 1,
-                        })}
+                    <div className="col-start-2 grid min-w-0 gap-2 sm:contents">
+                      <Select
+                        value={tg.provider_id}
+                        onValueChange={(v) => updateTarget(idx, { provider_id: v })}
+                        ariaLabel={t("routes.provider")}
+                        options={providerOptions}
+                        triggerTitle={
+                          tg.provider_id
+                            ? (providerLabelById.get(tg.provider_id) ?? tg.provider_id)
+                            : undefined
+                        }
                       />
+                      <Input
+                        value={tg.model_id}
+                        placeholder={t("routes.model")}
+                        onChange={(e) => updateTarget(idx, { model_id: e.target.value })}
+                      />
+                      <div className="flex items-center justify-center">
+                        <Switch
+                          checked={enabled}
+                          onCheckedChange={(v) => updateTarget(idx, { enabled: v })}
+                          aria-label={t("routes.targetEnabled", {
+                            index: idx + 1,
+                          })}
+                        />
+                      </div>
                     </div>
                     <Button
                       variant="ghost"

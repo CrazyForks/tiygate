@@ -216,6 +216,7 @@ const zh: Translation = {
     priority: "优先级",
     orderHint: "越靠上的目标权重越高，拖拽调整顺序。",
     dragToReorder: "拖拽调整目标顺序",
+    targetMoved: "目标已移动到第 {{position}} / {{total}} 位。",
     targetEnabled: "启用目标 {{index}}",
     targetEnabledHeader: "启用",
     strategy: "路由策略",
