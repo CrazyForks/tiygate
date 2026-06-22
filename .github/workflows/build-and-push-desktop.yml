@@ -55,8 +55,8 @@ jobs:
           cache-all-crates: true
           key: ${{ matrix.target }}
 
-      - name: Install tauri-cli
-        run: cargo install tauri-cli --version "^2" --locked --quiet
+      - name: Install Tauri CLI
+        run: npm install -g @tauri-apps/cli@^2
 
       - name: Set version from tag
         shell: bash
@@ -123,7 +123,7 @@ jobs:
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
-          tauriScript: cargo tauri
+          tauriScript: tauri
           args: --target ${{ matrix.target }}
           releaseId: ""
 
