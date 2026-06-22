@@ -158,6 +158,10 @@ export default function RoutesPage() {
     targetRowRefs.current.length = form.targets.length;
   }, [form.targets.length]);
 
+  useEffect(() => {
+    if (!modalOpen) resetTargetDrag();
+  }, [modalOpen]);
+
   const invalidate = () => qc.invalidateQueries({ queryKey: ["routes"] });
 
   const saveMutation = useMutation({
@@ -208,7 +212,13 @@ export default function RoutesPage() {
     onError: (e: Error) => toast.error(t("routes.copyFailed"), e.message),
   });
 
+  function resetTargetDrag() {
+    dragStateRef.current = null;
+    setDragPreview(null);
+  }
+
   function openCreate() {
+    resetTargetDrag();
     setEditing(null);
     setForm(emptyForm());
     setFormError(null);
@@ -216,6 +226,7 @@ export default function RoutesPage() {
   }
 
   function openEdit(r: Route) {
+    resetTargetDrag();
     setEditing(r);
     setForm({
       id: r.id,
@@ -264,9 +275,16 @@ export default function RoutesPage() {
   }
 
   function commitTargetInsert(from: number, insertIndex: number): number | null {
+    // `insertIndex` is a position in the original array while the dragged row
+    // still occupies `from`. Inserting after the source shifts the final index
+    // left by one after the source row is removed.
     const targetIndex = insertIndex > from ? insertIndex - 1 : insertIndex;
     if (targetIndex === from) return null;
     return moveTarget(from, targetIndex) ? targetIndex : null;
+  }
+
+  function isNoopTargetInsert(from: number, insertIndex: number): boolean {
+    return (insertIndex > from ? insertIndex - 1 : insertIndex) === from;
   }
 
   function getTargetInsertIndex(clientY: number, from: number): number {
@@ -305,7 +323,16 @@ export default function RoutesPage() {
     );
   }
 
-  function endTargetPointerDrag(e: PointerEvent<HTMLElement>) {
+  function cancelTargetPointerDrag(e: PointerEvent<HTMLElement>) {
+    const state = dragStateRef.current;
+    if (state && state.pointerId !== e.pointerId) return;
+    if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    }
+    resetTargetDrag();
+  }
+
+  function commitTargetPointerDrag(e: PointerEvent<HTMLElement>) {
     const state = dragStateRef.current;
     if (!state || state.pointerId !== e.pointerId) return;
     if (e.currentTarget.hasPointerCapture(e.pointerId)) {
@@ -321,8 +348,7 @@ export default function RoutesPage() {
       );
       focusTargetHandle(targetIndex);
     }
-    dragStateRef.current = null;
-    setDragPreview(null);
+    resetTargetDrag();
   }
 
   function handleTargetPointerDown(
@@ -359,6 +385,12 @@ export default function RoutesPage() {
     e: KeyboardEvent<HTMLElement>,
     idx: number,
   ) {
+    if (e.key === "Escape" && dragStateRef.current) {
+      e.preventDefault();
+      resetTargetDrag();
+      return;
+    }
+
     let nextIndex = idx;
     if (e.key === "ArrowUp") {
       nextIndex = idx - 1;
@@ -699,8 +731,13 @@ export default function RoutesPage() {
               {form.targets.map((tg, idx) => {
                 const enabled = isTargetEnabled(tg);
                 const isDragging = dragPreview?.from === idx;
-                const showInsertBefore = shouldShowInsertBefore(idx);
-                const showInsertAfter = shouldShowInsertAfterLast(idx);
+                const isNoopInsert = dragPreview
+                  ? isNoopTargetInsert(dragPreview.from, dragPreview.insertIndex)
+                  : false;
+                const showInsertBefore =
+                  !isNoopInsert && shouldShowInsertBefore(idx);
+                const showInsertAfter =
+                  !isNoopInsert && shouldShowInsertAfterLast(idx);
                 return (
                   <div
                     key={tg.uiKey}
@@ -736,9 +773,9 @@ export default function RoutesPage() {
                       title={t("routes.dragToReorder")}
                       onPointerDown={(e) => handleTargetPointerDown(e, idx)}
                       onPointerMove={handleTargetPointerMove}
-                      onPointerUp={endTargetPointerDrag}
-                      onPointerCancel={endTargetPointerDrag}
-                      onLostPointerCapture={endTargetPointerDrag}
+                      onPointerUp={commitTargetPointerDrag}
+                      onPointerCancel={cancelTargetPointerDrag}
+                      onLostPointerCapture={cancelTargetPointerDrag}
                       onKeyDown={(e) => handleTargetPointerKeyDown(e, idx)}
                     >
                       <GripVertical size={14} />
