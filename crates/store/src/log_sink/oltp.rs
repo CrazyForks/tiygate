@@ -2165,9 +2165,9 @@ pub struct RequestLogEntry {
     pub error_source: Option<String>,
     /// Gateway-side stream truncation reason mirrored from
     /// `request_payloads.truncation_reason`. `Some("idle" | "total" |
-    /// "upstream_error")` when the gateway terminated a streaming
-    /// response itself; `None` for a clean end / non-stream. Note
-    /// `status` stays "ok" in this case.
+    /// "upstream_error" | "client_disconnect")` when a streaming
+    /// response ended before a clean natural completion; `None` for a
+    /// clean end / non-stream. Note `status` stays "ok" in this case.
     pub truncation_reason: Option<String>,
     /// Upstream model finish / stop reason extracted from the response
     /// body during capture. Normalised to snake_case (e.g. `stop`,

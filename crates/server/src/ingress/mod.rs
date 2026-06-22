@@ -952,13 +952,21 @@ mod streaming_helper_tests {
         assert_eq!(a.truncated, Some(TruncationReason::UpstreamError));
     }
 
-    /// The three truncation reasons round-trip through `Debug` /
+    /// The truncation reasons round-trip through `Debug` /
     /// `PartialEq` so disconnect-billing logs are reliable.
     #[test]
     fn truncation_reason_distinct() {
         assert_ne!(TruncationReason::Idle, TruncationReason::Total);
         assert_ne!(TruncationReason::Idle, TruncationReason::UpstreamError);
         assert_ne!(TruncationReason::Total, TruncationReason::UpstreamError);
+        assert_ne!(
+            TruncationReason::ClientDisconnect,
+            TruncationReason::UpstreamError
+        );
+        assert_eq!(
+            TruncationReason::ClientDisconnect.as_str(),
+            "client_disconnect"
+        );
         // Debug formatting is used by telemetry events.
         assert!(format!("{:?}", TruncationReason::Idle).contains("Idle"));
     }

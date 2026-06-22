@@ -163,11 +163,11 @@ pub struct ExchangeCapture {
     pub client_resp_body: Option<String>,
     /// Whether the exchange used a streaming (SSE) response.
     pub is_stream: bool,
-    /// If the streaming response was terminated by the gateway instead
-    /// of ending naturally, the reason: "idle" (idle timer), "total"
-    /// (total wall-clock budget), or "upstream_error" (upstream
-    /// connection error mid-stream). `None` for a clean end-of-stream
-    /// and for non-stream exchanges.
+    /// If the streaming response was terminated before a clean natural
+    /// end, the reason: "idle" (idle timer), "total" (total wall-clock
+    /// budget), "upstream_error" (upstream connection error mid-stream),
+    /// or "client_disconnect" (downstream client cancelled). `None` for
+    /// a clean end-of-stream and for non-stream exchanges.
     pub truncation_reason: Option<String>,
     /// Duration of the streaming body transfer in milliseconds,
     /// measured from upstream response-header arrival to stream

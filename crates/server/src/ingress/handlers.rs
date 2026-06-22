@@ -315,6 +315,7 @@ pub(super) async fn handle_chat_completions(
         compute_pass_through(&codec, &ingress_protocol, &targets, &raw_env);
 
     // Delegate to the unified fallback / circuit-breaker / retry loop.
+    scope.mark_waiting_upstream();
     let outcome = execute_with_fallback(
         &state,
         &mut scope,
@@ -457,6 +458,7 @@ pub(super) async fn handle_messages(
         compute_pass_through(&codec, &ingress_protocol, &targets, &raw_env);
 
     // Delegate to the unified fallback / circuit-breaker / retry loop.
+    scope.mark_waiting_upstream();
     let outcome = execute_with_fallback(
         &state,
         &mut scope,
@@ -648,6 +650,7 @@ pub(super) async fn handle_embeddings(
 
     // Delegate to the unified fallback / circuit-breaker / retry loop.
     let request_id = scope.request_id().to_string();
+    scope.mark_waiting_upstream();
     let outcome = execute_with_fallback(
         &state,
         &mut scope,
@@ -794,6 +797,7 @@ pub(super) async fn handle_responses(
 
     // Delegate to the unified fallback / circuit-breaker / retry loop.
     let request_id = scope.request_id().to_string();
+    scope.mark_waiting_upstream();
     let outcome = execute_with_fallback(
         &state,
         &mut scope,
@@ -965,6 +969,7 @@ pub(super) async fn handle_gemini_generate(
 
     // Delegate to the unified fallback / circuit-breaker / retry loop.
     let request_id = scope.request_id().to_string();
+    scope.mark_waiting_upstream();
     let outcome = execute_with_fallback(
         &state,
         &mut scope,
@@ -1112,6 +1117,7 @@ pub(super) async fn handle_images_generations(
     let (_pass_through_candidate, raw_passthrough_body) =
         compute_pass_through(&codec, &ingress_protocol, &targets, &raw_env);
 
+    scope.mark_waiting_upstream();
     let outcome = execute_with_fallback(
         &state,
         &mut scope,
@@ -1286,6 +1292,7 @@ pub(super) async fn handle_images_edits(
     // Bytes extractor, not in raw_envelope.body.
     let content_type_str = content_type.unwrap_or("multipart/form-data").to_string();
 
+    scope.mark_waiting_upstream();
     let outcome = execute_with_fallback(
         &state,
         &mut scope,

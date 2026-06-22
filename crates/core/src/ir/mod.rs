@@ -506,6 +506,10 @@ pub enum TruncationReason {
     /// The upstream connection returned an error mid-stream.
     /// Partial state is still billable for the bytes already received.
     UpstreamError,
+    /// The downstream client disconnected or cancelled the response
+    /// before the upstream stream reached a natural end. Partial bytes
+    /// already received are still captured for diagnostics.
+    ClientDisconnect,
 }
 
 impl TruncationReason {
@@ -515,6 +519,7 @@ impl TruncationReason {
             TruncationReason::Idle => "idle",
             TruncationReason::Total => "total",
             TruncationReason::UpstreamError => "upstream_error",
+            TruncationReason::ClientDisconnect => "client_disconnect",
         }
     }
 }

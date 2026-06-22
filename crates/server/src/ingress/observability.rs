@@ -302,6 +302,12 @@ pub(super) struct RequestScope<'a> {
     /// When `true`, the scope has already emitted its terminal event;
     /// Drop must not emit a second one.
     armed: bool,
+    /// When `true`, the handler was awaiting an upstream response when
+    /// the scope was dropped. This lets `Drop` distinguish "client
+    /// disconnected while we waited for upstream" (→ `client_disconnect`)
+    /// from "handler was dropped in an unexpected state" (→
+    /// `internal_error`).
+    waiting_upstream: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -328,6 +334,7 @@ impl<'a> RequestScope<'a> {
             envelope: None,
             ttfb_ms: None,
             armed: true,
+            waiting_upstream: false,
         }
     }
 
@@ -397,6 +404,14 @@ impl<'a> RequestScope<'a> {
         self.armed = false;
     }
 
+    /// Mark that the handler is about to await an upstream call.
+    /// If the future is cancelled (client disconnect) before
+    /// `emit_ok` / `emit_error` fires, `Drop` uses this flag to
+    /// emit `client_disconnect` instead of `internal_error`.
+    pub fn mark_waiting_upstream(&mut self) {
+        self.waiting_upstream = true;
+    }
+
     /// Emit a terminal `RequestEvent` for the success path.
     pub fn emit_ok(self, http_status: Option<u16>) {
         self.emit_internal("ok", None, http_status);
@@ -446,13 +461,21 @@ impl<'a> Drop for RequestScope<'a> {
         if !self.armed {
             return;
         }
-        // The handler is returning from a code path we did not
-        // explicitly instrument. Emit a default "internal_error"
-        // terminal event so the OltpSink still gets a row. We use the
-        // pre-built `emit_request_event` helper so the column shape
-        // matches the rest of the pipeline. `emit_request_event`
-        // itself dispatches to the bus via `tokio::spawn`, so this
-        // Drop is non-blocking.
+        // The handler future was cancelled without a terminal event.
+        // When `waiting_upstream` is set, the most likely cause is a
+        // client disconnect while we were awaiting the upstream — mark
+        // it `client_disconnect` so the log row reflects the real
+        // outcome. Otherwise the drop is unexpected (e.g. a handler
+        // code path we forgot to instrument) → `internal_error`.
+        let error_class = if self.waiting_upstream {
+            "client_disconnect"
+        } else {
+            "internal_error"
+        };
+        // We use the pre-built `emit_request_event` helper so the
+        // column shape matches the rest of the pipeline.
+        // `emit_request_event` itself dispatches to the bus via
+        // `tokio::spawn`, so this Drop is non-blocking.
         let latency_ms = LatencyBreakdown {
             total_ms: self.started.elapsed().as_millis() as u64,
             upstream_ms: self.started.elapsed().as_millis() as u64,
@@ -467,7 +490,7 @@ impl<'a> Drop for RequestScope<'a> {
             &self.ingress,
             self.egress.as_ref(),
             "error",
-            Some("internal_error"),
+            Some(error_class),
             None,
             Some(500u16),
             false,

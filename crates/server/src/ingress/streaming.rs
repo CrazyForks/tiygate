@@ -193,6 +193,190 @@ pub(super) struct StreamCapture {
     pub client_resp_headers: Vec<(String, String)>,
 }
 
+/// Shared, single-shot finalizer for stream exchange capture.
+///
+/// The response body stream may be dropped by hyper when the downstream
+/// client disconnects. Code placed at the tail of `async_stream::stream!`
+/// is skipped in that case, so this guard owns the accumulated bytes and
+/// sends a best-effort capture from `Drop` with `client_disconnect`.
+struct StreamCaptureGuard {
+    inner: Arc<std::sync::Mutex<StreamCaptureState>>,
+    accum: Arc<std::sync::Mutex<UsageAccumulator>>,
+}
+
+struct StreamCaptureState {
+    capture: Option<StreamCapture>,
+    upstream_body: Vec<u8>,
+    client_body: Vec<u8>,
+    started: Instant,
+    last_reason: Option<TruncationReason>,
+    finalized: bool,
+    /// Set to true once the upstream has delivered a natural termination
+    /// signal (the `None` branch in `drive_upstream_stream` was reached).
+    /// When the downstream client closes immediately after receiving the
+    /// last frame, the `async_stream` future is cancelled at the `yield`
+    /// point *before* `finalize_spawn()` runs. `Drop` checks this flag to
+    /// distinguish "stream completed naturally, client just closed early"
+    /// from "client truly disconnected mid-stream".
+    upstream_completed: bool,
+}
+
+impl StreamCaptureGuard {
+    fn new(capture: Option<StreamCapture>, accum: Arc<std::sync::Mutex<UsageAccumulator>>) -> Self {
+        Self {
+            inner: Arc::new(std::sync::Mutex::new(StreamCaptureState {
+                capture,
+                upstream_body: Vec::new(),
+                client_body: Vec::new(),
+                started: Instant::now(),
+                last_reason: None,
+                finalized: false,
+                upstream_completed: false,
+            })),
+            accum,
+        }
+    }
+
+    fn append_upstream(&self, bytes: &[u8]) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.upstream_body.extend_from_slice(bytes);
+        }
+    }
+
+    fn append_client(&self, bytes: &[u8]) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.client_body.extend_from_slice(bytes);
+        }
+    }
+
+    fn set_reason(&self, reason: Option<TruncationReason>) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.last_reason = reason;
+        }
+    }
+
+    fn mark_upstream_completed(&self) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.upstream_completed = true;
+        }
+    }
+
+    fn upstream_len(&self) -> usize {
+        self.inner
+            .lock()
+            .map(|state| state.upstream_body.len())
+            .unwrap_or(0)
+    }
+
+    fn request_id(&self) -> String {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|state| state.capture.as_ref().map(|cap| cap.request_id.clone()))
+            .unwrap_or_default()
+    }
+
+    /// Mark finalized and fire-and-forget the capture via `tokio::spawn`.
+    /// Use this **before** the final `yield` / `break` in the stream loop
+    /// so that a client disconnect immediately after the last frame does
+    /// not cancel an in-flight `finalize().await` and trigger the `Drop`
+    /// fallback (`client_disconnect`).
+    fn finalize_spawn(&self) {
+        if let Some((telemetry, capture)) = self.take_capture(None) {
+            tokio::spawn(async move {
+                telemetry.send_capture(capture).await;
+            });
+        }
+    }
+
+    fn take_capture(
+        &self,
+        fallback_reason: Option<TruncationReason>,
+    ) -> Option<(
+        Arc<dyn tiygate_core::TelemetryBus>,
+        tiygate_core::ExchangeCapture,
+    )> {
+        let mut state = self.inner.lock().ok()?;
+        if state.finalized {
+            return None;
+        }
+        state.finalized = true;
+        if state.last_reason.is_none() {
+            state.last_reason = fallback_reason;
+        }
+        let cap = state.capture.take()?;
+        let telemetry = cap.telemetry.clone();
+        let stream_duration_ms = Some(state.started.elapsed().as_millis() as u64);
+        let upstream_resp_body = if state.upstream_body.is_empty() {
+            None
+        } else {
+            Some(String::from_utf8_lossy(&state.upstream_body).into_owned())
+        };
+        let client_resp_body = if state.client_body.is_empty() {
+            None
+        } else {
+            Some(String::from_utf8_lossy(&state.client_body).into_owned())
+        };
+        Some((
+            telemetry,
+            tiygate_core::ExchangeCapture {
+                request_id: cap.request_id,
+                egress_method: cap.egress_method,
+                egress_path: cap.egress_path,
+                egress_headers: cap.egress_headers,
+                egress_body: cap.egress_body,
+                upstream_status: cap.upstream_status,
+                upstream_resp_headers: cap.upstream_resp_headers,
+                upstream_resp_body,
+                client_resp_headers: cap.client_resp_headers,
+                client_resp_body,
+                is_stream: true,
+                truncation_reason: state.last_reason.map(|r| r.as_str().to_string()),
+                stream_duration_ms,
+            },
+        ))
+    }
+}
+
+impl Drop for StreamCaptureGuard {
+    fn drop(&mut self) {
+        let disconnect_reason = {
+            let state = self.inner.lock().ok();
+            let completed = state
+                .as_ref()
+                .map(|s| s.upstream_completed)
+                .unwrap_or(false);
+            if completed {
+                None // upstream delivered a natural end — not a client disconnect
+            } else {
+                Some(TruncationReason::ClientDisconnect)
+            }
+        };
+        let Some((telemetry, capture)) = self.take_capture(disconnect_reason) else {
+            return;
+        };
+        if let Some(reason) = disconnect_reason {
+            if let Ok(mut a) = self.accum.lock() {
+                a.mark_truncated(reason);
+            }
+            let request_id = capture.request_id.clone();
+            let bytes_received = capture
+                .upstream_resp_body
+                .as_deref()
+                .map(str::len)
+                .unwrap_or(0);
+            tracing::warn!(
+                request_id = %request_id,
+                bytes_received,
+                "downstream SSE client disconnected before stream completed"
+            );
+        }
+        tokio::spawn(async move {
+            telemetry.send_capture(capture).await;
+        });
+    }
+}
+
 /// Cross-protocol streaming re-encode plan for [`drive_upstream_stream`].
 ///
 /// When the ingress entrypoint protocol differs from the egress (upstream
@@ -235,18 +419,7 @@ fn split_sse_lines(buf: &str) -> (Vec<String>, String) {
     (lines, remainder)
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    clippy::let_underscore_must_use,
-    // `last_reason` is captured by the async-stream macro but
-    // the captured value is only used via the trailing
-    // `let _ = last_reason;` touch at the end of the stream
-    // block; rustc's NLL does not see through the macro
-    // expansion. The variable is documented intent — the
-    // truncation reason is held in scope for future
-    // `TelemetryBus` reports.
-    unused_assignments
-)]
+#[allow(clippy::too_many_arguments, clippy::let_underscore_must_use)]
 pub(super) fn drive_upstream_stream(
     _state: &AppState,
     accum: Arc<std::sync::Mutex<UsageAccumulator>>,
@@ -267,22 +440,13 @@ pub(super) fn drive_upstream_stream(
     use async_stream::stream;
 
     let total_budget_enabled = !total_timeout.is_zero();
-    let total_started = Instant::now();
+    let capture_guard = StreamCaptureGuard::new(capture, accum.clone());
     let mut upstream = response.bytes_stream();
-    let mut last_reason: Option<TruncationReason> = None;
     // Streaming response-body accumulators for the request-log detail
-    // view. `capture_buf` always records the raw upstream SSE bytes, so
-    // `upstream_resp_body` in the persisted row reflects what came
-    // from the provider. `client_capture_buf` records the bytes that
-    // were actually yielded to the downstream client:
-    //  * In verbatim / same-protocol mode it is appended with the same
-    //    upstream bytes, so `client_resp_body == upstream_resp_body`.
-    //  * In transcode / cross-protocol mode it is appended with the
-    //    ingress encoder's output (Anthropic SSE → OpenAI chunks, etc.),
-    //    so the request-log detail view shows what the client really
-    //    received, not a byte-identical copy of the upstream stream.
-    let mut capture_buf: Vec<u8> = Vec::new();
-    let mut client_capture_buf: Vec<u8> = Vec::new();
+    // view live in `capture_guard` instead of plain locals. The guard's
+    // Drop path persists a best-effort capture when the downstream
+    // client cancels and the async-stream body is dropped before the
+    // normal tail code can run.
     // Rolling tail of the most recently forwarded upstream bytes. Used
     // on natural close to detect whether the upstream already emitted
     // its own protocol-native terminal frame (e.g. `data: [DONE]` or
@@ -311,6 +475,16 @@ pub(super) fn drive_upstream_stream(
     // terminator arrived, we must NOT call finish() (it would fabricate a
     // success terminator the upstream never sent) and instead end at EOF.
     let mut saw_terminal = false;
+    let log_truncation =
+        |reason: TruncationReason, is_transcode: bool, guard: &StreamCaptureGuard| {
+            let rid = guard.request_id();
+            tracing::warn!(
+                request_id = %rid,
+                reason = reason.as_str(),
+                is_transcode,
+                "upstream SSE stream truncated by gateway"
+            );
+        };
     let idle_timeout = if idle_timeout.is_zero() {
         // 0 means "use the keepalive cadence as a no-progress signal"
         // — but to be safe we still need *some* upper bound so a hung
@@ -361,7 +535,7 @@ pub(super) fn drive_upstream_stream(
                             // Accumulate the raw SSE bytes for the detail
                             // view. This is a single memory copy and
                             // never blocks the forward path.
-                            capture_buf.extend_from_slice(&bytes);
+                            capture_guard.append_upstream(&bytes);
                             // Maintain a small rolling tail for terminal-
                             // frame dedup on natural close. Only needed for the
                             // verbatim path; transcode dedups on its own
@@ -422,7 +596,7 @@ pub(super) fn drive_upstream_stream(
                                     // persist the ingress-format body in
                                     // `client_resp_body`, not the raw
                                     // upstream SSE.
-                                    client_capture_buf.extend_from_slice(&out);
+                                    capture_guard.append_client(&out);
                                     yield Ok(Bytes::from(out));
                                 }
                             } else {
@@ -431,12 +605,17 @@ pub(super) fn drive_upstream_stream(
                                 // (`data: ...\n\n`); wrapping it in an axum
                                 // `Event` would double-prefix `data:` and
                                 // corrupt the stream. Pass the raw bytes.
-                                client_capture_buf.extend_from_slice(&bytes);
+                                capture_guard.append_client(&bytes);
                                 yield Ok(bytes);
                             }
                         }
                         Some(Err(_e)) => {
-                            last_reason = Some(TruncationReason::UpstreamError);
+                            capture_guard.set_reason(Some(TruncationReason::UpstreamError));
+                            log_truncation(
+                                TruncationReason::UpstreamError,
+                                transcode.is_some(),
+                                &capture_guard,
+                            );
                             // Log the underlying reqwest/hyper error with
                             // its full source chain. This is the single
                             // point where the real reason for a mid-stream
@@ -454,17 +633,14 @@ pub(super) fn drive_upstream_stream(
                                     detail.push_str(&s.to_string());
                                     src = s.source();
                                 }
-                                let rid = capture
-                                    .as_ref()
-                                    .map(|c| c.request_id.as_str())
-                                    .unwrap_or("");
+                                let rid = capture_guard.request_id();
                                 tracing::warn!(
                                     request_id = %rid,
                                     error = %detail,
                                     is_timeout = _e.is_timeout(),
                                     is_body = _e.is_body(),
                                     is_decode = _e.is_decode(),
-                                    bytes_received = capture_buf.len(),
+                                    bytes_received = capture_guard.upstream_len(),
                                     "upstream SSE stream errored mid-stream"
                                 );
                             }
@@ -485,7 +661,7 @@ pub(super) fn drive_upstream_stream(
                                     Some("upstream_error"),
                                 );
                                 if !ef.is_empty() {
-                                    client_capture_buf.extend_from_slice(&ef);
+                                    capture_guard.append_client(&ef);
                                     yield Ok(Bytes::from(ef));
                                 }
                             } else if !error_marker.is_empty() {
@@ -497,16 +673,23 @@ pub(super) fn drive_upstream_stream(
                                 if !tail_ends_on_frame_boundary(&tail_buf) {
                                     yield Ok(Bytes::from_static(b"\n\n"));
                                 }
-                                client_capture_buf
-                                    .extend_from_slice(&error_marker);
+                                capture_guard.append_client(&error_marker);
                                 yield Ok(Bytes::from(error_marker.clone()));
                             }
+                            capture_guard.finalize_spawn();
                             break;
                         }
                         None => {
                             // Upstream closed naturally — emit the
                             // protocol-native end frame and finish.
-                            last_reason = None;
+                            capture_guard.set_reason(None);
+                            // Mark as completed BEFORE yielding the last frame:
+                            // if the client (SDK) closes immediately after
+                            // receiving that frame, the `async_stream` future is
+                            // cancelled at the `yield` suspension point and
+                            // Drop's `upstream_completed` check prevents a
+                            // false `client_disconnect`.
+                            capture_guard.mark_upstream_completed();
                             if let Ok(mut a) = accum.lock() {
                                 a.mark_completed();
                             }
@@ -572,7 +755,7 @@ pub(super) fn drive_upstream_stream(
                                     }
                                 }
                                 if !out.is_empty() {
-                                    client_capture_buf.extend_from_slice(&out);
+                                    capture_guard.append_client(&out);
                                     yield Ok(Bytes::from(out));
                                 }
                             } else {
@@ -591,12 +774,19 @@ pub(super) fn drive_upstream_stream(
                                 // half-written `data:` line. End at EOF and let
                                 // the client decide.
                             }
+                            // Finalize capture BEFORE break: the client may
+                            // close immediately after receiving the last frame
+                            // (SDK reads [DONE] → response.close()), which
+                            // cancels this future before `finalize().await`
+                            // at the tail can run.
+                            capture_guard.finalize_spawn();
                             break;
                         }
                     }
                 }
                 _ = tokio::time::sleep_until(idle_deadline) => {
-                    last_reason = Some(TruncationReason::Idle);
+                    capture_guard.set_reason(Some(TruncationReason::Idle));
+                    log_truncation(TruncationReason::Idle, transcode.is_some(), &capture_guard);
                     if let Ok(mut a) = accum.lock() {
                         a.mark_truncated(TruncationReason::Idle);
                     }
@@ -615,16 +805,17 @@ pub(super) fn drive_upstream_stream(
                             Some("upstream_timeout"),
                         );
                         if !ef.is_empty() {
-                            client_capture_buf.extend_from_slice(&ef);
+                            capture_guard.append_client(&ef);
                             yield Ok(Bytes::from(ef));
                         }
                     } else if !error_marker.is_empty() {
                         if !tail_ends_on_frame_boundary(&tail_buf) {
                             yield Ok(Bytes::from_static(b"\n\n"));
                         }
-                        client_capture_buf.extend_from_slice(&error_marker);
+                        capture_guard.append_client(&error_marker);
                         yield Ok(Bytes::from(error_marker.clone()));
                     }
+                    capture_guard.finalize_spawn();
                     break;
                 }
                 _ = async {
@@ -635,7 +826,8 @@ pub(super) fn drive_upstream_stream(
                         std::future::pending::<()>().await;
                     }
                 } => {
-                    last_reason = Some(TruncationReason::Total);
+                    capture_guard.set_reason(Some(TruncationReason::Total));
+                    log_truncation(TruncationReason::Total, transcode.is_some(), &capture_guard);
                     if let Ok(mut a) = accum.lock() {
                         a.mark_truncated(TruncationReason::Total);
                     }
@@ -649,88 +841,29 @@ pub(super) fn drive_upstream_stream(
                             Some("upstream_timeout"),
                         );
                         if !ef.is_empty() {
-                            client_capture_buf.extend_from_slice(&ef);
+                            capture_guard.append_client(&ef);
                             yield Ok(Bytes::from(ef));
                         }
                     } else if !error_marker.is_empty() {
                         if !tail_ends_on_frame_boundary(&tail_buf) {
                             yield Ok(Bytes::from_static(b"\n\n"));
                         }
-                        client_capture_buf.extend_from_slice(&error_marker);
+                        capture_guard.append_client(&error_marker);
                         yield Ok(Bytes::from(error_marker.clone()));
                     }
+                    capture_guard.finalize_spawn();
                     break;
                 }
             }
         }
-        // Report any gateway-side truncation. `last_reason` is captured
-        // by the async-stream macro; previously it was discarded, which
-        // hid mid-stream truncations (status stays 200) from logs.
-        if let Some(reason) = last_reason {
-            let rid = capture.as_ref().map(|c| c.request_id.as_str()).unwrap_or("");
-            tracing::warn!(
-                request_id = %rid,
-                reason = reason.as_str(),
-                is_transcode = transcode.is_some(),
-                "upstream SSE stream truncated by gateway"
-            );
-        }
-        // `total_started` was captured at the entry of
-        // `drive_upstream_stream`, i.e. the moment the upstream
-        // response object was handed to us (right after `client.execute()`
-        // resolved — the response headers have arrived). This is the
-        // correct start point for `stream_duration_ms`: it covers the
-        // full wall-clock time from upstream response-header arrival to
-        // stream EOF / error / timeout, including the TTFB gap where the
-        // upstream is "thinking" before emitting the first SSE chunk.
-        // Using a per-poll `Instant` would miss that gap and understate
-        // the duration for tool_calls / short responses where TTFB
-        // dominates.
-        let _ = total_started;
-
         // Stream finished (natural end, idle, total, or upstream
         // error). Send the accumulated exchange capture to the
-        // telemetry bus for the request-log detail view.
-        //  * `upstream_resp_body` always records the raw upstream
-        //    SSE bytes captured at chunk arrival time.
-        //  * `client_resp_body` records the bytes that were actually
-        //    yielded to the downstream client. In verbatim /
-        //    same-protocol mode this is byte-identical to the
-        //    upstream body; in cross-protocol / transcode mode it is
-        //    the ingress-format SSE produced by the encoder (e.g.
-        //    OpenAI `chat.completion.chunk` data lines decoded from
-        //    Anthropic `content_block_delta` events).
-        if let Some(cap) = capture {
-            let stream_duration_ms =
-                Some(total_started.elapsed().as_millis() as u64);
-            let upstream_body = if capture_buf.is_empty() {
-                None
-            } else {
-                Some(String::from_utf8_lossy(&capture_buf).into_owned())
-            };
-            let client_body = if client_capture_buf.is_empty() {
-                None
-            } else {
-                Some(String::from_utf8_lossy(&client_capture_buf).into_owned())
-            };
-            cap.telemetry
-                .send_capture(tiygate_core::ExchangeCapture {
-                    request_id: cap.request_id,
-                    egress_method: cap.egress_method,
-                    egress_path: cap.egress_path,
-                    egress_headers: cap.egress_headers,
-                    egress_body: cap.egress_body,
-                    upstream_status: cap.upstream_status,
-                    upstream_resp_headers: cap.upstream_resp_headers,
-                    upstream_resp_body: upstream_body,
-                    client_resp_headers: cap.client_resp_headers,
-                    client_resp_body: client_body,
-                    is_stream: true,
-                    truncation_reason: last_reason.map(|r| r.as_str().to_string()),
-                    stream_duration_ms,
-                })
-                .await;
-        }
+        // telemetry bus. If the downstream client cancels before this
+        // point, `StreamCaptureGuard::drop` sends a best-effort capture
+        // with `client_disconnect` instead.
+        // Safety net: if we reach here without having hit a break
+        // (shouldn't happen, but keeps the contract), finalize now.
+        capture_guard.finalize_spawn();
     };
 
     // Wrap the inner stream in a keepalive emitter so the downstream
@@ -775,4 +908,161 @@ fn tail_ends_on_frame_boundary(tail: &[u8]) -> bool {
         return true;
     }
     tail.ends_with(b"\n\n") || tail.ends_with(b"\r\n\r\n")
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use std::sync::Mutex;
+    use tiygate_core::{ExchangeCapture, PipelineEvent, RequestEvent, TelemetryBus};
+
+    #[derive(Default)]
+    struct CapturingBus {
+        captures: Mutex<Vec<ExchangeCapture>>,
+    }
+
+    #[async_trait]
+    impl TelemetryBus for CapturingBus {
+        async fn send(&self, _event: PipelineEvent) {}
+
+        async fn send_request_event(&self, _event: RequestEvent) {}
+
+        async fn send_capture(&self, capture: ExchangeCapture) {
+            self.captures.lock().unwrap().push(capture);
+        }
+    }
+
+    fn sample_stream_capture(bus: Arc<CapturingBus>) -> StreamCapture {
+        StreamCapture {
+            request_id: "req-1".to_string(),
+            telemetry: bus,
+            egress_method: "POST".to_string(),
+            egress_path: "/v1/chat/completions".to_string(),
+            egress_headers: Vec::new(),
+            egress_body: Some("{}".to_string()),
+            upstream_status: Some(200),
+            upstream_resp_headers: Vec::new(),
+            client_resp_headers: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_capture_guard_drop_sends_client_disconnect_capture() {
+        let bus = Arc::new(CapturingBus::default());
+        let accum = Arc::new(std::sync::Mutex::new(UsageAccumulator::new()));
+        {
+            let guard =
+                StreamCaptureGuard::new(Some(sample_stream_capture(bus.clone())), accum.clone());
+            guard.append_upstream(b"data: partial\n\n");
+            guard.append_client(b"data: partial\n\n");
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if bus.captures.lock().unwrap().len() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("drop capture send should complete");
+
+        let captures = bus.captures.lock().unwrap();
+        assert_eq!(captures.len(), 1);
+        let capture = &captures[0];
+        assert_eq!(capture.request_id, "req-1");
+        assert_eq!(
+            capture.truncation_reason.as_deref(),
+            Some("client_disconnect")
+        );
+        assert_eq!(
+            capture.upstream_resp_body.as_deref(),
+            Some("data: partial\n\n")
+        );
+        assert_eq!(
+            capture.client_resp_body.as_deref(),
+            Some("data: partial\n\n")
+        );
+        assert!(capture.stream_duration_ms.is_some());
+        drop(captures);
+
+        let acc = accum.lock().unwrap();
+        assert_eq!(acc.truncated, Some(TruncationReason::ClientDisconnect));
+        assert!(!acc.completed);
+    }
+
+    #[tokio::test]
+    async fn stream_capture_guard_finalize_sends_once_and_drop_is_noop() {
+        let bus = Arc::new(CapturingBus::default());
+        let accum = Arc::new(std::sync::Mutex::new(UsageAccumulator::new()));
+        {
+            let guard =
+                StreamCaptureGuard::new(Some(sample_stream_capture(bus.clone())), accum.clone());
+            guard.append_upstream(b"data: done\n\n");
+            guard.append_client(b"data: done\n\n");
+            guard.finalize_spawn();
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if bus.captures.lock().unwrap().len() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("finalize_spawn should complete");
+
+        let captures = bus.captures.lock().unwrap();
+        assert_eq!(captures.len(), 1);
+        let capture = &captures[0];
+        assert_eq!(capture.truncation_reason, None);
+        assert_eq!(
+            capture.upstream_resp_body.as_deref(),
+            Some("data: done\n\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_capture_guard_upstream_completed_drop_is_clean() {
+        let bus = Arc::new(CapturingBus::default());
+        let accum = Arc::new(std::sync::Mutex::new(UsageAccumulator::new()));
+        {
+            let guard =
+                StreamCaptureGuard::new(Some(sample_stream_capture(bus.clone())), accum.clone());
+            guard.append_upstream(b"data: last\n\n");
+            guard.append_client(b"data: last\n\n");
+            // Simulate natural EOF: upstream delivered termination signal,
+            // but the yield point was cancelled before finalize_spawn ran.
+            guard.mark_upstream_completed();
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if bus.captures.lock().unwrap().len() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("drop capture send should complete");
+
+        let captures = bus.captures.lock().unwrap();
+        assert_eq!(captures.len(), 1);
+        let capture = &captures[0];
+        // No truncation_reason — upstream completed, Drop should NOT
+        // mark client_disconnect.
+        assert_eq!(capture.truncation_reason, None);
+        assert_eq!(
+            capture.upstream_resp_body.as_deref(),
+            Some("data: last\n\n")
+        );
+        drop(captures);
+
+        // Accumulator should NOT be marked truncated.
+        let acc = accum.lock().unwrap();
+        assert!(acc.truncated.is_none());
+    }
 }
