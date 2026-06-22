@@ -89,14 +89,19 @@ jobs:
         env:
           TAURI_ENV: "1"
 
-      - name: Build sidecar binary
+      - name: Build sidecar and Tauri Rust binaries
         shell: bash
         run: |
-          SIDECAR_FEATURES="webui,admin,cache,providers,control-plane,tracing"
           TARGET="${{ matrix.target }}"
 
-          cargo build -p tiygate-server \
-            --features "$SIDECAR_FEATURES" \
+          # Build both tiygate-server (sidecar) and tiygate-desktop (Tauri
+          # Rust app) in a single cargo invocation so dependencies are shared
+          # and compiled in parallel. tauri-action will then skip Rust
+          # compilation and go straight to bundling.
+          cargo build \
+            -p tiygate-server \
+            -p tiygate-desktop \
+            --features "tiygate-server/webui,admin,cache,providers,control-plane,tracing,tiygate-desktop/custom-protocol" \
             --release \
             --target "$TARGET"
 
