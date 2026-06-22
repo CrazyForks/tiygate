@@ -26,6 +26,7 @@ use tiygate_core::protocol::ProtocolEndpoint;
 use tiygate_core::quota::{QuotaDecision, QuotaSpec};
 use tiygate_core::redaction::Redactor;
 use tiygate_core::telemetry::{EventPayload, LatencyBreakdown, PipelineEvent, RequestEvent};
+use tiygate_core::telemetry::{RequestErrorClass, RequestStatus};
 // Re-exported under a stable path so external callers (admin /
 // tests / future gateway extensions) can import the trace context
 // type without reaching into `tiygate-core` directly. Reserved
@@ -187,7 +188,7 @@ pub(super) async fn resolve_api_key(
 pub(super) fn enforce_auth(
     state: &AppState,
     api_key: &ResolvedApiKey,
-) -> Result<(), (AppError, &'static str)> {
+) -> Result<(), (AppError, RequestErrorClass)> {
     use http::StatusCode;
     if !state.tunables().require_api_key {
         return Ok(());
@@ -196,15 +197,15 @@ pub(super) fn enforce_auth(
         KeyLookupOutcome::Authenticated => Ok(()),
         KeyLookupOutcome::NoCredential => Err((
             AppError::new(StatusCode::UNAUTHORIZED, "missing api key".to_string()),
-            "auth_missing",
+            RequestErrorClass::AuthMissing,
         )),
         KeyLookupOutcome::UnknownCredential => Err((
             AppError::new(StatusCode::UNAUTHORIZED, "invalid api key".to_string()),
-            "auth_invalid",
+            RequestErrorClass::AuthInvalid,
         )),
         KeyLookupOutcome::DisabledCredential => Err((
             AppError::new(StatusCode::FORBIDDEN, "api key disabled".to_string()),
-            "auth_disabled",
+            RequestErrorClass::AuthDisabled,
         )),
     }
 }
@@ -414,15 +415,30 @@ impl<'a> RequestScope<'a> {
 
     /// Emit a terminal `RequestEvent` for the success path.
     pub fn emit_ok(self, http_status: Option<u16>) {
-        self.emit_internal("ok", None, http_status);
+        self.emit_internal(RequestStatus::Success, None, None, http_status);
     }
 
     /// Emit a terminal `RequestEvent` for an upstream / gateway error.
-    pub fn emit_error(self, error_class: &str, http_status: Option<u16>) {
-        self.emit_internal("error", Some(error_class), http_status);
+    /// `error_source` is an optional human-readable description of the
+    /// error (e.g. the upstream error message) persisted alongside the
+    /// structured `error_class` for display in the detail view.
+    pub fn emit_error(
+        self,
+        error_class: RequestErrorClass,
+        error_source: Option<&str>,
+        http_status: Option<u16>,
+    ) {
+        let status = RequestStatus::from(error_class.tier());
+        self.emit_internal(status, Some(error_class), error_source, http_status);
     }
 
-    fn emit_internal(mut self, status: &str, error_class: Option<&str>, http_status: Option<u16>) {
+    fn emit_internal(
+        mut self,
+        status: RequestStatus,
+        error_class: Option<RequestErrorClass>,
+        error_source: Option<&str>,
+        http_status: Option<u16>,
+    ) {
         self.armed = false;
         let resolved_provider = self.resolved_provider.as_deref();
         let resolved_model = self.resolved_model.as_deref();
@@ -438,7 +454,7 @@ impl<'a> RequestScope<'a> {
             egress,
             status,
             error_class,
-            None,
+            error_source,
             http_status,
             false,
             None,
@@ -468,10 +484,11 @@ impl<'a> Drop for RequestScope<'a> {
         // outcome. Otherwise the drop is unexpected (e.g. a handler
         // code path we forgot to instrument) → `internal_error`.
         let error_class = if self.waiting_upstream {
-            "client_disconnect"
+            RequestErrorClass::ClientDisconnect
         } else {
-            "internal_error"
+            RequestErrorClass::InternalError
         };
+        let status = RequestStatus::from(error_class.tier());
         // We use the pre-built `emit_request_event` helper so the
         // column shape matches the rest of the pipeline.
         // `emit_request_event` itself dispatches to the bus via
@@ -489,7 +506,7 @@ impl<'a> Drop for RequestScope<'a> {
             self.resolved_model.as_deref(),
             &self.ingress,
             self.egress.as_ref(),
-            "error",
+            status,
             Some(error_class),
             None,
             Some(500u16),
@@ -894,8 +911,8 @@ pub(super) fn emit_request_event(
     resolved_model: Option<&str>,
     ingress: &ProtocolEndpoint,
     egress: Option<&ProtocolEndpoint>,
-    status: &str,
-    error_class: Option<&str>,
+    status: RequestStatus,
+    error_class: Option<RequestErrorClass>,
     error_source: Option<&str>,
     http_status: Option<u16>,
     lossy: bool,
@@ -926,8 +943,8 @@ pub(super) fn emit_request_event(
         egress_protocol: egress.map(|e| format!("{}/{}/{}", e.suite.label(), e.name, e.version)),
         lossy,
         cache_hit: cache_hit.map(str::to_string),
-        status: status.to_string(),
-        error_class: error_class.map(str::to_string),
+        status,
+        error_class,
         http_status,
         error_source: error_source.map(str::to_string),
         latency_ms: latency.clone(),
@@ -953,8 +970,8 @@ pub(super) fn emit_request_event(
         timestamp: Utc::now(),
         stage: "request_completed".to_string(),
         payload: EventPayload::RequestCompleted {
-            status: status.to_string(),
-            error_class: error_class.map(str::to_string),
+            status: status.as_str().to_string(),
+            error_class: error_class.map(|c| c.as_str().to_string()),
             total_latency_ms: latency.total_ms,
             upstream_latency_ms: latency.upstream_ms,
             ttfb_ms,
@@ -1008,8 +1025,8 @@ pub(super) fn emit_completion(
     resolved_model: Option<&str>,
     ingress: &ProtocolEndpoint,
     egress: Option<&ProtocolEndpoint>,
-    status: &str,
-    error_class: Option<&str>,
+    status: RequestStatus,
+    error_class: Option<RequestErrorClass>,
     http_status: Option<u16>,
     trace: &TraceContext,
     api_key_id: Option<&str>,

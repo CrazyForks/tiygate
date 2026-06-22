@@ -218,7 +218,7 @@ mod tests {
             egress_protocol: None,
             lossy: false,
             cache_hit: None,
-            status: "ok".to_string(),
+            status: tiygate_core::telemetry::RequestStatus::Success,
             error_class: None,
             http_status: Some(200),
             error_source: None,

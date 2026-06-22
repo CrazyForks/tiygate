@@ -7,6 +7,7 @@ use axum::http::StatusCode;
 use axum::response::Response;
 use futures::Future;
 
+use tiygate_core::telemetry::RequestErrorClass;
 use tiygate_core::{
     classify_error, DefaultFallbackPolicy, ErrorClass, FallbackDecision, FallbackPolicy,
     RetryPolicy,
@@ -34,7 +35,7 @@ pub(super) enum FallbackOutcome {
     /// (e.g. `FallbackDecision::Fail`).
     Failed {
         error: AppError,
-        error_class: String,
+        error_class: RequestErrorClass,
     },
 }
 
@@ -117,7 +118,7 @@ where
             );
             return FallbackOutcome::Failed {
                 error: app_err,
-                error_class: "DeadlineExceeded".to_string(),
+                error_class: RequestErrorClass::DeadlineExceeded,
             };
         }
 
@@ -135,7 +136,7 @@ where
                     payload: EventPayload::HopFailure {
                         target: health_key.clone(),
                         error: "circuit-broken".to_string(),
-                        error_class: "CircuitBreaker".to_string(),
+                        error_class: "circuit_breaker".to_string(),
                         latency_ms: 0,
                     },
                 })
@@ -219,14 +220,14 @@ where
                         payload: EventPayload::HopFailure {
                             target: health_key.clone(),
                             error: app_err.message.clone(),
-                            error_class: format!("{:?}", classification.class),
+                            error_class: classification.class.as_str().to_string(),
                             latency_ms: hop_elapsed_ms,
                         },
                     })
                     .await;
 
                 // Rate-limit cooling (parse Retry-After header)
-                if classification.class == ErrorClass::RateLimited {
+                if classification.fallback_class == ErrorClass::RateLimited {
                     if let Some(rh) = &app_err.retry_after_header {
                         if let Ok(secs) = rh.parse::<u64>() {
                             state.health.apply_cooling(
@@ -251,7 +252,7 @@ where
                 match decision {
                     FallbackDecision::TryNext => {
                         // Auth 401/403: extended cooling + skip same account
-                        if classification.class == ErrorClass::Auth {
+                        if classification.fallback_class == ErrorClass::Auth {
                             state.health.apply_cooling(
                                 &health_key,
                                 Duration::from_secs(300),
@@ -278,10 +279,9 @@ where
                         continue;
                     }
                     FallbackDecision::Fail => {
-                        let error_class = format!("{:?}", classification.class);
                         return FallbackOutcome::Failed {
                             error: app_err,
-                            error_class,
+                            error_class: classification.class,
                         };
                     }
                 }

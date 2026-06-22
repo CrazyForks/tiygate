@@ -49,6 +49,6 @@ pub use routing::{
     Strategy, WeightedStrategy,
 };
 pub use telemetry::{
-    EventSink, ExchangeCapture, MicroUsd, PipelineEvent, PriceProvider, RequestEvent, TelemetryBus,
-    TokenKind,
+    ErrorTier, EventSink, ExchangeCapture, MicroUsd, PipelineEvent, PriceProvider,
+    RequestErrorClass, RequestEvent, RequestStatus, TelemetryBus, TokenKind,
 };

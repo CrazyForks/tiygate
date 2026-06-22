@@ -486,11 +486,11 @@ async fn acceptance_2_migrate_creates_tables_and_status_reports() {
 
 #[tokio::test]
 async fn acceptance_3_stats_aggregate_uses_oltp_log_table() {
-    use tiygate_core::telemetry::{LatencyBreakdown, RequestEvent};
+    use tiygate_core::telemetry::{LatencyBreakdown, RequestEvent, RequestStatus};
     use tiygate_core::Usage;
     let (_router, _store, pool) = boot_no_auth().await;
     let sink = tiygate_store::log_sink::oltp::OltpSink::new(pool.clone());
-    let make = |id: &str, model: &str, status: &str| RequestEvent {
+    let make = |id: &str, model: &str, status: RequestStatus| RequestEvent {
         request_id: id.to_string(),
         timestamp: chrono::Utc::now(),
         virtual_model: model.to_string(),
@@ -504,7 +504,7 @@ async fn acceptance_3_stats_aggregate_uses_oltp_log_table() {
         egress_protocol: Some("openai/chat-completions/v1".to_string()),
         lossy: false,
         cache_hit: None,
-        status: status.to_string(),
+        status,
         error_class: None,
         http_status: Some(200),
         error_source: None,
@@ -526,10 +526,10 @@ async fn acceptance_3_stats_aggregate_uses_oltp_log_table() {
         user_agent: None,
         raw_envelope: None,
     };
-    sink.write_request_event(&make("r1", "gpt-4o", "ok"))
+    sink.write_request_event(&make("r1", "gpt-4o", RequestStatus::Success))
         .await
         .expect("write1");
-    sink.write_request_event(&make("r2", "gpt-4o-mini", "ok"))
+    sink.write_request_event(&make("r2", "gpt-4o-mini", RequestStatus::Success))
         .await
         .expect("write2");
 
@@ -562,7 +562,7 @@ async fn acceptance_3_stats_by_provider_endpoint() {
         egress_protocol: Some("openai/chat-completions/v1".to_string()),
         lossy: false,
         cache_hit: None,
-        status: "ok".to_string(),
+        status: tiygate_core::telemetry::RequestStatus::Success,
         error_class: None,
         http_status: Some(200),
         error_source: None,

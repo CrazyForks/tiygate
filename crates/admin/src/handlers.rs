@@ -1038,6 +1038,18 @@ async fn list_requests(
     State(state): State<AdminState>,
     axum::extract::Query(q): axum::extract::Query<RequestListQuery>,
 ) -> Result<Response, AdminError> {
+    // Normalise the error_class filter so legacy PascalCase values
+    // (e.g. "RateLimited", "BadRequest") are mapped to the canonical
+    // snake_case form stored in the DB. Without this, old filter URLs
+    // or scripts would silently match nothing after the migration.
+    let error_class = q
+        .error_class
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(tiygate_core::telemetry::RequestErrorClass::parse_str)
+        .map(|c| c.as_str().to_string());
+
     let filter = tiygate_store::log_sink::oltp::RequestFilter {
         request_id: q.request_id,
         since: q.since,
@@ -1045,7 +1057,7 @@ async fn list_requests(
         model: q.model,
         provider: q.provider,
         status: q.status,
-        error_class: q.error_class,
+        error_class,
         min_latency_ms: q.min_latency_ms,
         max_latency_ms: q.max_latency_ms,
         limit: q.limit,

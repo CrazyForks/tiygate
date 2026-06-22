@@ -12,6 +12,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::ProtocolEndpoint;
+use crate::telemetry::RequestErrorClass;
 
 /// A single routing target — one hop in the routing chain.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -442,10 +443,31 @@ pub enum ErrorClass {
     LossyOrCapability,
 }
 
+impl ErrorClass {
+    /// Map this fallback-internal class to the canonical
+    /// `RequestErrorClass` used in the request log / telemetry.
+    pub fn to_request_class(self) -> RequestErrorClass {
+        match self {
+            Self::Transient => RequestErrorClass::Transient,
+            Self::RateLimited => RequestErrorClass::RateLimited,
+            Self::Auth => RequestErrorClass::UpstreamAuth,
+            Self::BadRequest => RequestErrorClass::BadRequest,
+            Self::LossyOrCapability => RequestErrorClass::LossyOrCapability,
+        }
+    }
+}
+
 /// Classification of an error for fallback purposes.
 #[derive(Debug, Clone)]
 pub struct ErrorClassification {
-    pub class: ErrorClass,
+    /// The request-log canonical error class. This is the value
+    /// persisted on `RequestEvent.error_class` and surfaced in the
+    /// admin console.
+    pub class: RequestErrorClass,
+    /// The fallback-internal class used by `DefaultFallbackPolicy`
+    /// to decide retry / transfer / fail. Kept alongside `class`
+    /// so the policy match stays on the stable `ErrorClass` enum.
+    pub fallback_class: ErrorClass,
     /// Optional Retry-After duration from upstream headers.
     pub retry_after: Option<Duration>,
     /// Original HTTP status code if applicable.
@@ -678,7 +700,7 @@ impl FallbackPolicy for DefaultFallbackPolicy {
         // Classify the error
         let class = classify_error(error);
 
-        match class.class {
+        match class.fallback_class {
             ErrorClass::Transient => {
                 // Try next target
                 FallbackDecision::TryNext
@@ -713,7 +735,8 @@ pub fn classify_error(error: &crate::Error) -> ErrorClassification {
     // Check for rate limiting
     if msg.contains("429") || msg.contains("rate limit") || msg.contains("rate_limited") {
         return ErrorClassification {
-            class: ErrorClass::RateLimited,
+            class: RequestErrorClass::RateLimited,
+            fallback_class: ErrorClass::RateLimited,
             retry_after: None,
             http_status: Some(429),
         };
@@ -722,7 +745,8 @@ pub fn classify_error(error: &crate::Error) -> ErrorClassification {
     // Check for auth errors
     if msg.contains("401") || msg.contains("403") || msg.contains("unauthorized") {
         return ErrorClassification {
-            class: ErrorClass::Auth,
+            class: RequestErrorClass::UpstreamAuth,
+            fallback_class: ErrorClass::Auth,
             retry_after: None,
             http_status: Some(401),
         };
@@ -731,7 +755,8 @@ pub fn classify_error(error: &crate::Error) -> ErrorClassification {
     // Check for bad request
     if msg.contains("400") || msg.contains("422") || msg.contains("bad request") {
         return ErrorClassification {
-            class: ErrorClass::BadRequest,
+            class: RequestErrorClass::BadRequest,
+            fallback_class: ErrorClass::BadRequest,
             retry_after: None,
             http_status: Some(400),
         };
@@ -740,7 +765,8 @@ pub fn classify_error(error: &crate::Error) -> ErrorClassification {
     // Check for lossy/capability
     if msg.contains("lossy") || msg.contains("capability") || msg.contains("unsupported") {
         return ErrorClassification {
-            class: ErrorClass::LossyOrCapability,
+            class: RequestErrorClass::LossyOrCapability,
+            fallback_class: ErrorClass::LossyOrCapability,
             retry_after: None,
             http_status: None,
         };
@@ -748,7 +774,8 @@ pub fn classify_error(error: &crate::Error) -> ErrorClassification {
 
     // Default: transient (5xx, timeout, transport)
     ErrorClassification {
-        class: ErrorClass::Transient,
+        class: RequestErrorClass::Transient,
+        fallback_class: ErrorClass::Transient,
         retry_after: None,
         http_status: None,
     }

@@ -9,6 +9,7 @@ mod tests {
     use crate::ir::*;
     use crate::protocol::*;
     use crate::routing::*;
+    use crate::telemetry::RequestErrorClass;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -290,22 +291,26 @@ mod tests {
         // Rate limited
         let err = crate::Error::Routing("429 rate limit exceeded".to_string());
         let class = classify_error(&err);
-        assert_eq!(class.class, ErrorClass::RateLimited);
+        assert_eq!(class.fallback_class, ErrorClass::RateLimited);
+        assert_eq!(class.class, RequestErrorClass::RateLimited);
 
         // Auth error
         let err = crate::Error::Routing("401 unauthorized".to_string());
         let class = classify_error(&err);
-        assert_eq!(class.class, ErrorClass::Auth);
+        assert_eq!(class.fallback_class, ErrorClass::Auth);
+        assert_eq!(class.class, RequestErrorClass::UpstreamAuth);
 
         // Bad request
         let err = crate::Error::Routing("400 bad request".to_string());
         let class = classify_error(&err);
-        assert_eq!(class.class, ErrorClass::BadRequest);
+        assert_eq!(class.fallback_class, ErrorClass::BadRequest);
+        assert_eq!(class.class, RequestErrorClass::BadRequest);
 
         // Transient (default)
         let err = crate::Error::Routing("500 internal server error".to_string());
         let class = classify_error(&err);
-        assert_eq!(class.class, ErrorClass::Transient);
+        assert_eq!(class.fallback_class, ErrorClass::Transient);
+        assert_eq!(class.class, RequestErrorClass::Transient);
     }
 
     #[test]

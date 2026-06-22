@@ -10,6 +10,194 @@ use serde::{Deserialize, Serialize};
 
 use crate::ir::Usage;
 
+// ---------------------------------------------------------------------------
+// Request status / error class enums
+//
+// These enums normalise the previously free-form `status` (`"ok"` / `"error"`)
+// and `error_class` (various PascalCase + snake_case literals) strings into
+// a closed, type-safe set. The DB layer still stores TEXT, so `from_str`
+// accepts both the new snake_case canonical form and the legacy PascalCase /
+// `"ok"` / `"error"` values for backward compatibility with pre-migration
+// rows.
+// ---------------------------------------------------------------------------
+
+/// Coarse-grained outcome of a request: success, a business-level failure
+/// (upstream rejected the request), or an abnormal termination (gateway /
+/// transport error that is not the upstream's fault).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestStatus {
+    /// The request completed successfully (possibly with a stream truncation).
+    #[default]
+    Success,
+    /// A business-level failure: the upstream returned an error that is
+    /// attributable to the request itself or the upstream's policy
+    /// (rate limit, auth, bad request, all targets exhausted, …).
+    Failed,
+    /// An abnormal termination not attributable to the upstream's business
+    /// logic — e.g. an internal gateway error or a client disconnect.
+    Abnormal,
+}
+
+impl RequestStatus {
+    /// Canonical lowercase string stored in the DB / emitted in JSON.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Failed => "failed",
+            Self::Abnormal => "abnormal",
+        }
+    }
+
+    /// Parse a stored status string. Accepts the new canonical values
+    /// (`"success"` / `"failed"` / `"abnormal"`) and the legacy values
+    /// (`"ok"` → `Success`, `"error"` → `Failed` as a default; the caller
+    /// is expected to refine `"error"` into `Failed` vs `Abnormal` using
+    /// the `error_class` tier when available).
+    pub fn parse_str(s: &str) -> Option<Self> {
+        match s {
+            "success" | "ok" => Some(Self::Success),
+            "failed" => Some(Self::Failed),
+            "abnormal" => Some(Self::Abnormal),
+            // Legacy "error" — map to Failed as the safe default; the
+            // OLTP read path refines this using `error_class.tier()`.
+            "error" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+
+    /// Human-readable label for display / logging.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Failed => "failed",
+            Self::Abnormal => "abnormal",
+        }
+    }
+}
+
+/// Distinguishes a business-level failure from an abnormal termination.
+/// Used by `RequestErrorClass::tier()` to derive `RequestStatus`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorTier {
+    /// A failure attributable to the upstream / request.
+    Failed,
+    /// An abnormal termination not attributable to the upstream's
+    /// business logic (internal error, client disconnect).
+    Abnormal,
+}
+
+impl From<ErrorTier> for RequestStatus {
+    fn from(tier: ErrorTier) -> Self {
+        match tier {
+            ErrorTier::Failed => RequestStatus::Failed,
+            ErrorTier::Abnormal => RequestStatus::Abnormal,
+        }
+    }
+}
+
+/// The closed set of error classes for request logs.
+///
+/// The canonical DB / JSON representation is `snake_case` (see `as_str`).
+/// `from_str` also accepts the legacy PascalCase literals (`"Transient"`,
+/// `"RateLimited"`, `"Auth"`, `"BadRequest"`, `"LossyOrCapability"`,
+/// `"CircuitBreaker"`, `"DeadlineExceeded"`) emitted by older code paths
+/// so historical rows continue to render correctly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestErrorClass {
+    /// Transient upstream error (5xx, timeout, transport) — retryable.
+    Transient,
+    /// Upstream rate-limited the request (429).
+    RateLimited,
+    /// Upstream authentication / authorisation error (401/403).
+    UpstreamAuth,
+    /// Malformed request rejected by the upstream (400/422).
+    BadRequest,
+    /// Capability mismatch or lossy protocol conversion.
+    LossyOrCapability,
+    /// Target skipped due to an open circuit breaker.
+    CircuitBreaker,
+    /// Request exceeded the fallback deadline.
+    DeadlineExceeded,
+    /// All upstream targets were exhausted without a success.
+    UpstreamExhausted,
+    /// Inbound API key missing when `require_api_key` is on.
+    AuthMissing,
+    /// Inbound API key did not match any active key.
+    AuthInvalid,
+    /// Inbound API key matched a disabled / revoked key.
+    AuthDisabled,
+    /// Gateway internal error (unexpected drop, handler panic, …).
+    InternalError,
+    /// Client disconnected mid-request.
+    ClientDisconnect,
+    /// Gateway quota exceeded (inbound rate limit / token budget).
+    QuotaExceeded,
+    /// Request body could not be decoded (malformed JSON / protocol).
+    DecodeError,
+    /// No route found for the requested virtual model.
+    RouteNotFound,
+}
+
+impl RequestErrorClass {
+    /// Canonical `snake_case` string stored in the DB / emitted in JSON.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Transient => "transient",
+            Self::RateLimited => "rate_limited",
+            Self::UpstreamAuth => "upstream_auth",
+            Self::BadRequest => "bad_request",
+            Self::LossyOrCapability => "lossy_or_capability",
+            Self::CircuitBreaker => "circuit_breaker",
+            Self::DeadlineExceeded => "deadline_exceeded",
+            Self::UpstreamExhausted => "upstream_exhausted",
+            Self::AuthMissing => "auth_missing",
+            Self::AuthInvalid => "auth_invalid",
+            Self::AuthDisabled => "auth_disabled",
+            Self::InternalError => "internal_error",
+            Self::ClientDisconnect => "client_disconnect",
+            Self::QuotaExceeded => "quota_exceeded",
+            Self::DecodeError => "decode_error",
+            Self::RouteNotFound => "route_not_found",
+        }
+    }
+
+    /// Parse a stored error-class string. Accepts the new canonical
+    /// `snake_case` values and the legacy PascalCase literals.
+    pub fn parse_str(s: &str) -> Option<Self> {
+        match s {
+            "transient" | "Transient" => Some(Self::Transient),
+            "rate_limited" | "RateLimited" => Some(Self::RateLimited),
+            "upstream_auth" | "Auth" => Some(Self::UpstreamAuth),
+            "bad_request" | "BadRequest" => Some(Self::BadRequest),
+            "lossy_or_capability" | "LossyOrCapability" => Some(Self::LossyOrCapability),
+            "circuit_breaker" | "CircuitBreaker" => Some(Self::CircuitBreaker),
+            "deadline_exceeded" | "DeadlineExceeded" => Some(Self::DeadlineExceeded),
+            "upstream_exhausted" => Some(Self::UpstreamExhausted),
+            "auth_missing" => Some(Self::AuthMissing),
+            "auth_invalid" => Some(Self::AuthInvalid),
+            "auth_disabled" => Some(Self::AuthDisabled),
+            "internal_error" => Some(Self::InternalError),
+            "client_disconnect" => Some(Self::ClientDisconnect),
+            "quota_exceeded" => Some(Self::QuotaExceeded),
+            "decode_error" => Some(Self::DecodeError),
+            "route_not_found" => Some(Self::RouteNotFound),
+            _ => None,
+        }
+    }
+
+    /// Classify the error into a tier, which maps to a `RequestStatus`.
+    /// `InternalError` and `ClientDisconnect` are abnormal terminations;
+    /// all others are business-level failures.
+    pub fn tier(&self) -> ErrorTier {
+        match self {
+            Self::InternalError | Self::ClientDisconnect => ErrorTier::Abnormal,
+            _ => ErrorTier::Failed,
+        }
+    }
+}
+
 /// A pipeline event emitted at stage boundaries.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineEvent {
@@ -92,8 +280,8 @@ pub struct RequestEvent {
     pub egress_protocol: Option<String>,
     pub lossy: bool,
     pub cache_hit: Option<String>,
-    pub status: String,
-    pub error_class: Option<String>,
+    pub status: RequestStatus,
+    pub error_class: Option<RequestErrorClass>,
     pub http_status: Option<u16>,
     pub error_source: Option<String>,
     pub latency_ms: LatencyBreakdown,

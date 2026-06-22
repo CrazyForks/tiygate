@@ -24,6 +24,7 @@ use tracing::warn;
 
 use tiygate_core::ir::Usage;
 use tiygate_core::redaction::Redactor;
+use tiygate_core::telemetry::{RequestErrorClass, RequestStatus};
 use tiygate_core::{EventSink, ExchangeCapture, PipelineEvent, RequestEvent};
 
 use crate::db::DbPool;
@@ -1792,8 +1793,8 @@ fn request_event_to_row(event: &RequestEvent) -> RequestEventRow {
         egress_protocol: event.egress_protocol.clone(),
         lossy: event.lossy,
         cache_hit: event.cache_hit.clone(),
-        status: event.status.clone(),
-        error_class: event.error_class.clone(),
+        status: event.status.as_str().to_string(),
+        error_class: event.error_class.map(|c| c.as_str().to_string()),
         http_status: event.http_status,
         error_source: event.error_source.clone(),
         total_latency_ms: event.latency_ms.total_ms,
@@ -1965,7 +1966,7 @@ pub async fn aggregate_by_model(
 ) -> Result<Vec<StatsBucket>, sqlx::Error> {
     let rows = sqlx::query(
         "SELECT virtual_model, COUNT(*) AS c, \
-                SUM(CASE WHEN status != 'ok' THEN 1 ELSE 0 END) AS e, \
+                SUM(CASE WHEN status NOT IN ('ok', 'success') THEN 1 ELSE 0 END) AS e, \
                 COALESCE(SUM(prompt_tokens), 0) AS pt, \
                 COALESCE(SUM(completion_tokens), 0) AS ct, \
                 COALESCE(SUM(reasoning_tokens), 0) AS rt, \
@@ -2007,7 +2008,7 @@ pub async fn aggregate_by_provider(
 ) -> Result<Vec<StatsBucket>, sqlx::Error> {
     let rows = sqlx::query(
         "SELECT COALESCE(resolved_provider, 'unknown') AS provider, COUNT(*) AS c, \
-                SUM(CASE WHEN status != 'ok' THEN 1 ELSE 0 END) AS e, \
+                SUM(CASE WHEN status NOT IN ('ok', 'success') THEN 1 ELSE 0 END) AS e, \
                 COALESCE(SUM(prompt_tokens), 0) AS pt, \
                 COALESCE(SUM(completion_tokens), 0) AS ct, \
                 COALESCE(SUM(reasoning_tokens), 0) AS rt, \
@@ -2049,7 +2050,7 @@ pub async fn aggregate_by_api_key(
 ) -> Result<Vec<StatsBucket>, sqlx::Error> {
     let rows = sqlx::query(
         "SELECT COALESCE(api_key_id, 'anonymous') AS api_key, COUNT(*) AS c, \
-                SUM(CASE WHEN status != 'ok' THEN 1 ELSE 0 END) AS e, \
+                SUM(CASE WHEN status NOT IN ('ok', 'success') THEN 1 ELSE 0 END) AS e, \
                 COALESCE(SUM(prompt_tokens), 0) AS pt, \
                 COALESCE(SUM(completion_tokens), 0) AS ct, \
                 COALESCE(SUM(reasoning_tokens), 0) AS rt, \
@@ -2096,7 +2097,7 @@ pub async fn aggregate_by_target(
         "SELECT \
                 COALESCE(resolved_provider, 'unknown') || ' / ' || COALESCE(resolved_model, 'unknown') AS target, \
                 COUNT(*) AS c, \
-                SUM(CASE WHEN status != 'ok' THEN 1 ELSE 0 END) AS e, \
+                SUM(CASE WHEN status NOT IN ('ok', 'success') THEN 1 ELSE 0 END) AS e, \
                 COALESCE(SUM(prompt_tokens), 0) AS pt, \
                 COALESCE(SUM(completion_tokens), 0) AS ct, \
                 COALESCE(SUM(reasoning_tokens), 0) AS rt, \
@@ -2159,8 +2160,8 @@ pub struct RequestLogEntry {
     pub egress_protocol: Option<String>,
     pub lossy: bool,
     pub cache_hit: Option<String>,
-    pub status: String,
-    pub error_class: Option<String>,
+    pub status: RequestStatus,
+    pub error_class: Option<RequestErrorClass>,
     pub http_status: Option<u16>,
     pub error_source: Option<String>,
     /// Gateway-side stream truncation reason mirrored from
@@ -2195,6 +2196,25 @@ pub struct RequestLogEntry {
 }
 
 fn row_to_entry(row: &sqlx::any::AnyRow) -> RequestLogEntry {
+    let raw_status: String = row.get("status");
+    let raw_error_class: Option<String> = row.get("error_class");
+    let error_class = raw_error_class
+        .as_deref()
+        .and_then(RequestErrorClass::parse_str);
+    // Refine legacy "error" status into Failed vs Abnormal based on the
+    // error class tier. New rows store "success"/"failed"/"abnormal"
+    // directly and are parsed as-is.
+    let status = match raw_status.as_str() {
+        "ok" | "success" => RequestStatus::Success,
+        "failed" => RequestStatus::Failed,
+        "abnormal" => RequestStatus::Abnormal,
+        // Legacy "error" — refine using the error class tier.
+        "error" => error_class
+            .map(|c| RequestStatus::from(c.tier()))
+            .unwrap_or(RequestStatus::Failed),
+        // Unknown — default to Failed as the safe option.
+        _ => RequestStatus::Failed,
+    };
     RequestLogEntry {
         request_id: row.get("request_id"),
         ts: row.get("ts"),
@@ -2209,8 +2229,8 @@ fn row_to_entry(row: &sqlx::any::AnyRow) -> RequestLogEntry {
         egress_protocol: row.get("egress_protocol"),
         lossy: row.get::<i32, _>("lossy") != 0,
         cache_hit: row.get("cache_hit"),
-        status: row.get("status"),
-        error_class: row.get("error_class"),
+        status,
+        error_class,
         http_status: row.get::<Option<i32>, _>("http_status").map(|n| n as u16),
         error_source: row.get("error_source"),
         truncation_reason: row.get("truncation_reason"),
@@ -2256,7 +2276,8 @@ pub struct RequestFilter {
     pub model: Option<String>,
     /// Filter by provider id.
     pub provider: Option<String>,
-    /// Filter by status: "ok", "error".
+    /// Filter by status: "success", "failed", "abnormal" (legacy "ok"/"error"
+    /// also accepted).
     pub status: Option<String>,
     /// Filter by error class.
     pub error_class: Option<String>,
@@ -2331,6 +2352,9 @@ pub async fn list_requests(
     let mut active_model: Option<String> = None;
     let mut active_provider: Option<String> = None;
     let mut active_status: Option<String> = None;
+    // Second status bind slot, only used when the legacy "error"
+    // filter expands to `status IN ('failed', 'abnormal')`.
+    let mut active_abnormal_status: Option<String> = None;
     let mut active_error_class: Option<String> = None;
     let mut active_min_latency: Option<u64> = None;
     let mut active_max_latency: Option<u64> = None;
@@ -2346,9 +2370,34 @@ pub async fn list_requests(
         param_idx += 1;
     }
     if let Some(ref s) = filter.status {
-        clauses.push(format!("status = ${param_idx}"));
-        active_status = Some(s.clone());
-        param_idx += 1;
+        let s = s.trim();
+        if !s.is_empty() {
+            // Normalise legacy status values to the new canonical
+            // form so the filter works against both old and new rows.
+            // Legacy "error" maps to both "failed" and "abnormal".
+            match s {
+                "ok" => {
+                    clauses.push(format!("status = ${param_idx}"));
+                    active_status = Some("success".to_string());
+                    param_idx += 1;
+                }
+                "error" => {
+                    // Legacy "error" spans both Failed and Abnormal.
+                    clauses.push(format!(
+                        "(status = ${param_idx} OR status = ${})",
+                        param_idx + 1
+                    ));
+                    active_status = Some("failed".to_string());
+                    active_abnormal_status = Some("abnormal".to_string());
+                    param_idx += 2;
+                }
+                _ => {
+                    clauses.push(format!("status = ${param_idx}"));
+                    active_status = Some(s.to_string());
+                    param_idx += 1;
+                }
+            }
+        }
     }
     if let Some(ref ec) = filter.error_class {
         clauses.push(format!("error_class = ${param_idx}"));
@@ -2380,6 +2429,9 @@ pub async fn list_requests(
         count_query = count_query.bind(p.clone());
     }
     if let Some(ref s) = active_status {
+        count_query = count_query.bind(s.clone());
+    }
+    if let Some(ref s) = active_abnormal_status {
         count_query = count_query.bind(s.clone());
     }
     if let Some(ref ec) = active_error_class {
@@ -2421,6 +2473,9 @@ pub async fn list_requests(
         data_query = data_query.bind(p.clone());
     }
     if let Some(ref s) = active_status {
+        data_query = data_query.bind(s.clone());
+    }
+    if let Some(ref s) = active_abnormal_status {
         data_query = data_query.bind(s.clone());
     }
     if let Some(ref ec) = active_error_class {
@@ -2640,7 +2695,7 @@ mod tests {
             egress_protocol: Some("openai/chat-completions/v1".to_string()),
             lossy: false,
             cache_hit: None,
-            status: "ok".to_string(),
+            status: tiygate_core::telemetry::RequestStatus::Success,
             error_class: None,
             http_status: Some(200),
             error_source: None,
@@ -2680,6 +2735,44 @@ mod tests {
         assert!(!by_model.is_empty());
         assert_eq!(by_model[0].bucket, "gpt-4o");
         assert_eq!(by_model[0].prompt_tokens, 10);
+    }
+
+    #[tokio::test]
+    async fn aggregate_error_count_correct_with_new_status_values() {
+        let pool = db::open_pool("sqlite::memory:").await.expect("pool");
+        db::run_migrations(&pool).await.expect("migrate");
+        let sink = OltpSink::new(Arc::new(pool.clone()));
+
+        // Write one success row.
+        let mut ok_ev = dummy_request_event();
+        ok_ev.request_id = "req-ok".to_string();
+        sink.write_request_event(&ok_ev).await.expect("write ok");
+
+        // Write one failed row.
+        let mut err_ev = dummy_request_event();
+        err_ev.request_id = "req-err".to_string();
+        err_ev.status = tiygate_core::telemetry::RequestStatus::Failed;
+        err_ev.error_class = Some(tiygate_core::telemetry::RequestErrorClass::BadRequest);
+        sink.write_request_event(&err_ev).await.expect("write err");
+
+        // Write one abnormal row.
+        let mut abnormal_ev = dummy_request_event();
+        abnormal_ev.request_id = "req-abnormal".to_string();
+        abnormal_ev.status = tiygate_core::telemetry::RequestStatus::Abnormal;
+        abnormal_ev.error_class = Some(tiygate_core::telemetry::RequestErrorClass::InternalError);
+        sink.write_request_event(&abnormal_ev)
+            .await
+            .expect("write abnormal");
+
+        let now = Utc::now().to_rfc3339();
+        let earlier = (Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let by_model = aggregate_by_model(&pool, &earlier, &now)
+            .await
+            .expect("agg");
+        assert_eq!(by_model.len(), 1);
+        assert_eq!(by_model[0].count, 3);
+        // Only the failed + abnormal rows should count as errors.
+        assert_eq!(by_model[0].error_count, 2);
     }
 
     #[tokio::test]
@@ -2818,7 +2911,10 @@ mod tests {
         assert_eq!(total, 1);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].virtual_model, "gpt-4o");
-        assert_eq!(entries[0].status, "ok");
+        assert_eq!(
+            entries[0].status,
+            tiygate_core::telemetry::RequestStatus::Success
+        );
     }
 
     #[tokio::test]
@@ -2869,8 +2965,8 @@ mod tests {
         second.request_id = "req-2".to_string();
         second.virtual_model = "claude-3".to_string();
         second.resolved_provider = Some("anthropic".to_string());
-        second.status = "error".to_string();
-        second.error_class = Some("bad_request".to_string());
+        second.status = tiygate_core::telemetry::RequestStatus::Failed;
+        second.error_class = Some(tiygate_core::telemetry::RequestErrorClass::BadRequest);
         sink.write_request_event(&second)
             .await
             .expect("write second");
@@ -2888,7 +2984,7 @@ mod tests {
         );
         assert_eq!(
             options.statuses,
-            vec!["error".to_string(), "ok".to_string()]
+            vec!["failed".to_string(), "success".to_string()]
         );
         assert_eq!(options.error_classes, vec!["bad_request".to_string()]);
 
@@ -2926,8 +3022,8 @@ mod tests {
         old.timestamp = Utc::now() - chrono::Duration::days(7);
         old.virtual_model = "old-model".to_string();
         old.resolved_provider = Some("old-provider".to_string());
-        old.status = "error".to_string();
-        old.error_class = Some("old_error".to_string());
+        old.status = tiygate_core::telemetry::RequestStatus::Failed;
+        old.error_class = Some(tiygate_core::telemetry::RequestErrorClass::Transient);
         sink.write_request_event(&old).await.expect("write old");
 
         let options = list_request_filter_options(&pool, &RequestFilter::default())
@@ -2936,7 +3032,7 @@ mod tests {
 
         assert_eq!(options.models, vec!["gpt-4o".to_string()]);
         assert_eq!(options.providers, vec!["openai".to_string()]);
-        assert_eq!(options.statuses, vec!["ok".to_string()]);
+        assert_eq!(options.statuses, vec!["success".to_string()]);
         assert!(options.error_classes.is_empty());
     }
 

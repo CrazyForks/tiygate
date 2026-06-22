@@ -86,15 +86,16 @@ function archiveStatusTitle(status: string) {
 
 function StatusBadge({
   status,
-  errorClass,
   truncationReason,
 }: {
   status: string;
-  errorClass?: string | null;
   truncationReason?: string | null;
 }) {
   const { t } = useTranslation();
-  if (status === "ok") {
+  // Normalise legacy status values for backward compatibility.
+  const normalized =
+    status === "ok" ? "success" : status === "error" ? "failed" : status;
+  if (normalized === "success") {
     if (truncationReason) {
       return (
         <Badge
@@ -105,13 +106,33 @@ function StatusBadge({
         </Badge>
       );
     }
-    return <Badge tone="success">{status}</Badge>;
+    return <Badge tone="success">{t("requests.statusSuccess")}</Badge>;
+  }
+  if (normalized === "abnormal") {
+    return (
+      <Badge tone="warning" title={status}>
+        {t("requests.statusAbnormal")}
+      </Badge>
+    );
   }
   return (
     <Badge tone="danger" title={status}>
-      {errorClass ?? status}
+      {t("requests.statusFailed")}
     </Badge>
   );
+}
+
+/// Map a snake_case error_class value to a localised label.
+/// Falls back to the raw value when no mapping exists.
+function errorClassLabel(
+  t: (key: string) => string,
+  errorClass?: string | null,
+): string {
+  if (!errorClass) return "—";
+  const key = `requests.errorClass_${errorClass}`;
+  const label = t(key);
+  // i18next returns the key itself when no translation is found.
+  return label === key ? errorClass : label;
 }
 
 type FilterOption = {
@@ -318,12 +339,29 @@ export default function RequestLogs() {
     [providerNameById, requestFilterOptions.providers],
   );
   const statusFilterOptions = useMemo(
-    () => toFilterOptions(requestFilterOptions.statuses),
-    [requestFilterOptions.statuses],
+    () =>
+      requestFilterOptions.statuses.map((value) => {
+        // Normalise legacy values for display.
+        const normalized =
+          value === "ok" ? "success" : value === "error" ? "failed" : value;
+        const labelKey = `requests.status${
+          normalized.charAt(0).toUpperCase() + normalized.slice(1)
+        }`;
+        const label = t(labelKey);
+        return {
+          value,
+          label: label === labelKey ? value : label,
+        };
+      }),
+    [requestFilterOptions.statuses, t],
   );
   const errorClassFilterOptions = useMemo(
-    () => toFilterOptions(requestFilterOptions.error_classes),
-    [requestFilterOptions.error_classes],
+    () =>
+      requestFilterOptions.error_classes.map((value) => ({
+        value,
+        label: errorClassLabel(t, value),
+      })),
+    [requestFilterOptions.error_classes, t],
   );
   const resolveProvider = useCallback(
     (id?: string | null) => (id ? providerNameById.get(id) : undefined),
@@ -558,7 +596,6 @@ export default function RequestLogs() {
                     <Td>
                       <StatusBadge
                         status={r.status}
-                        errorClass={r.error_class}
                         truncationReason={r.truncation_reason}
                       />
                     </Td>
@@ -681,7 +718,6 @@ export default function RequestLogs() {
           <div className="flex flex-wrap items-center gap-2">
             <StatusBadge
               status={detail?.status ?? ""}
-              errorClass={detail?.error_class}
               truncationReason={
                 replayQuery.data?.truncation_reason ?? detail?.truncation_reason
               }
@@ -745,19 +781,26 @@ export default function RequestLogs() {
                     replayQuery.data?.finish_reason ?? detail?.finish_reason
                   }
                 />
-                <MetricCell
-                  label={t("requests.truncationReason")}
-                  value={
-                    replayQuery.data?.truncation_reason ??
-                    detail?.truncation_reason
-                  }
-                />
-                {(detail?.error_class || detail?.status !== "ok") && (
+                {(replayQuery.data?.truncation_reason ??
+                  detail?.truncation_reason) && (
+                  <MetricCell
+                    label={t("requests.truncationReason")}
+                    value={
+                      replayQuery.data?.truncation_reason ??
+                      detail?.truncation_reason
+                    }
+                  />
+                )}
+                {(detail?.error_class ||
+                  (detail?.status !== "ok" &&
+                    detail?.status !== "success")) && (
                   <MetricCell
                     label={t("requests.errorClass")}
                     badge={
                       detail?.error_class ? (
-                        <Badge tone="danger">{detail.error_class}</Badge>
+                        <Badge tone="danger">
+                          {errorClassLabel(t, detail.error_class)}
+                        </Badge>
                       ) : undefined
                     }
                   />
