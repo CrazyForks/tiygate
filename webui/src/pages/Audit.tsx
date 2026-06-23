@@ -199,7 +199,7 @@ export default function Audit() {
             <EmptyState title={t("audit.empty")} />
           ) : (
             <Table
-              maxHeight={["max-h-[calc(100vh-14rem)]", "lg:max-h-[calc(100vh-10rem)]"]}
+              maxHeight={["max-h-[calc(100vh-10rem)]", "lg:max-h-[calc(100vh-6rem)]"]}
               tableClassName="min-w-max border-separate border-spacing-0"
               containerRef={scrollRef}
             >

@@ -536,7 +536,7 @@ export default function RoutesPage() {
             />
           ) : (
             <Table
-              maxHeight={["max-h-[calc(100vh-9.5rem)]", "lg:max-h-[calc(100vh-5.5rem)]"]}
+              maxHeight={["max-h-[calc(100vh-14rem)]", "lg:max-h-[calc(100vh-10rem)]"]}
               tableClassName="min-w-max border-separate border-spacing-0"
               containerRef={scrollRef}
             >
