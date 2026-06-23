@@ -1442,7 +1442,7 @@ pub(super) async fn execute_responses_upstream(
 /// Handle POST /v1/embeddings.
 ///
 /// Wiring (§4.7 + §4.1 + §4.8):
-/// 1. Build a *redacted, truncated* `RawEnvelope` for the audit log.
+/// 1. Build a *redacted* `RawEnvelope` for the audit log.
 /// 2. Extract (or mint) the W3C trace context.
 /// 3. Check the embedding cache; on hit, serve the cached value
 ///    and emit a `RequestEvent` with `cache_hit = hit`.

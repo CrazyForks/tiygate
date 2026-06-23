@@ -478,13 +478,10 @@ pub struct RawEnvelope {
     pub path: String,
     /// Request headers (sensitive fields redacted).
     pub headers: HashMap<String, String>,
-    /// Raw request body (may be truncated; see `truncated`).
+    /// Raw request body.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
-    /// Whether the body was truncated.
-    #[serde(default)]
-    pub truncated: bool,
-    /// Original body size in bytes before truncation.
+    /// Original body size in bytes.
     #[serde(default)]
     pub original_body_size: u64,
     /// When the request was received.

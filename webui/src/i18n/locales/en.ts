@@ -347,9 +347,9 @@ const en = {
     detail: "Detail",
     viewDetail: "View detail",
     replay: "Replay envelope",
-    redactedNote: "Headers are redacted; oversized bodies are truncated.",
+    redactedNote: "Headers are redacted.",
     replayNote:
-      "This is a stored snapshot; it is not re-sent upstream. Headers are redacted and oversized bodies are truncated.",
+      "This is a stored snapshot; it is not re-sent upstream. Headers are redacted.",
     rawEnvelope: "Raw envelope",
     redactedHeaders: "Redacted headers",
     prev: "Previous",

@@ -1,7 +1,7 @@
 # TiyGate 请求日志：c→g→p→g→c 全链路记录规范
 
 请求日志详情视图记录单次请求在网关内的完整四段链路。本文定义每段
-记录什么、在哪里捕获、如何脱敏与截断，确保字段齐全、客户端自定义
+记录什么、在哪里捕获、如何脱敏，确保字段齐全、客户端自定义
 header 可见、且仅对敏感值脱敏。
 
 ## 四段链路
@@ -58,13 +58,13 @@ g→p/p→g/g→c 三段在落库前由 `OltpSink::capture_to_row()`
 构建 `RawEnvelope` 时即脱敏。捕获到的明文完整 header 只在内存中短暂存在，
 落库前一定经过脱敏。
 
-## 截断与媒体剥离
+## 媒体剥离
 
-- c→g body 受 `raw_envelope_max_bytes` 限制；当
-  `raw_envelope_capture_media` 关闭（默认）时，内联 base64 媒体被替换为
-  `{_media_meta: {...}}` 元数据后再截断。
-- g→p/p→g/g→c body 受 `payload_max_bytes` 限制，超出则截断并置
-  `*_truncated` 标志。
+- 当 `raw_envelope_capture_media` 关闭（默认）时，c→g body 中的内联
+  base64 媒体被替换为字符串占位符
+  `[_media_meta mime=... size_bytes=N sha256_hex=...]`。
+  占位符保持原始 JSON 类型（string 仍为 string），避免审计日志中出现
+  与真实请求结构不一致的 object 字段。
 - 流式响应额外尝试把上游 SSE 合并为结构化 JSON 存入
   `sse_parsed_json`。
 

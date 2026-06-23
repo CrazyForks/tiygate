@@ -412,12 +412,9 @@ impl OltpSink {
         let client_resp_headers_json =
             redact_headers_json(&self.redactor, &capture.client_resp_headers);
 
-        let (egress_body, egress_body_truncated) =
-            self.prepare_body(capture.egress_body.as_deref());
-        let (upstream_resp_body, upstream_resp_body_truncated) =
-            self.prepare_body(capture.upstream_resp_body.as_deref());
-        let (client_resp_body, client_resp_body_truncated) =
-            self.prepare_body(capture.client_resp_body.as_deref());
+        let egress_body = self.prepare_body(capture.egress_body.as_deref());
+        let upstream_resp_body = self.prepare_body(capture.upstream_resp_body.as_deref());
+        let client_resp_body = self.prepare_body(capture.client_resp_body.as_deref());
 
         // For streaming responses, attempt to merge the SSE chunks
         // (we parse from the *upstream* body which carries the raw
@@ -452,14 +449,14 @@ impl OltpSink {
             egress_path: capture.egress_path.clone(),
             egress_headers_json,
             egress_body,
-            egress_body_truncated,
+            egress_body_truncated: false,
             upstream_status: capture.upstream_status,
             upstream_resp_headers_json,
             upstream_resp_body,
-            upstream_resp_body_truncated,
+            upstream_resp_body_truncated: false,
             client_resp_headers_json,
             client_resp_body,
-            client_resp_body_truncated,
+            client_resp_body_truncated: false,
             is_stream: capture.is_stream,
             sse_parsed_json,
             client_sse_parsed_json,
@@ -672,12 +669,9 @@ impl OltpSink {
         Ok(())
     }
 
-    /// Redact a JSON body string (best-effort). Returns
-    /// `(stored_body, truncated)` where `truncated` is always `false`.
-    fn prepare_body(&self, body: Option<&str>) -> (Option<String>, bool) {
-        let Some(raw) = body else {
-            return (None, false);
-        };
+    /// Redact a JSON body string (best-effort).
+    fn prepare_body(&self, body: Option<&str>) -> Option<String> {
+        let raw = body?;
         // Redact known credential keys when the body is valid JSON;
         // otherwise keep the raw text (e.g. SSE streams, error pages).
         let redacted = match serde_json::from_str::<serde_json::Value>(raw) {
@@ -687,7 +681,7 @@ impl OltpSink {
             }
             Err(_) => raw.to_string(),
         };
-        (Some(redacted), false)
+        Some(redacted)
     }
 }
 
@@ -2875,7 +2869,6 @@ mod tests {
                 .into_iter()
                 .collect(),
             body: Some("{\"model\":\"gpt-4o\"}".to_string()),
-            truncated: false,
             original_body_size: 18,
             timestamp: Utc::now(),
         };
@@ -2931,7 +2924,6 @@ mod tests {
                 .into_iter()
                 .collect(),
             body: Some("{\"model\":\"gpt-4o\"}".to_string()),
-            truncated: false,
             original_body_size: 18,
             timestamp: Utc::now(),
         });
@@ -3119,7 +3111,6 @@ mod tests {
                 .into_iter()
                 .collect(),
             body: Some("{\"model\":\"gpt-4o\"}".to_string()),
-            truncated: false,
             original_body_size: 18,
             timestamp: Utc::now(),
         };

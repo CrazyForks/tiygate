@@ -423,7 +423,6 @@ fn anthropic_decode_tool_result_array_content() {
         path: "/v1/messages".to_string(),
         headers: std::collections::HashMap::new(),
         body: None,
-        truncated: false,
         original_body_size: 0,
         timestamp: chrono::Utc::now(),
     };

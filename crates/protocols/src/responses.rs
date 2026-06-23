@@ -1516,7 +1516,6 @@ mod tests {
             path: "/v1/responses".to_string(),
             headers: std::collections::HashMap::new(),
             body: None,
-            truncated: false,
             original_body_size: 0,
             timestamp: chrono::Utc::now(),
         }

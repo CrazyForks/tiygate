@@ -338,9 +338,9 @@ const zh: Translation = {
     detail: "详情",
     viewDetail: "查看详情",
     replay: "回放信封",
-    redactedNote: "请求头已脱敏；超限的 body 已截断。",
+    redactedNote: "请求头已脱敏。",
     replayNote:
-      "这是已存储的快照，不会重新向上游发起请求；请求头已脱敏，超限的 body 已截断。",
+      "这是已存储的快照，不会重新向上游发起请求；请求头已脱敏。",
     rawEnvelope: "原始信封",
     redactedHeaders: "脱敏请求头",
     prev: "上一页",

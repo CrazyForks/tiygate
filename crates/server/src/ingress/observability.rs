@@ -543,7 +543,6 @@ pub(super) fn build_redacted_envelope(
     }
 
     let stored_body = Some(body_str);
-    let truncated = false;
     let raw_iter = raw_headers
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()));
@@ -553,7 +552,6 @@ pub(super) fn build_redacted_envelope(
         path: path.to_string(),
         headers: redacted.into_iter().collect(),
         body: stored_body,
-        truncated,
         original_body_size,
         timestamp: Utc::now(),
     }
@@ -581,18 +579,19 @@ pub(super) fn build_redacted_envelope_raw(
         path: path.to_string(),
         headers: redacted.into_iter().collect(),
         body: None,
-        truncated: false,
         original_body_size,
         timestamp: Utc::now(),
     }
 }
 
 /// Strip inline base64 media payloads from a JSON body string,
-/// replacing them with metadata objects `{"_media_meta": {"mime":
-/// "...", "size_bytes": N, "sha256_hex": "..."}}`. This is a
-/// best-effort scan: it parses the body JSON, walks all string
-/// values, and replaces any base64-encoded data blocks (>= 512
-/// chars) with a compact metadata stub.
+/// replacing them with string placeholders of the form
+/// `[_media_meta mime=... size_bytes=N sha256_hex=...]`.
+/// The JSON *type* of the original value (string) is preserved so
+/// that the audit envelope structure matches the real request.
+/// This is a best-effort scan: it parses the body JSON, walks all
+/// string values, and replaces any base64-encoded data blocks
+/// (>= 512 chars) with a compact metadata stub.
 ///
 /// The approach avoids the `regex` dependency by using `serde_json`
 /// to walk the JSON structure and detect large base64-like strings
@@ -666,8 +665,12 @@ fn is_large_base64(s: &str) -> bool {
     non_b64 * 100 <= total * 2
 }
 
-/// Build a `{"_media_meta": {...}}` JSON value from a base64 string,
-/// capturing MIME type, approximate binary size, and SHA-256 hash.
+/// Build a string placeholder from a base64 string, capturing MIME
+/// type, approximate binary size, and SHA-256 hash. The result is a
+/// `Value::String` (not an object) so that the JSON *type* of the
+/// original value is preserved — e.g. a `"url"` field that was a
+/// string stays a string in the audit envelope, avoiding schema
+/// confusion when the audit log is inspected or replayed.
 fn build_media_meta(s: &str) -> Value {
     use sha2::{Digest, Sha256};
 
@@ -700,13 +703,9 @@ fn build_media_meta(s: &str) -> Value {
         hex::encode(hasher.finalize())
     };
 
-    serde_json::json!({
-        "_media_meta": {
-            "mime": mime,
-            "size_bytes": binary_size,
-            "sha256_hex": hash
-        }
-    })
+    Value::String(format!(
+        "[_media_meta mime={mime} size_bytes={binary_size} sha256_hex={hash}]"
+    ))
 }
 
 /// Extract the W3C trace context from the inbound headers. When
@@ -954,7 +953,7 @@ pub(super) fn emit_request_event(
         api_key_id: api_key_id.map(str::to_string),
         client_ip: None,
         user_agent: None,
-        // Persist the redacted, truncated envelope alongside the
+        // Persist the redacted envelope alongside the
         // event row so an operator can replay a failed request
         // via the envelope. The `Redactor` is already applied at
         // envelope build time, so the value is safe to store.
@@ -1194,5 +1193,150 @@ mod api_key_resolution_tests {
     fn extract_empty_x_goog_api_key_returns_none() {
         let h = headers_from(&[("x-goog-api-key", "   ")]);
         assert_eq!(extract_credential(&h), None);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+mod media_strip_tests {
+    use super::{build_media_meta, is_large_base64, strip_inline_media};
+    use serde_json::Value;
+
+    // -----------------------------------------------------------------------
+    // build_media_meta — must return Value::String (not an object)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_media_meta_returns_string_not_object() {
+        // Pad to exceed 512 chars.
+        let padded = format!("data:image/png;base64,{}", "A".repeat(600));
+        let meta = build_media_meta(&padded);
+        assert!(
+            meta.is_string(),
+            "build_media_meta must return Value::String, got: {meta:?}"
+        );
+    }
+
+    #[test]
+    fn build_media_meta_string_contains_mime_and_hash() {
+        let padded = format!("data:image/jpeg;base64,{}", "B".repeat(600));
+        let meta = build_media_meta(&padded);
+        let s = meta.as_str().expect("must be string");
+        assert!(s.contains("mime=image/jpeg"), "missing mime in: {s}");
+        assert!(s.contains("sha256_hex="), "missing sha256_hex in: {s}");
+        assert!(s.contains("size_bytes="), "missing size_bytes in: {s}");
+        assert!(s.starts_with("[_media_meta "), "unexpected prefix in: {s}");
+    }
+
+    #[test]
+    fn build_media_meta_defaults_mime_for_non_data_url() {
+        let raw_b64 = "C".repeat(600);
+        let meta = build_media_meta(&raw_b64);
+        let s = meta.as_str().expect("must be string");
+        assert!(
+            s.contains("mime=application/octet-stream"),
+            "expected default mime, got: {s}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // is_large_base64 — threshold detection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn short_string_is_not_base64() {
+        assert!(!is_large_base64("short"));
+        assert!(!is_large_base64("iVBORw0KGgo="));
+    }
+
+    #[test]
+    fn long_base64_string_is_detected() {
+        let s = "A".repeat(600);
+        assert!(is_large_base64(&s));
+    }
+
+    #[test]
+    fn data_url_prefix_is_handled() {
+        let s = format!("data:image/png;base64,{}", "A".repeat(600));
+        assert!(is_large_base64(&s));
+    }
+
+    #[test]
+    fn just_under_threshold_is_not_detected() {
+        let s = "A".repeat(511);
+        assert!(!is_large_base64(&s));
+    }
+
+    // -----------------------------------------------------------------------
+    // strip_inline_media — JSON structure preservation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn strip_preserves_string_type_for_url_field() {
+        // Simulates an OpenAI image_url request where the url is a
+        // large data: URI. After stripping, the "url" field must
+        // still be a JSON string (not an object), so the audit
+        // envelope structure matches the real request schema.
+        let b64 = "A".repeat(600);
+        let body = format!(
+            r#"{{"messages":[{{"content":[{{"type":"image_url","image_url":{{"url":"data:image/png;base64,{b64}"}}}}]}}]}}"#
+        );
+        let stripped = strip_inline_media(&body);
+        let v: Value = serde_json::from_str(&stripped).expect("stripped body must be valid JSON");
+        let url = &v["messages"][0]["content"][0]["image_url"]["url"];
+        assert!(
+            url.is_string(),
+            "url field must remain a string after stripping, got: {url:?}"
+        );
+        let url_str = url.as_str().expect("must be string");
+        assert!(
+            url_str.starts_with("[_media_meta "),
+            "url should contain media meta placeholder, got: {url_str}"
+        );
+    }
+
+    #[test]
+    fn strip_leaves_small_strings_untouched() {
+        let body = r#"{"prompt":"hello world","max_tokens":10}"#;
+        let stripped = strip_inline_media(body);
+        // strip_inline_media re-serializes via serde_json, which may
+        // reorder keys; verify content equivalence instead of exact
+        // string equality.
+        let orig: Value = serde_json::from_str(body).expect("original must parse");
+        let stripped_val: Value = serde_json::from_str(&stripped).expect("stripped must parse");
+        assert_eq!(orig, stripped_val, "small strings should not be stripped");
+    }
+
+    #[test]
+    fn strip_handles_invalid_json_gracefully() {
+        let body = "not valid json {{{";
+        let stripped = strip_inline_media(body);
+        assert_eq!(stripped, body, "invalid JSON should be returned as-is");
+    }
+
+    #[test]
+    fn strip_preserves_non_media_string_fields() {
+        let b64 = "A".repeat(600);
+        let body = format!(
+            r#"{{"model":"gpt-4","prompt":"describe this","image":"data:image/png;base64,{b64}"}}"#
+        );
+        let stripped = strip_inline_media(&body);
+        let v: Value = serde_json::from_str(&stripped).expect("must be valid JSON");
+        assert_eq!(v["model"].as_str(), Some("gpt-4"));
+        assert_eq!(v["prompt"].as_str(), Some("describe this"));
+        assert!(v["image"].is_string(), "image must stay string");
+    }
+
+    #[test]
+    fn strip_handles_nested_arrays_of_base64() {
+        let b64 = format!("data:image/png;base64,{}", "A".repeat(600));
+        let body = format!(r#"{{"items":["{b64}","{b64}"]}}"#);
+        let stripped = strip_inline_media(&body);
+        let v: Value = serde_json::from_str(&stripped).expect("must be valid JSON");
+        let items = v["items"].as_array().expect("items must be array");
+        assert_eq!(items.len(), 2);
+        for item in items {
+            assert!(item.is_string(), "each item must remain string");
+        }
     }
 }

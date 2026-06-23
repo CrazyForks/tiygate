@@ -276,6 +276,10 @@ pub(super) async fn handle_chat_completions(
         }
     }
 
+    // Capture the original body string for passthrough before
+    // `decode_request` moves `body`.
+    let original_body_str = serde_json::to_string(&body).unwrap_or_default();
+
     // Decode request
     let ir_request = match codec.decode_request(body, &raw_env) {
         Ok(r) => r,
@@ -325,7 +329,7 @@ pub(super) async fn handle_chat_completions(
     // the ingress suite and the codec declares Passthrough, forward
     // the original body verbatim (no IR round-trip).
     let (_pass_through_candidate, raw_passthrough_body) =
-        compute_pass_through(&codec, &ingress_protocol, &targets, &raw_env);
+        compute_pass_through(&codec, &ingress_protocol, &targets, &original_body_str);
 
     // Delegate to the unified fallback / circuit-breaker / retry loop.
     scope.mark_waiting_upstream();
@@ -446,6 +450,8 @@ pub(super) async fn handle_messages(
         }
     }
 
+    let original_body_str = serde_json::to_string(&body).unwrap_or_default();
+
     let ir_request = match codec.decode_request(body, &raw_env) {
         Ok(r) => r,
         Err(e) => {
@@ -484,7 +490,7 @@ pub(super) async fn handle_messages(
     // PassThrough: forward raw body bytes verbatim when the target's
     // protocol suite matches the ingress suite.
     let (_pass_through, raw_passthrough_body) =
-        compute_pass_through(&codec, &ingress_protocol, &targets, &raw_env);
+        compute_pass_through(&codec, &ingress_protocol, &targets, &original_body_str);
 
     // Delegate to the unified fallback / circuit-breaker / retry loop.
     scope.mark_waiting_upstream();
@@ -819,6 +825,8 @@ pub(super) async fn handle_responses(
         }
     }
 
+    let original_body_str = serde_json::to_string(&body).unwrap_or_default();
+
     let ir_request = match codec.decode_request(body, &raw_env) {
         Ok(r) => r,
         Err(e) => {
@@ -854,7 +862,7 @@ pub(super) async fn handle_responses(
     };
 
     let (_pass_through, raw_passthrough_body) =
-        compute_pass_through(&codec, &ingress_protocol, &targets, &raw_env);
+        compute_pass_through(&codec, &ingress_protocol, &targets, &original_body_str);
 
     // Delegate to the unified fallback / circuit-breaker / retry loop.
     let request_id = scope.request_id().to_string();
@@ -999,6 +1007,8 @@ pub(super) async fn handle_gemini_generate(
         }
     }
 
+    let original_body_str = serde_json::to_string(&body).unwrap_or_default();
+
     // Inject the streaming flag from the URL method into the body so the
     // Gemini codec's `decode_request` (which reads `body["_stream"]`) can
     // pick it up. Standard Gemini clients do not send a `_stream` field —
@@ -1042,7 +1052,7 @@ pub(super) async fn handle_gemini_generate(
     };
 
     let (_pass_through, raw_passthrough_body) =
-        compute_pass_through(&codec, &ingress_protocol, &targets, &raw_env);
+        compute_pass_through(&codec, &ingress_protocol, &targets, &original_body_str);
 
     // Delegate to the unified fallback / circuit-breaker / retry loop.
     let request_id = scope.request_id().to_string();
@@ -1164,6 +1174,8 @@ pub(super) async fn handle_images_generations(
         }
     }
 
+    let original_body_str = serde_json::to_string(&body).unwrap_or_default();
+
     // Decode request — in passthrough mode this is only used to extract
     // the model name and stream flag for routing.
     let ir_request = match codec.decode_request(body, &raw_env) {
@@ -1208,7 +1220,7 @@ pub(super) async fn handle_images_generations(
     );
 
     let (_pass_through_candidate, raw_passthrough_body) =
-        compute_pass_through(&codec, &ingress_protocol, &targets, &raw_env);
+        compute_pass_through(&codec, &ingress_protocol, &targets, &original_body_str);
 
     scope.mark_waiting_upstream();
     let outcome = execute_with_fallback(

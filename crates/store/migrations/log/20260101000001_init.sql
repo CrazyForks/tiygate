@@ -39,8 +39,8 @@ CREATE TABLE IF NOT EXISTS request_logs (
     client_ip TEXT,
     user_agent TEXT,
     -- Phase 4 §4.1: raw_envelope captures live alongside the
-    -- aggregated event. Stored as JSON text. Body bytes may be
-    -- truncated; the redacted_headers column carries the
+    -- aggregated event. Stored as JSON text. The
+    -- redacted_headers column carries the
     -- already-redacted header set.
     raw_envelope_json TEXT,
     redacted_headers_json TEXT

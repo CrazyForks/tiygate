@@ -1482,7 +1482,6 @@ mod tests {
             path: "/v1beta/models/gemini:generateContent".to_string(),
             headers: std::collections::HashMap::new(),
             body: None,
-            truncated: false,
             original_body_size: 0,
             timestamp: chrono::Utc::now(),
         }

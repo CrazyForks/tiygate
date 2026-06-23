@@ -559,7 +559,6 @@ mod tests {
             path: "/v1/images/generations".to_string(),
             headers: HashMap::new(),
             body: None,
-            truncated: false,
             original_body_size: 0,
             timestamp: chrono::Utc::now(),
         }

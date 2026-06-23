@@ -22,7 +22,6 @@ fn make_env() -> tiygate_core::RawEnvelope {
         path: "/test".to_string(),
         headers: std::collections::HashMap::new(),
         body: None,
-        truncated: false,
         original_body_size: 0,
         timestamp: chrono::Utc::now(),
     }

@@ -291,7 +291,7 @@ pub struct RequestEvent {
     pub api_key_id: Option<String>,
     pub client_ip: Option<String>,
     pub user_agent: Option<String>,
-    /// The redacted, truncated `RawEnvelope` captured at the
+    /// The redacted `RawEnvelope` captured at the
     /// ingress. Persisted to the OLTP log table so an operator can
     /// replay a failed request via the envelope and inspect the
     /// exact headers / body the caller sent. Per §8 acceptance
@@ -311,10 +311,10 @@ pub struct LatencyBreakdown {
 }
 
 /// A full request/response exchange capture for the request-log
-/// detail view. Carries the raw (un-redacted, un-truncated) headers
-/// and bodies as captured on the request hot path. The telemetry
-/// background task redacts + truncates + (for SSE) parses these
-/// before persistence, so the hot path stays cheap (clone/move only).
+/// detail view. Carries the raw (un-redacted) headers and bodies
+/// as captured on the request hot path. The telemetry background
+/// task redacts (and for SSE parses) these before persistence, so
+/// the hot path stays cheap (clone/move only).
 ///
 /// Headers are `Vec<(name, value)>` to preserve order and duplicates.
 /// Bodies are raw `String`s (JSON for non-stream, concatenated SSE

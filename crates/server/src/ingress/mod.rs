@@ -33,7 +33,7 @@ use axum::{
 use tokio::sync::Semaphore;
 use tower_http::timeout::RequestBodyTimeoutLayer;
 
-use tiygate_core::{HealthRegistry, RawEnvelope, TelemetryBus};
+use tiygate_core::{HealthRegistry, TelemetryBus};
 
 /// Construct a `Strategy` from the `RoutingStrategyName` carried on
 /// `AppState`. §3.4 names `Weighted` as the document-level default; we honor
@@ -543,13 +543,19 @@ pub(crate) fn spawn_tunables_reloader(
 /// Compute the raw-passthrough body and the same-suite flag, in a
 /// way that all ingress handlers can share. When the target's
 /// protocol suite matches the ingress suite and the codec declares
-/// Passthrough, the captured `raw_envelope.body` is forwarded
-/// verbatim to the upstream.
+/// Passthrough, the `original_body` is forwarded verbatim to the
+/// upstream.
+///
+/// **Important**: `original_body` must be the *unmodified* client
+/// request body, NOT the `RawEnvelope.body` (which may have been
+/// media-stripped for audit storage). Forwarding a media-stripped
+/// body corrupts upstream requests — see the fix for the
+/// `_media_meta` passthrough bug.
 pub fn compute_pass_through<C: tiygate_core::EndpointCodec>(
     codec: &C,
     ingress_protocol: &tiygate_core::ProtocolEndpoint,
     targets: &[tiygate_core::RoutingTarget],
-    raw_envelope: &RawEnvelope,
+    original_body: &str,
 ) -> (bool, Option<String>) {
     let pass_through_candidate = targets.iter().any(|t| {
         ingress_protocol.suite == t.api_protocol.suite
@@ -559,7 +565,7 @@ pub fn compute_pass_through<C: tiygate_core::EndpointCodec>(
             )
     });
     if pass_through_candidate {
-        (true, raw_envelope.body.clone())
+        (true, Some(original_body.to_string()))
     } else {
         (false, None)
     }
