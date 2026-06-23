@@ -980,10 +980,13 @@ function TargetBadges({
       ref={containerRef}
       className="flex max-h-[3.25rem] max-w-full flex-wrap gap-1 overflow-hidden"
     >
-      {shown.map((tg, i) => (
+      {shown.map((tg, i) => {
+        const enabled = isTargetEnabled(tg);
+        return (
         <Badge
           key={i}
-          tone="primary"
+          tone={enabled ? "primary" : "neutral"}
+          className={cn(!enabled && "opacity-50")}
           title={`${resolveProvider(tg.provider_id) ?? tg.provider_id} → ${tg.model_id}`}
         >
           <span className="truncate font-medium">
@@ -997,7 +1000,8 @@ function TargetBadges({
             {tg.model_id}
           </span>
         </Badge>
-      ))}
+        );
+      })}
       {hiddenCount > 0 && (
         <Badge
           tone="neutral"
