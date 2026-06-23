@@ -6,6 +6,7 @@ import { Save, RotateCcw } from "lucide-react";
 import { settingsApi } from "@/api/resources";
 import type { Settings } from "@/api/types";
 import {
+  Alert,
   Button,
   Card,
   CardBody,
@@ -373,9 +374,9 @@ export default function SettingsPage() {
                 />
               </Field>
             </div>
-            <p className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm text-amber-700 dark:text-amber-300">
+            <Alert tone="warning">
               {t("settings.sqliteMaintenance.vacuumWarning")}
-            </p>
+            </Alert>
           </CardBody>
         </Card>
       )}
