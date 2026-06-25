@@ -151,7 +151,7 @@ pub fn xai_preset() -> OAuthProviderPreset {
         token_request_style: TokenRequestStyle::Form,
         extra_authorize_params: vec![
             ("plan".to_string(), "generic".to_string()),
-            ("referrer".to_string(), "cli-proxy-api".to_string()),
+            ("referrer".to_string(), "tiygate".to_string()),
         ],
     }
 }
