@@ -589,44 +589,8 @@ impl DbConfigStore {
             }
         }
 
-        // Decrypt the OAuth metadata for OAuth-mode providers so the
-        // data plane can extract the refresh token on the hot path
-        // without re-running crypto. Same cleartext-fallback logic
-        // as the API key path above.
-        if let Some(enc) = self.encryption.as_ref() {
-            for provider in providers.iter_mut() {
-                if !matches!(provider.auth_mode, AuthMode::OAuth) {
-                    continue;
-                }
-                if provider.encrypted_oauth_meta.is_empty() {
-                    provider.oauth_meta_cleartext = Some(String::new());
-                    continue;
-                }
-                match keys::decrypt_oauth_meta(enc, &provider.encrypted_oauth_meta) {
-                    Ok(plain) => provider.oauth_meta_cleartext = Some(plain),
-                    Err(e) => {
-                        tracing::warn!(
-                            provider = %provider.id,
-                            error = %e,
-                            "decrypting provider oauth meta failed; \
-                             data plane will not be able to refresh OAuth tokens"
-                        );
-                        provider.oauth_meta_cleartext = None;
-                    }
-                }
-            }
-        } else {
-            for provider in providers.iter_mut() {
-                if !matches!(provider.auth_mode, AuthMode::OAuth) {
-                    continue;
-                }
-                if provider.encrypted_oauth_meta.is_empty() {
-                    provider.oauth_meta_cleartext = Some(String::new());
-                } else {
-                    // No master key: column holds cleartext.
-                    provider.oauth_meta_cleartext = Some(provider.encrypted_oauth_meta.clone());
-                }
-            }
+        for provider in providers.iter_mut() {
+            populate_provider_oauth_cleartext(self.encryption.as_ref(), provider);
         }
 
         let routes = self.load_routes().await?;
@@ -676,7 +640,11 @@ impl DbConfigStore {
         .bind(id)
         .fetch_optional(self.pool.any())
         .await?;
-        rows.map(row_to_provider).transpose()
+        let mut provider = rows.map(row_to_provider).transpose()?;
+        if let Some(provider) = provider.as_mut() {
+            populate_provider_oauth_cleartext(self.encryption.as_ref(), provider);
+        }
+        Ok(provider)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1635,6 +1603,35 @@ fn row_to_provider(row: sqlx::any::AnyRow) -> Result<Provider, StoreError> {
     })
 }
 
+fn populate_provider_oauth_cleartext(
+    encryption: Option<&Arc<KeyEncryption>>,
+    provider: &mut Provider,
+) {
+    if !matches!(provider.auth_mode, AuthMode::OAuth) {
+        return;
+    }
+    if provider.encrypted_oauth_meta.is_empty() {
+        provider.oauth_meta_cleartext = Some(String::new());
+        return;
+    }
+    if let Some(enc) = encryption {
+        match keys::decrypt_oauth_meta(enc, &provider.encrypted_oauth_meta) {
+            Ok(plain) => provider.oauth_meta_cleartext = Some(plain),
+            Err(e) => {
+                tracing::warn!(
+                    provider = %provider.id,
+                    error = %e,
+                    "decrypting provider oauth meta failed; data plane will not be able to refresh OAuth tokens"
+                );
+                provider.oauth_meta_cleartext = None;
+            }
+        }
+    } else {
+        // No master key: column holds cleartext.
+        provider.oauth_meta_cleartext = Some(provider.encrypted_oauth_meta.clone());
+    }
+}
+
 fn row_to_route(row: sqlx::any::AnyRow) -> Result<Route, StoreError> {
     let targets_str: String = row.get("targets_json");
     let targets: Vec<RouteTarget> = serde_json::from_str(&targets_str)?;
@@ -1937,6 +1934,41 @@ mod tests {
         let store = DbConfigStore::new(pool, encryption);
         store.refresh().await.expect("refresh");
         store
+    }
+
+    #[tokio::test]
+    async fn get_provider_populates_oauth_meta_cleartext() {
+        let key = KeyEncryption::from_secret(&master_key_hex()).expect("key");
+        let store = boot_store(Some(Arc::new(key))).await;
+        let meta = serde_json::json!({
+            "refresh_token": "rt-test",
+            "expires_in_s": 3600,
+        });
+        let meta_str = serde_json::to_string(&meta).expect("serialize meta");
+        store
+            .upsert_provider(
+                "oauth-openai",
+                "OAuth OpenAI",
+                "openai",
+                "https://api.openai.com/v1",
+                None,
+                AuthMode::OAuth,
+                Some(&meta_str),
+                serde_json::json!({}),
+                true,
+            )
+            .await
+            .expect("upsert oauth provider");
+
+        let provider = store
+            .get_provider("oauth-openai")
+            .await
+            .expect("get provider")
+            .expect("provider exists");
+        assert_eq!(
+            provider.oauth_meta_cleartext.as_deref(),
+            Some(meta_str.as_str())
+        );
     }
 
     #[tokio::test]

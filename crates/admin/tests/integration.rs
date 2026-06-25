@@ -781,8 +781,7 @@ async fn oauth_callback_rejects_unknown_state() {
                 .uri("/admin/v1/oauth/callback")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
-                    serde_json::to_vec(&json!({"code": "foo", "state": "ghost"}))
-                        .expect("encode"),
+                    serde_json::to_vec(&json!({"code": "foo", "state": "ghost"})).expect("encode"),
                 ))
                 .expect("req"),
         )

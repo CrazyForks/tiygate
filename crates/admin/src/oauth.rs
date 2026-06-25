@@ -282,6 +282,7 @@ async fn refresh_oauth(
     let oauth_meta_str = provider
         .oauth_meta_cleartext
         .as_deref()
+        .filter(|meta| !meta.trim().is_empty())
         .ok_or_else(|| ApiError::bad_request("provider has no stored OAuth metadata"))?;
     let oauth_meta: serde_json::Value = serde_json::from_str(oauth_meta_str)
         .map_err(|e| ApiError::bad_request(format!("invalid OAuth metadata: {e}")))?;
