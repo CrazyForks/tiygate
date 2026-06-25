@@ -28,10 +28,10 @@
 //! `oauth_pending` as soon as the callback validates the
 //! incoming query param.
 
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::{get, post};
+use axum::routing::post;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -49,7 +49,7 @@ use crate::state::{AdminState, OAuthPendingFlow};
 pub fn router() -> Router<AdminState> {
     Router::new()
         .route("/admin/v1/oauth/start", post(start_oauth))
-        .route("/admin/v1/oauth/callback", get(callback_oauth))
+        .route("/admin/v1/oauth/callback", post(callback_oauth))
         .route("/admin/v1/oauth/refresh", post(refresh_oauth))
 }
 
@@ -130,38 +130,90 @@ struct StartOauthResponse {
     state: String,
 }
 
-/// `GET /admin/v1/oauth/callback?code=…&state=…` — receive the
-/// provider redirect and complete the flow.
+/// `POST /admin/v1/oauth/callback` — complete the OAuth flow after
+/// the user manually pastes the authorization code from the
+/// provider's redirect URL.
+///
+/// The provider redirects the user's browser to the `redirect_url`
+/// registered in the preset (e.g.
+/// `http://localhost:1455/auth/callback?code=…&state=…`). Because
+/// TiyGate does not serve that callback URL, the page will 404 —
+/// the user copies the `code` (and `state`) query parameters from
+/// the address bar and pastes them into the Admin Console, which
+/// then calls this endpoint via the normal admin-API auth path.
 async fn callback_oauth(
     State(state): State<AdminState>,
-    Query(q): Query<OauthCallbackQuery>,
+    Json(req): Json<OauthCallbackRequest>,
 ) -> Result<Json<OauthCallbackResponse>, ApiError> {
+    callback_oauth_inner(state, req.code, req.state)
+        .await
+        .map(Json)
+        .map_err(|e| ApiError::from_status_msg(e.0, &e.1))
+}
+
+#[derive(Debug, Deserialize)]
+struct OauthCallbackRequest {
+    code: String,
+    state: String,
+}
+
+#[derive(Debug, Serialize)]
+struct OauthCallbackResponse {
+    provider_id: String,
+    access_token: Option<String>,
+    expires_in_s: Option<u64>,
+}
+
+/// Shared inner logic: validates `state`, exchanges the code for
+/// tokens, and persists the refresh-token metadata.
+async fn callback_oauth_inner(
+    state: AdminState,
+    code: String,
+    csrf_state: String,
+) -> Result<OauthCallbackResponse, (StatusCode, String)> {
     // Validate `state` against the pending-flow map. The lookup
     // is single-shot: a second callback with the same `state`
     // will be rejected (replay protection).
-    let pending = state.oauth_pending.lock().await.remove(&q.state);
-    let pending = pending.ok_or_else(|| ApiError::bad_request("invalid or expired `state`"))?;
+    let pending = state.oauth_pending.lock().await.remove(&csrf_state);
+    let pending = pending.ok_or((
+        StatusCode::BAD_REQUEST,
+        "invalid or expired `state`".to_string(),
+    ))?;
 
     // Look up the provider and its OAuth preset.
     let provider = state
         .store
         .get_provider(&pending.provider_id)
         .await
-        .map_err(|e| ApiError::internal(format!("lookup provider: {e}")))?
-        .ok_or_else(|| ApiError::not_found("provider vanished during oauth flow"))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("lookup provider: {e}"),
+            )
+        })?
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            "provider vanished during oauth flow".to_string(),
+        ))?;
 
-    let preset = preset_for_vendor(&provider.vendor).ok_or_else(|| {
-        ApiError::internal(format!(
+    let preset = preset_for_vendor(&provider.vendor).ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!(
             "provider vendor '{}' has no built-in OAuth preset",
             provider.vendor
-        ))
-    })?;
+        ),
+    ))?;
 
     // Exchange the authorization code for tokens.
     let http_client = reqwest::Client::new();
-    let result = exchange_code(&preset, &q.code, &pending.verifier, &http_client)
+    let result = exchange_code(&preset, &code, &pending.verifier, &http_client)
         .await
-        .map_err(|e| ApiError::internal(format!("oauth exchange failed: {e}")))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("oauth exchange failed: {e}"),
+            )
+        })?;
 
     let access_token = result.access_token;
     let refresh_token = result.refresh_token;
@@ -175,32 +227,28 @@ async fn callback_oauth(
         "refresh_token": refresh_token,
         "expires_in_s": expires_in.map(|d| d.as_secs()),
     });
-    let meta_str = serde_json::to_string(&meta_json)
-        .map_err(|e| ApiError::internal(format!("serialise oauth meta: {e}")))?;
+    let meta_str = serde_json::to_string(&meta_json).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("serialise oauth meta: {e}"),
+        )
+    })?;
     state
         .store
         .set_provider_oauth_meta(&pending.provider_id, &meta_str)
         .await
-        .map_err(|e| ApiError::internal(format!("persist oauth meta: {e}")))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("persist oauth meta: {e}"),
+            )
+        })?;
 
-    Ok(Json(OauthCallbackResponse {
+    Ok(OauthCallbackResponse {
         provider_id: pending.provider_id,
         access_token: Some(access_token),
         expires_in_s: expires_in.map(|d| d.as_secs()),
-    }))
-}
-
-#[derive(Debug, Deserialize)]
-struct OauthCallbackQuery {
-    code: String,
-    state: String,
-}
-
-#[derive(Debug, Serialize)]
-struct OauthCallbackResponse {
-    provider_id: String,
-    access_token: Option<String>,
-    expires_in_s: Option<u64>,
+    })
 }
 
 /// `POST /admin/v1/oauth/refresh` — refresh an existing OAuth
@@ -318,6 +366,17 @@ impl ApiError {
     }
     fn internal(msg: impl Into<String>) -> Self {
         Self::Internal(msg.into())
+    }
+    /// Build an `ApiError` from a raw status code and message.
+    /// Used by the JSON callback handler to convert the
+    /// `(StatusCode, String)` tuple returned by
+    /// [`callback_oauth_inner`].
+    fn from_status_msg(status: StatusCode, msg: &str) -> Self {
+        match status {
+            StatusCode::NOT_FOUND => Self::NotFound(msg.to_string()),
+            StatusCode::BAD_REQUEST => Self::BadRequest(msg.to_string()),
+            _ => Self::Internal(msg.to_string()),
+        }
     }
 }
 
