@@ -27,6 +27,7 @@ pub fn run() {
 
     let app = match tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let handle = app.handle().clone();
 
@@ -173,6 +174,7 @@ pub fn run() {
             commands::set_admin_token,
             commands::enable_passwordless,
             commands::get_server_port,
+            commands::open_external_url,
             commands::get_master_key,
             commands::apply_master_key,
             commands::save_backup_file,

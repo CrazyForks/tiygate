@@ -71,6 +71,16 @@ export async function tauriGetServerPort(): Promise<number | null> {
   }
 }
 
+export async function tauriOpenExternalUrl(url: string): Promise<boolean> {
+  if (!isTauri()) return false;
+  try {
+    await invoke<void>("open_external_url", { url });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Set a user-chosen admin token. The Rust backend persists it, marks
  * first-run as complete, and restarts the sidecar. After this resolves,

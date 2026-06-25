@@ -189,8 +189,21 @@ const en = {
     },
     unsupported: "Not supported yet",
     unsupportedVendor: "Vendor not supported",
-    oauthHint:
-      "After saving, go to the OAuth page to complete the authorization flow.",
+    oauthPanel: {
+      title: "OAuth authorization",
+      saveFirst: "Save the provider first, then start the authorization flow here.",
+      notConnected: "Not authorized yet",
+      connected: "Authorized",
+      start: "Start flow",
+      refresh: "Refresh token",
+      authorizeUrl: "Authorization URL",
+      openUrl: "Open",
+      copyUrl: "Copy",
+      callbackHint:
+        "After completing login authorization in the browser, paste the callback URL below and complete authorization",
+      callbackUrlPlaceholder: "http://localhost:1455/auth/callback?code=…&state=…",
+      submitCallback: "Complete authorization",
+    },
     apiKey: "API key",
     apiKeyHint: "Leave blank to keep the existing secret.",
     redacted: "Secret is stored encrypted and never returned.",
@@ -308,7 +321,7 @@ const en = {
     authorizeUrl: "Authorization URL",
     openUrl: "Open authorization URL",
     started:
-      "Flow started. Open the URL above; the provider will redirect to the callback.",
+      "Flow started. Copy the authorization URL into your browser, finish login authorization, then paste the callback URL into the input below.",
     refreshed: "Token refreshed for {{provider}}.",
     noProviders: "No providers configured yet. Add one first.",
     selectPlaceholder: "Select a provider",
@@ -318,12 +331,10 @@ const en = {
     urlCopied: "Authorization URL copied.",
     callbackSuccess: "OAuth authorization complete for {{provider}}.",
     callbackError: "OAuth authorization failed.",
-    callbackHint: "Paste the full redirect URL from the browser address bar",
+    callbackHint:
+      "After completing login authorization in the browser, paste the callback URL below and complete authorization",
     callbackUrlPlaceholder: "http://localhost:1455/auth/callback?code=…&state=…",
-    pasteCallbackUrl: "Paste URL",
     submitCallback: "Complete authorization",
-    callbackUrlPasted: "Callback URL pasted.",
-    callbackUrlPasteFailed: "Clipboard read failed. Paste manually.",
     callbackUrlInvalid: "Could not parse code and state from the URL. Make sure you copied the full redirect URL.",
   },
   requests: {

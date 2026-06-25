@@ -165,6 +165,9 @@ impl KeyEncryption {
 
     /// Returns a redacted form of an encrypted blob for safe logging.
     pub fn redact(blob: &str) -> String {
+        if blob.is_empty() {
+            return String::new();
+        }
         if blob.len() <= 12 {
             return "[encrypted: <short>]".to_string();
         }
@@ -243,6 +246,11 @@ mod tests {
     fn from_secret_rejects_short() {
         let err = KeyEncryption::from_secret("abcd");
         assert!(matches!(err, Err(EncryptionError::BadKeyLength(_))));
+    }
+
+    #[test]
+    fn redact_preserves_empty_blob() {
+        assert_eq!(KeyEncryption::redact(""), "");
     }
 
     #[test]

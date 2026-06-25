@@ -12,6 +12,7 @@
 
 use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
+use tauri_plugin_opener::OpenerExt;
 
 use crate::config::InstanceEntry;
 use crate::sidecar;
@@ -39,6 +40,19 @@ pub fn get_admin_token(state: State<'_, AppState>) -> Option<String> {
 #[tauri::command]
 pub fn get_server_port(state: State<'_, AppState>) -> u16 {
     state.server_port.lock().map(|p| *p).unwrap_or(0)
+}
+
+/// Open a trusted external URL in the system default browser.
+#[tauri::command]
+pub fn open_external_url(app: AppHandle, url: String) -> Result<(), String> {
+    let parsed = url::Url::parse(url.trim()).map_err(|e| format!("invalid url: {e}"))?;
+    match parsed.scheme() {
+        "http" | "https" => app
+            .opener()
+            .open_url(parsed.as_str(), None::<&str>)
+            .map_err(|e| format!("failed to open url: {e}")),
+        _ => Err("only http and https URLs can be opened".into()),
+    }
 }
 
 /// Returns the master key used to encrypt provider API keys and other

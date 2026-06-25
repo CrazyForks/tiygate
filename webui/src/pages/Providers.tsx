@@ -1,8 +1,8 @@
 import { useMemo, useRef, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Plus, Pencil, Trash2 } from "lucide-react";
-import { providersApi, providerCatalogApi } from "@/api/resources";
+import { Plus, Pencil, Trash2, ExternalLink, RefreshCw, Play, Copy } from "lucide-react";
+import { providersApi, providerCatalogApi, oauthApi } from "@/api/resources";
 import type {
   Provider,
   ProviderDeleteImpact,
@@ -34,6 +34,8 @@ import {
 } from "@/components/ui";
 import { PageHeader, fmtTime } from "@/components/PageHeader";
 import { cn } from "@/lib/cn";
+import { parseCallbackUrl } from "@/lib/oauth";
+import { openExternalUrl } from "@/lib/external-url";
 import { VendorIcon } from "@/lib/vendors";
 
 const AUTH_MODES = ["api_key", "oauth"];
@@ -119,6 +121,11 @@ function emptyForm(): FormState {
   };
 }
 
+function hasOAuthMeta(provider: Provider | null): boolean {
+  const meta = provider?.encrypted_oauth_meta?.trim() ?? "";
+  return meta !== "" && meta !== "[encrypted: <short>]";
+}
+
 export default function Providers() {
   const { t } = useTranslation();
   const qc = useQueryClient();
@@ -154,6 +161,12 @@ export default function Providers() {
   const [pendingDelete, setPendingDelete] = useState<PendingDeleteState | null>(
     null,
   );
+
+  // OAuth flow state (used inside the edit dialog when auth_mode=oauth).
+  const [oauthAuthUrl, setOauthAuthUrl] = useState<string | null>(null);
+  const [oauthCallbackUrl, setOauthCallbackUrl] = useState("");
+  const [oauthMessage, setOauthMessage] = useState<string | null>(null);
+  const [oauthError, setOauthError] = useState<string | null>(null);
 
   // Options for the vendor dropdown, sourced from the server catalog. When
   // editing a provider whose vendor is no longer in the catalog (server
@@ -196,13 +209,107 @@ export default function Providers() {
       input.id
         ? providersApi.update(input.id, input.body)
         : providersApi.create(input.body),
-    onSuccess: () => {
-      setModalOpen(false);
+    onSuccess: (savedProvider: Provider) => {
+      const isOAuth = savedProvider.auth_mode === "oauth";
+      if (isOAuth) {
+        // Keep the dialog open so the user can proceed with the OAuth
+        // authorization flow directly inside the dialog. Update `editing`
+        // to the freshly-saved provider so the panel has the real id and
+        // the latest encrypted_oauth_meta.
+        setEditing(savedProvider);
+        setForm((prev) => ({ ...prev, id: savedProvider.id }));
+        setFormError(null);
+      } else {
+        setModalOpen(false);
+      }
       toast.success(t("providers.saved"));
       void invalidateProviders();
     },
     onError: (e: Error) => setFormError(e.message),
   });
+
+  const oauthStartMutation = useMutation({
+    mutationFn: () => oauthApi.start(editing!.id),
+    onSuccess: (res) => {
+      setOauthError(null);
+      setOauthAuthUrl(res.url);
+      setOauthCallbackUrl("");
+      setOauthMessage(t("oauth.started"));
+    },
+    onError: (e: Error) => {
+      setOauthError(e.message);
+      setOauthAuthUrl(null);
+      setOauthMessage(null);
+    },
+  });
+
+  const oauthCallbackMutation = useMutation({
+    mutationFn: () => {
+      const parsed = parseCallbackUrl(oauthCallbackUrl);
+      if (!parsed) {
+        throw new Error(t("oauth.callbackUrlInvalid"));
+      }
+      return oauthApi.callback(parsed.code, parsed.state);
+    },
+    onSuccess: (res) => {
+      setOauthError(null);
+      const label = `${editing?.name ?? ""} (${res.provider_id})`;
+      setOauthMessage(t("oauth.callbackSuccess", { provider: label }));
+      toast.success(t("oauth.callbackSuccess", { provider: label }));
+      setOauthAuthUrl(null);
+      setOauthCallbackUrl("");
+      // Refresh provider data so encrypted_oauth_meta is up to date.
+      void invalidateProviders();
+      void providersApi
+        .get(res.provider_id)
+        .then((p) => setEditing(p))
+        .catch(() => {
+          /* leave editing as-is; list refetch covers the table */
+        });
+    },
+    onError: (e: Error) => {
+      setOauthError(e.message);
+      setOauthMessage(null);
+    },
+  });
+
+  const oauthRefreshMutation = useMutation({
+    mutationFn: () => oauthApi.refresh(editing!.id),
+    onSuccess: (res) => {
+      setOauthError(null);
+      const label = `${editing?.name ?? ""} (${res.provider_id})`;
+      setOauthMessage(t("oauth.refreshed", { provider: label }));
+      toast.success(t("oauth.refreshed", { provider: label }));
+    },
+    onError: (e: Error) => {
+      setOauthError(e.message);
+      setOauthMessage(null);
+    },
+  });
+
+  async function copyOauthUrl() {
+    if (!oauthAuthUrl) return;
+    try {
+      await navigator.clipboard.writeText(oauthAuthUrl);
+      toast.success(t("oauth.urlCopied"));
+    } catch {
+      toast.error(t("common.copyFailed"));
+    }
+  }
+
+  async function openOauthUrl() {
+    if (!oauthAuthUrl) return;
+    const opened = await openExternalUrl(oauthAuthUrl);
+    if (!opened) await copyOauthUrl();
+  }
+
+  /** Reset all OAuth dialog state when the dialog opens/closes. */
+  function resetOauthState() {
+    setOauthAuthUrl(null);
+    setOauthCallbackUrl("");
+    setOauthMessage(null);
+    setOauthError(null);
+  }
 
   const deleteMutation = useMutation({
     mutationFn: providersApi.remove,
@@ -221,6 +328,7 @@ export default function Providers() {
     setEditing(null);
     setForm(emptyForm());
     setFormError(null);
+    resetOauthState();
     setModalOpen(true);
   }
 
@@ -236,6 +344,7 @@ export default function Providers() {
       enabled: p.enabled,
     });
     setFormError(null);
+    resetOauthState();
     setModalOpen(true);
   }
 
@@ -568,6 +677,7 @@ export default function Providers() {
             <Select
               value={form.auth_mode}
               onValueChange={(v) => {
+                if (v !== "oauth") resetOauthState();
                 setForm({ ...form, auth_mode: v });
               }}
               ariaLabel={t("providers.authMode")}
@@ -585,7 +695,98 @@ export default function Providers() {
             />
           </Field>
           {form.auth_mode === "oauth" ? (
-            <Alert tone="info">{t("providers.oauthHint")}</Alert>
+            editing ? (
+              <div className="space-y-3 rounded-lg border border-border bg-surface-muted/40 p-4">
+                <div className="flex items-center justify-between">
+                  <span className="text-sm font-medium text-text">
+                    {t("providers.oauthPanel.title")}
+                  </span>
+                  {hasOAuthMeta(editing) ? (
+                    <Badge tone="success">
+                      {t("providers.oauthPanel.connected")}
+                    </Badge>
+                  ) : (
+                    <Badge tone="neutral">
+                      {t("providers.oauthPanel.notConnected")}
+                    </Badge>
+                  )}
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <Button
+                    variant="primary"
+                    icon={<Play size={16} />}
+                    loading={oauthStartMutation.isPending}
+                    onClick={() => oauthStartMutation.mutate()}
+                  >
+                    {t("providers.oauthPanel.start")}
+                  </Button>
+                  <Button
+                    variant="secondary"
+                    icon={<RefreshCw size={16} />}
+                    disabled={!hasOAuthMeta(editing)}
+                    loading={oauthRefreshMutation.isPending}
+                    onClick={() => oauthRefreshMutation.mutate()}
+                  >
+                    {t("providers.oauthPanel.refresh")}
+                  </Button>
+                </div>
+                {oauthError ? <ErrorBox message={oauthError} /> : null}
+                {oauthMessage ? (
+                  <Alert tone="success">{oauthMessage}</Alert>
+                ) : null}
+                {oauthAuthUrl ? (
+                  <Field label={t("providers.oauthPanel.authorizeUrl")}>
+                    <div className="space-y-2">
+                      <code className="block w-full break-all rounded-md bg-surface-muted px-3 py-2 font-mono text-xs text-text">
+                        {oauthAuthUrl}
+                      </code>
+                      <div className="flex flex-wrap gap-2">
+                        <Button
+                          variant="secondary"
+                          icon={<Copy size={14} />}
+                          onClick={copyOauthUrl}
+                        >
+                          {t("providers.oauthPanel.copyUrl")}
+                        </Button>
+                        <Button
+                          variant="accent"
+                          icon={<ExternalLink size={14} />}
+                          onClick={openOauthUrl}
+                        >
+                          {t("providers.oauthPanel.openUrl")}
+                        </Button>
+                      </div>
+                    </div>
+                  </Field>
+                ) : null}
+                {oauthAuthUrl ? (
+                  <Field label={t("providers.oauthPanel.callbackHint")}>
+                    <div className="space-y-2">
+                      <textarea
+                        className="min-h-[60px] w-full resize-y rounded-md border border-border bg-surface px-3 py-2 font-mono text-xs text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-primary/40"
+                        placeholder={t(
+                          "providers.oauthPanel.callbackUrlPlaceholder",
+                        )}
+                        value={oauthCallbackUrl}
+                        onChange={(e) => setOauthCallbackUrl(e.target.value)}
+                      />
+                      <Button
+                        variant="primary"
+                        disabled={!oauthCallbackUrl.trim()}
+                        loading={oauthCallbackMutation.isPending}
+                        onClick={() => oauthCallbackMutation.mutate()}
+                      >
+                        {t("providers.oauthPanel.submitCallback")}
+                      </Button>
+                    </div>
+                  </Field>
+                ) : null}
+              </div>
+            ) : (
+              <Alert tone="info">
+                {t("providers.oauthPanel.saveFirst")}
+              </Alert>
+            )
           ) : null}
           {form.auth_mode !== "oauth" ? (
             <Field

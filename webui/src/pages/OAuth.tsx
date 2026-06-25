@@ -1,8 +1,10 @@
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { ExternalLink, Info, RefreshCw, Play, Copy, ClipboardPaste } from "lucide-react";
+import { ExternalLink, Info, RefreshCw, Play, Copy } from "lucide-react";
 import { oauthApi, providersApi } from "@/api/resources";
+import { parseCallbackUrl } from "@/lib/oauth";
+import { openExternalUrl } from "@/lib/external-url";
 import {
   Button,
   Card,
@@ -94,14 +96,10 @@ export default function OAuth() {
     }
   }
 
-  async function pasteFromClipboard() {
-    try {
-      const text = await navigator.clipboard.readText();
-      setCallbackUrl(text.trim());
-      toast.success(t("oauth.callbackUrlPasted"));
-    } catch {
-      toast.error(t("oauth.callbackUrlPasteFailed"));
-    }
+  async function openUrl() {
+    if (!authUrl) return;
+    const opened = await openExternalUrl(authUrl);
+    if (!opened) await copyUrl();
   }
 
   // Only show OAuth-mode providers — others can't use the OAuth flow.
@@ -192,11 +190,11 @@ export default function OAuth() {
 
             {authUrl ? (
               <Field label={t("oauth.authorizeUrl")}>
-                <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-                  <code className="min-w-0 flex-1 break-all rounded-md bg-surface-muted px-3 py-2 font-mono text-xs text-text">
+                <div className="space-y-2">
+                  <code className="block w-full break-all rounded-md bg-surface-muted px-3 py-2 font-mono text-xs text-text">
                     {authUrl}
                   </code>
-                  <div className="flex gap-2">
+                  <div className="flex flex-wrap gap-2">
                     <Button
                       variant="secondary"
                       icon={<Copy size={14} />}
@@ -204,14 +202,13 @@ export default function OAuth() {
                     >
                       {t("oauth.copyUrl")}
                     </Button>
-                    <a href={authUrl} target="_blank" rel="noreferrer">
-                      <Button
-                        variant="accent"
-                        icon={<ExternalLink size={14} />}
-                      >
-                        {t("oauth.openUrl")}
-                      </Button>
-                    </a>
+                    <Button
+                      variant="accent"
+                      icon={<ExternalLink size={14} />}
+                      onClick={openUrl}
+                    >
+                      {t("oauth.openUrl")}
+                    </Button>
                   </div>
                 </div>
               </Field>
@@ -220,21 +217,12 @@ export default function OAuth() {
             {authUrl ? (
               <Field label={t("oauth.callbackHint")}>
                 <div className="space-y-2">
-                  <div className="flex items-start gap-2">
-                    <textarea
-                      className="min-h-[60px] min-w-0 flex-1 resize-y rounded-md border border-border bg-surface px-3 py-2 font-mono text-xs text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-primary/40"
-                      placeholder={t("oauth.callbackUrlPlaceholder")}
-                      value={callbackUrl}
-                      onChange={(e) => setCallbackUrl(e.target.value)}
-                    />
-                    <Button
-                      variant="secondary"
-                      icon={<ClipboardPaste size={14} />}
-                      onClick={pasteFromClipboard}
-                    >
-                      {t("oauth.pasteCallbackUrl")}
-                    </Button>
-                  </div>
+                  <textarea
+                    className="min-h-[60px] w-full resize-y rounded-md border border-border bg-surface px-3 py-2 font-mono text-xs text-text placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-primary/40"
+                    placeholder={t("oauth.callbackUrlPlaceholder")}
+                    value={callbackUrl}
+                    onChange={(e) => setCallbackUrl(e.target.value)}
+                  />
                   <Button
                     variant="primary"
                     disabled={!callbackUrl.trim()}
@@ -253,18 +241,3 @@ export default function OAuth() {
   );
 }
 
-/** Parse `code` and `state` from a pasted callback URL. Returns
- * `null` if either parameter is missing or the URL is malformed. */
-function parseCallbackUrl(raw: string): { code: string; state: string } | null {
-  const trimmed = raw.trim();
-  if (!trimmed) return null;
-  try {
-    const url = new URL(trimmed);
-    const code = url.searchParams.get("code");
-    const state = url.searchParams.get("state");
-    if (!code || !state) return null;
-    return { code, state };
-  } catch {
-    return null;
-  }
-}
