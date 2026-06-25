@@ -210,12 +210,11 @@ export default function Providers() {
         ? providersApi.update(input.id, input.body)
         : providersApi.create(input.body),
     onSuccess: (savedProvider: Provider) => {
-      const isOAuth = savedProvider.auth_mode === "oauth";
-      if (isOAuth) {
-        // Keep the dialog open so the user can proceed with the OAuth
-        // authorization flow directly inside the dialog. Update `editing`
-        // to the freshly-saved provider so the panel has the real id and
-        // the latest encrypted_oauth_meta.
+      const shouldKeepOpenForOAuth =
+        savedProvider.auth_mode === "oauth" && !hasOAuthMeta(savedProvider);
+      if (shouldKeepOpenForOAuth) {
+        // Keep the dialog open only when OAuth still needs authorization.
+        // Once encrypted_oauth_meta exists, saving behaves like normal edits.
         setEditing(savedProvider);
         setForm((prev) => ({ ...prev, id: savedProvider.id }));
         setFormError(null);
