@@ -91,6 +91,11 @@ export const oauthApi = {
       method: "POST",
       body: { provider_id: providerId },
     }),
+  callback: (code: string, state: string) =>
+    apiRequest<OAuthTokenResponse>("/oauth/callback", {
+      method: "POST",
+      body: { code, state },
+    }),
   refresh: (providerId: string) =>
     apiRequest<OAuthTokenResponse>("/oauth/refresh", {
       method: "POST",

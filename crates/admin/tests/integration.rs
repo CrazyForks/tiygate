@@ -725,22 +725,23 @@ async fn acceptance_10_admin_auth_rejects_wrong_token() {
 
 #[tokio::test]
 async fn oauth_routes_are_registered() {
-    // `GET /admin/v1/oauth/callback` must reject requests
-    // without a `state` query param (we surface a 400 from
-    // the missing-state branch via serde's Query extractor).
+    // `POST /admin/v1/oauth/callback` must reject requests
+    // with a malformed body (missing `state` field).
     let (router, _store, _pool) = boot_no_auth().await;
     let resp = router
         .oneshot(
             Request::builder()
-                .method("GET")
-                .uri("/admin/v1/oauth/callback?code=foo") // no `state`
-                .body(Body::empty())
+                .method("POST")
+                .uri("/admin/v1/oauth/callback")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"code": "foo"})).expect("encode"),
+                ))
                 .expect("req"),
         )
         .await
         .expect("resp");
-    // Missing `state` is a 4xx from the axum Query extractor
-    // (the handler signature requires both `code` and `state`).
+    // Missing `state` is a 4xx from serde's JSON deserializer.
     assert!(
         resp.status().is_client_error(),
         "expected 4xx for missing state, got {}",
@@ -776,9 +777,12 @@ async fn oauth_callback_rejects_unknown_state() {
     let resp = router
         .oneshot(
             Request::builder()
-                .method("GET")
-                .uri("/admin/v1/oauth/callback?code=foo&state=ghost")
-                .body(Body::empty())
+                .method("POST")
+                .uri("/admin/v1/oauth/callback")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"code": "foo", "state": "ghost"})).expect("encode"),
+                ))
                 .expect("req"),
         )
         .await

@@ -199,3 +199,4 @@ install-tools: ## 安装常用开发工具(rustfmt/clippy/llvm-cov/watch)
 	-$(CARGO) install cargo-llvm-cov --locked
 	-$(CARGO) install cargo-watch --locked
 	-$(CARGO) install cargo-audit --locked
+	-$(CARGO) install tauri-cli --locked
