@@ -65,7 +65,21 @@ pub enum StreamPart {
     /// An incremental text delta.
     TextDelta { text: String },
     /// An incremental reasoning/thinking delta.
-    ReasoningDelta { text: String },
+    ReasoningDelta {
+        text: String,
+        /// Provider-issued reasoning item id (e.g. OpenAI Responses `rs_...`),
+        /// surfaced during streaming so it survives to the stream boundary and
+        /// can be replayed on later turns. `None` for protocols that do not
+        /// carry a streaming reasoning id.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        /// Encrypted reasoning content streamed alongside the delta (e.g.
+        /// OpenAI Responses `reasoning.encrypted_content` carried on the
+        /// reasoning output item). Must be replayed verbatim on subsequent
+        /// turns; `None` for plain-text streaming reasoning.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        encrypted_content: Option<String>,
+    },
     /// A tool call being built incrementally.
     ToolCallDelta {
         id: String,
@@ -156,12 +170,24 @@ pub enum Content {
         id: String,
         name: String,
         arguments: serde_json::Value,
+        /// Responses-specific `call_id` that is distinct from the item `id`.
+        /// When present, `id` is the item reference (e.g. `fc_xxx`) and
+        /// `call_id` is the function-call identifier (e.g. `call_xxx`).
+        /// When absent, `id` serves both roles (Chat Completions, Messages,
+        /// Gemini all use a single identifier).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
     },
     /// A tool result provided by the user/system.
     ToolResult {
         tool_call_id: String,
         name: String,
         content: String,
+        /// Responses-specific item reference id for `function_call_output`.
+        /// Required by the Responses HTTP API so each output item has a
+        /// unique id that can be matched via `item_reference`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
     },
     /// A refusal from the model (OpenAI `message.refusal`, Responses
     /// `refusal` output item, Anthropic `stop_reason:"refusal"`).
@@ -329,6 +355,11 @@ pub struct ThinkingConfig {
     /// `includeThoughts`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub include_thoughts: Option<bool>,
+    /// Reasoning summary mode (OpenAI Responses `reasoning.summary`,
+    /// e.g. "auto"). Controls whether the API returns a human-readable
+    /// summary of the reasoning alongside encrypted content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
 }
 
 impl ThinkingConfig {

@@ -109,6 +109,7 @@ impl EndpointCodec for ChatCompletionsCodec {
                             tool_call_id: msg["tool_call_id"].as_str().unwrap_or("").to_string(),
                             name: msg["name"].as_str().unwrap_or("").to_string(),
                             content: msg["content"].as_str().unwrap_or("").to_string(),
+                            id: None,
                         }]
                     }
                 } else if let Some(text) = msg["content"].as_str() {
@@ -174,6 +175,7 @@ impl EndpointCodec for ChatCompletionsCodec {
                             id: tc["id"].as_str().unwrap_or("").to_string(),
                             name: tc["function"]["name"].as_str().unwrap_or("").to_string(),
                             arguments,
+                            call_id: None,
                         });
                     }
                 }
@@ -423,6 +425,7 @@ impl EndpointCodec for ChatCompletionsCodec {
                     id,
                     name,
                     arguments,
+                    ..
                 } => {
                     tool_calls_json.push(json!({
                         "id": id,
@@ -571,6 +574,7 @@ impl EndpointCodec for ChatCompletionsCodec {
                         id,
                         name,
                         arguments,
+                        ..
                     } => {
                         // Re-emit the tool call on the assistant message so the
                         // downstream API sees a self-consistent turn.
@@ -620,6 +624,7 @@ impl EndpointCodec for ChatCompletionsCodec {
                         tool_call_id,
                         name: _,
                         content,
+                        ..
                     } => {
                         // Tool results are a separate message in OpenAI format;
                         // emit them as their own {role:"tool", tool_call_id, content}
@@ -887,6 +892,7 @@ impl EndpointCodec for ChatCompletionsCodec {
                             id: tc["id"].as_str().unwrap_or("").to_string(),
                             name: tc["function"]["name"].as_str().unwrap_or("").to_string(),
                             arguments: args,
+                            call_id: None,
                         });
                     }
                 }
@@ -957,24 +963,35 @@ impl EndpointCodec for ChatCompletionsCodec {
                 })
         };
 
-        let usage = body.get("usage").map(|u| {
-            let cache_read = u["prompt_tokens_details"]["cached_tokens"].as_u64();
-            // OpenAI's `prompt_tokens` INCLUDES the cached portion. The IR
-            // convention is that `prompt_tokens` is the NON-cached prompt and
-            // cache lives in its own bucket, so subtract the cache here. This
-            // prevents double-counting when the IR is later re-encoded to a
-            // protocol whose encoder adds the cache back into prompt_tokens.
-            let raw_prompt = u["prompt_tokens"].as_u64().unwrap_or(0);
-            let prompt_excl_cache = raw_prompt.saturating_sub(cache_read.unwrap_or(0));
-            Usage {
-                prompt_tokens: prompt_excl_cache,
-                completion_tokens: u["completion_tokens"].as_u64().unwrap_or(0),
-                total_tokens: u["total_tokens"].as_u64().unwrap_or(0),
-                reasoning_tokens: u["completion_tokens_details"]["reasoning_tokens"].as_u64(),
-                cache_read_tokens: cache_read,
-                ..Default::default()
-            }
-        });
+        // Guard against `"usage": null` — `body.get("usage")` returns
+        // `Some(Value::Null)` for null, which would produce a zero-valued
+        // `Usage` and shadow real usage on cross-protocol re-encode.
+        let usage = body
+            .get("usage")
+            .filter(|u| {
+                u.is_object()
+                    && (u["prompt_tokens"].is_u64()
+                        || u["completion_tokens"].is_u64()
+                        || u["total_tokens"].is_u64())
+            })
+            .map(|u| {
+                let cache_read = u["prompt_tokens_details"]["cached_tokens"].as_u64();
+                // OpenAI's `prompt_tokens` INCLUDES the cached portion. The IR
+                // convention is that `prompt_tokens` is the NON-cached prompt and
+                // cache lives in its own bucket, so subtract the cache here. This
+                // prevents double-counting when the IR is later re-encoded to a
+                // protocol whose encoder adds the cache back into prompt_tokens.
+                let raw_prompt = u["prompt_tokens"].as_u64().unwrap_or(0);
+                let prompt_excl_cache = raw_prompt.saturating_sub(cache_read.unwrap_or(0));
+                Usage {
+                    prompt_tokens: prompt_excl_cache,
+                    completion_tokens: u["completion_tokens"].as_u64().unwrap_or(0),
+                    total_tokens: u["total_tokens"].as_u64().unwrap_or(0),
+                    reasoning_tokens: u["completion_tokens_details"]["reasoning_tokens"].as_u64(),
+                    cache_read_tokens: cache_read,
+                    ..Default::default()
+                }
+            });
 
         Ok(IrResponse {
             content,
@@ -1050,7 +1067,7 @@ impl StreamEncoder for ChatCompletionsStreamEncoder {
                     })
                 )
             }
-            StreamPart::ReasoningDelta { text } => {
+            StreamPart::ReasoningDelta { text, .. } => {
                 // Deepseek thinking mode streams the CoT as `reasoning_content`
                 // in the SSE delta. Other OpenAI-compatible providers may use
                 // a different field; we always emit `reasoning_content` so
@@ -1334,12 +1351,16 @@ impl StreamDecoder for ChatCompletionsStreamDecoder {
                             if !text.is_empty() {
                                 parts.push(StreamPart::ReasoningDelta {
                                     text: text.to_string(),
+                                    id: None,
+                                    encrypted_content: None,
                                 });
                             }
                         } else if let Some(reasoning) = delta.get("reasoning_details") {
                             if let Some(text) = reasoning["text"].as_str() {
                                 parts.push(StreamPart::ReasoningDelta {
                                     text: text.to_string(),
+                                    id: None,
+                                    encrypted_content: None,
                                 });
                             }
                         }
@@ -1426,29 +1447,43 @@ impl StreamDecoder for ChatCompletionsStreamDecoder {
                     }
                 }
 
-                // Usage
+                // Usage — guard against `"usage": null` which OpenAI sends on
+                // every non-final chunk when `stream_options.include_usage` is
+                // true.  `chunk.get("usage")` returns `Some(Value::Null)` for
+                // null, so without an object + token-field check we would push
+                // a zero-valued `Usage` part that poisons cross-protocol
+                // encoders (e.g. Responses defers completed on the first
+                // non-null usage, emitting all-zeros before real usage arrives).
                 if let Some(usage) = chunk.get("usage") {
-                    let raw_prompt = usage["prompt_tokens"].as_u64().unwrap_or(0);
-                    let completion = usage["completion_tokens"].as_u64().unwrap_or(0);
-                    let total = usage["total_tokens"]
-                        .as_u64()
-                        .unwrap_or(raw_prompt + completion);
-                    let cache_read = usage["prompt_tokens_details"]["cached_tokens"].as_u64();
-                    let reasoning = usage["completion_tokens_details"]["reasoning_tokens"].as_u64();
-                    // OpenAI's prompt_tokens includes cache; the IR convention
-                    // keeps prompt_tokens cache-free. Subtract to avoid double
-                    // counting on re-encode.
-                    let prompt = raw_prompt.saturating_sub(cache_read.unwrap_or(0));
-                    parts.push(StreamPart::Usage {
-                        usage: Usage {
-                            prompt_tokens: prompt,
-                            completion_tokens: completion,
-                            total_tokens: total,
-                            reasoning_tokens: reasoning,
-                            cache_read_tokens: cache_read,
-                            ..Default::default()
-                        },
-                    });
+                    if usage.is_object()
+                        && (usage["prompt_tokens"].is_u64()
+                            || usage["completion_tokens"].is_u64()
+                            || usage["total_tokens"].is_u64())
+                    {
+                        let raw_prompt = usage["prompt_tokens"].as_u64().unwrap_or(0);
+                        let completion = usage["completion_tokens"].as_u64().unwrap_or(0);
+                        let total = usage["total_tokens"]
+                            .as_u64()
+                            .unwrap_or(raw_prompt + completion);
+                        let cache_read =
+                            usage["prompt_tokens_details"]["cached_tokens"].as_u64();
+                        let reasoning = usage["completion_tokens_details"]["reasoning_tokens"]
+                            .as_u64();
+                        // OpenAI's prompt_tokens includes cache; the IR convention
+                        // keeps prompt_tokens cache-free. Subtract to avoid double
+                        // counting on re-encode.
+                        let prompt = raw_prompt.saturating_sub(cache_read.unwrap_or(0));
+                        parts.push(StreamPart::Usage {
+                            usage: Usage {
+                                prompt_tokens: prompt,
+                                completion_tokens: completion,
+                                total_tokens: total,
+                                reasoning_tokens: reasoning,
+                                cache_read_tokens: cache_read,
+                                ..Default::default()
+                            },
+                        });
+                    }
                 }
 
                 // OpenAI-compatible providers often put `finish_reason` and
@@ -1526,6 +1561,7 @@ fn parse_content_array(arr: &[Value], role: &Role) -> Vec<Content> {
                         tool_call_id: item["tool_call_id"].as_str().unwrap_or("").to_string(),
                         name: String::new(),
                         content: item["content"].as_str().unwrap_or("").to_string(),
+                        id: None,
                     }
                 } else {
                     Content::Text {
@@ -1844,6 +1880,7 @@ mod tests {
                 id: "call_1".to_string(),
                 name: "get_weather".to_string(),
                 arguments: json!({"city": "London"}),
+                call_id: None,
             }],
             usage: None,
             finish_reason: Some(FinishReason::ToolCalls),
@@ -1882,6 +1919,8 @@ mod tests {
             },
             StreamPart::ReasoningDelta {
                 text: "think".to_string(),
+                id: None,
+                encrypted_content: None,
             },
             StreamPart::ToolCallDelta {
                 id: "tc1".to_string(),
@@ -2174,6 +2213,7 @@ mod tests {
                             id: "call_1".to_string(),
                             name: "get_weather".to_string(),
                             arguments: json!({"city": "杭州"}),
+                            call_id: None,
                         },
                     ],
                 },
@@ -2183,6 +2223,7 @@ mod tests {
                         tool_call_id: "call_1".to_string(),
                         name: "get_weather".to_string(),
                         content: "sunny".to_string(),
+                        id: None,
                     }],
                 },
                 // 纯文本轮:reasoning_content 应丢弃
@@ -2252,7 +2293,7 @@ mod tests {
         let rc_text: String = parts
             .iter()
             .filter_map(|p| match p {
-                StreamPart::ReasoningDelta { text } => Some(text.clone()),
+                StreamPart::ReasoningDelta { text, .. } => Some(text.clone()),
                 _ => None,
             })
             .collect();
@@ -2269,7 +2310,7 @@ mod tests {
         let r_text: String = parts2
             .iter()
             .filter_map(|p| match p {
-                StreamPart::ReasoningDelta { text } => Some(text.clone()),
+                StreamPart::ReasoningDelta { text, .. } => Some(text.clone()),
                 _ => None,
             })
             .collect();
@@ -2286,7 +2327,7 @@ mod tests {
         let empty_text: String = parts3
             .iter()
             .filter_map(|p| match p {
-                StreamPart::ReasoningDelta { text } => Some(text.clone()),
+                StreamPart::ReasoningDelta { text, .. } => Some(text.clone()),
                 _ => None,
             })
             .collect();
@@ -2303,10 +2344,73 @@ mod tests {
         let prio_text: String = parts4
             .iter()
             .filter_map(|p| match p {
-                StreamPart::ReasoningDelta { text } => Some(text.clone()),
+                StreamPart::ReasoningDelta { text, .. } => Some(text.clone()),
                 _ => None,
             })
             .collect();
         assert_eq!(prio_text, "primary", "reasoning_content 应优先于 reasoning");
+    }
+
+    /// 回归:`"usage": null` 出现在非最终 chunk 时,解码器不得产出
+    /// `StreamPart::Usage`。OpenAI 兼容流在 `include_usage: true` 时每个
+    /// 中间 chunk 都带 `usage: null`,若不守卫则生成全零 Usage,在跨协议
+    /// 转码(chat → responses)时提前触发 `response.completed` 并丢弃后续
+    /// 真实 usage。
+    #[test]
+    fn test_stream_decoder_null_usage_does_not_emit_usage_part() {
+        let mut dec = ChatCompletionsStreamDecoder::new();
+
+        // 1. 内容 chunk 带 `"usage": null` — 不应产出 Usage
+        let parts = dec
+            .feed(r#"data: {"id":"r1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"hi"}}],"usage":null}"#)
+            .unwrap();
+        let has_usage = parts.iter().any(|p| matches!(p, StreamPart::Usage { .. }));
+        assert!(
+            !has_usage,
+            "null usage must not produce StreamPart::Usage"
+        );
+
+        // 2. finish chunk 带 `"usage": null` — 仍不应产出 Usage
+        let parts = dec
+            .feed(r#"data: {"id":"r1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":null}"#)
+            .unwrap();
+        let has_usage = parts.iter().any(|p| matches!(p, StreamPart::Usage { .. }));
+        assert!(
+            !has_usage,
+            "null usage on finish chunk must not produce StreamPart::Usage"
+        );
+
+        // 3. 真实 usage chunk — 必须产出 Usage 且值正确
+        let parts = dec
+            .feed(r#"data: {"id":"r1","object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":77200,"completion_tokens":28,"total_tokens":77228,"prompt_tokens_details":{"cached_tokens":76937}}}"#)
+            .unwrap();
+        let usage_part = parts.iter().find_map(|p| match p {
+            StreamPart::Usage { usage } => Some(usage),
+            _ => None,
+        });
+        let usage = usage_part.expect("real usage chunk must produce StreamPart::Usage");
+        assert_eq!(usage.prompt_tokens, 263); // 77200 - 76937
+        assert_eq!(usage.completion_tokens, 28);
+        assert_eq!(usage.total_tokens, 77228);
+        assert_eq!(usage.cache_read_tokens, Some(76937));
+    }
+
+    /// 非流式 `decode_response` 对 `"usage": null` 应返回 `None`,
+    /// 而非全零 `Some(Usage::default())`。
+    #[test]
+    fn test_decode_response_null_usage_returns_none() {
+        let codec = ChatCompletionsCodec::new();
+        let body = serde_json::json!({
+            "id": "r1",
+            "object": "chat.completion",
+            "model": "test-model",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+            "usage": null
+        });
+        let ir = codec.decode_response(body).unwrap();
+        assert!(
+            ir.usage.is_none(),
+            "null usage must decode to None, not a zero-valued Usage"
+        );
     }
 }

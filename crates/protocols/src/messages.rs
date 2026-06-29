@@ -180,6 +180,7 @@ impl EndpointCodec for MessagesCodec {
                                     } else {
                                         block["input"].clone()
                                     },
+                                    call_id: None,
                                 });
                             }
                             Some("tool_result") => {
@@ -190,6 +191,7 @@ impl EndpointCodec for MessagesCodec {
                                         .to_string(),
                                     name: String::new(),
                                     content: flatten_anthropic_content(&block["content"]),
+                                    id: None,
                                 });
                             }
                             Some("image") => {
@@ -301,6 +303,7 @@ impl EndpointCodec for MessagesCodec {
                         budget_tokens,
                         display,
                         include_thoughts,
+                        summary: None,
                     })
                 }
             }),
@@ -396,6 +399,7 @@ impl EndpointCodec for MessagesCodec {
                     id,
                     name,
                     arguments,
+                    ..
                 } => {
                     content_blocks.push(json!({
                         "type": "tool_use",
@@ -543,6 +547,7 @@ impl EndpointCodec for MessagesCodec {
                         id,
                         name,
                         arguments,
+                        ..
                     } => Some(
                         json!({"type": "tool_use", "id": id, "name": name, "input": arguments}),
                     ),
@@ -550,6 +555,7 @@ impl EndpointCodec for MessagesCodec {
                         tool_call_id,
                         name: _,
                         content,
+                        ..
                     } => Some(json!({
                         "type": "tool_result",
                         "tool_use_id": tool_call_id,
@@ -792,6 +798,7 @@ impl EndpointCodec for MessagesCodec {
                             id: block["id"].as_str().unwrap_or("").to_string(),
                             name: block["name"].as_str().unwrap_or("").to_string(),
                             arguments: block["input"].clone(),
+                            call_id: None,
                         });
                     }
                     _ => {}
@@ -1025,7 +1032,7 @@ impl StreamEncoder for MessagesStreamEncoder {
                 ));
                 out
             }
-            StreamPart::ReasoningDelta { text } => {
+            StreamPart::ReasoningDelta { text, .. } => {
                 let mut out =
                     self.ensure_block("thinking", json!({"type": "thinking", "thinking": ""}));
                 let idx = self.current_index.unwrap_or(0);
@@ -1322,6 +1329,8 @@ impl StreamDecoder for MessagesStreamDecoder {
                         if let Some(thinking) = block["thinking"].as_str() {
                             parts.push(StreamPart::ReasoningDelta {
                                 text: thinking.to_string(),
+                                id: None,
+                                encrypted_content: None,
                             });
                         }
                     }
@@ -1354,6 +1363,8 @@ impl StreamDecoder for MessagesStreamDecoder {
                         if let Some(thinking) = delta["thinking"].as_str() {
                             parts.push(StreamPart::ReasoningDelta {
                                 text: thinking.to_string(),
+                                id: None,
+                                encrypted_content: None,
                             });
                         }
                     }
@@ -1768,6 +1779,7 @@ mod tests {
                 id: "toolu_1".to_string(),
                 name: "get_weather".to_string(),
                 arguments: json!({"city": "London"}),
+                call_id: None,
             }],
             usage: None,
             finish_reason: Some(FinishReason::ToolCalls),
@@ -1805,6 +1817,8 @@ mod tests {
             },
             StreamPart::ReasoningDelta {
                 text: "think".to_string(),
+                id: None,
+                encrypted_content: None,
             },
             StreamPart::ToolCallDelta {
                 id: "tc1".to_string(),
@@ -1935,6 +1949,7 @@ mod tests {
                         id: "t1".to_string(),
                         name: "f".to_string(),
                         arguments: json!({}),
+                        call_id: None,
                     }],
                 },
                 Message {
@@ -1943,6 +1958,7 @@ mod tests {
                         tool_call_id: "t1".to_string(),
                         name: "f".to_string(),
                         content: "r1".to_string(),
+                        id: None,
                     }],
                 },
                 Message {
@@ -1951,6 +1967,7 @@ mod tests {
                         tool_call_id: "t2".to_string(),
                         name: "f".to_string(),
                         content: "r2".to_string(),
+                        id: None,
                     }],
                 },
             ],

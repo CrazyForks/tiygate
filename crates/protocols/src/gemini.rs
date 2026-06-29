@@ -382,6 +382,7 @@ impl EndpointCodec for GeminiCodec {
                                     .unwrap_or_else(|| synth_gemini_call_id(&name)),
                                 name,
                                 arguments: fc["args"].clone(),
+                                call_id: None,
                             });
                         } else if let Some(fr) = part.get("functionResponse") {
                             let name = fr["name"].as_str().unwrap_or("").to_string();
@@ -396,6 +397,7 @@ impl EndpointCodec for GeminiCodec {
                                     .as_object()
                                     .map(|o| serde_json::to_string(o).unwrap_or_default())
                                     .unwrap_or_default(),
+                                id: None,
                             });
                         } else if let Some(id) = part.get("inlineData") {
                             cp.push(Content::Media {
@@ -505,6 +507,7 @@ impl EndpointCodec for GeminiCodec {
                     budget_tokens,
                     effort,
                     display,
+                    summary: None,
                 })
             }
         });
@@ -615,6 +618,7 @@ impl EndpointCodec for GeminiCodec {
                     id: _,
                     name,
                     arguments,
+                    ..
                 } => {
                     parts.push(json!({"functionCall": {"name": name, "args": arguments}}));
                 }
@@ -702,6 +706,7 @@ impl EndpointCodec for GeminiCodec {
                         id: _,
                         name,
                         arguments,
+                        ..
                     } => {
                         let mut part = json!({"functionCall": {"name": name, "args": arguments}});
                         // Replay the next stashed thoughtSignature, if any.
@@ -723,6 +728,7 @@ impl EndpointCodec for GeminiCodec {
                         tool_call_id,
                         name,
                         content,
+                        ..
                     } => {
                         let response_obj: Value =
                             serde_json::from_str(content).unwrap_or(json!({"output": content}));
@@ -1011,6 +1017,7 @@ impl EndpointCodec for GeminiCodec {
                                     id,
                                     name,
                                     arguments: fc["args"].clone(),
+                                    call_id: None,
                                 });
                             }
                         }
@@ -1153,7 +1160,7 @@ impl StreamEncoder for GeminiStreamEncoder {
                 "data: {}\n\n",
                 json!({"candidates": [{"content": {"role": "model", "parts": [{"text": text}]}}]})
             ),
-            StreamPart::ReasoningDelta { text } => format!(
+            StreamPart::ReasoningDelta { text, .. } => format!(
                 "data: {}\n\n",
                 json!({"candidates": [{"content": {"parts": [{"text": text, "thought": true}]}}]})
             ),
@@ -1335,6 +1342,8 @@ impl StreamDecoder for GeminiStreamDecoder {
                             if let Some(text) = p["text"].as_str() {
                                 parts.push(StreamPart::ReasoningDelta {
                                     text: text.to_string(),
+                                    id: None,
+                                    encrypted_content: None,
                                 });
                             }
                         } else {
@@ -1349,6 +1358,8 @@ impl StreamDecoder for GeminiStreamDecoder {
                             {
                                 parts.push(StreamPart::ReasoningDelta {
                                     text: t.to_string(),
+                                    id: None,
+                                    encrypted_content: None,
                                 });
                             }
                         }
@@ -1550,6 +1561,8 @@ mod tests {
             },
             StreamPart::ReasoningDelta {
                 text: "think".to_string(),
+                id: None,
+                encrypted_content: None,
             },
             StreamPart::ToolCallDelta {
                 id: "t1".to_string(),
@@ -1837,6 +1850,7 @@ mod tests {
                     id: "call_1".to_string(),
                     name: "get_weather".to_string(),
                     arguments: json!({"city": "London"}),
+                    call_id: None,
                 }],
             }],
             tools: vec![],
@@ -1870,6 +1884,7 @@ mod tests {
                     id: "call_1".to_string(),
                     name: "get_weather".to_string(),
                     arguments: json!({}),
+                    call_id: None,
                 }],
             }],
             tools: vec![],
