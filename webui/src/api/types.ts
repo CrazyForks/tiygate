@@ -6,6 +6,7 @@ export interface Provider {
   name: string;
   vendor: string;
   api_base: string;
+  models_endpoint: string;
   auth_mode: string;
   encrypted_api_key: string;
   encrypted_oauth_meta: string;
@@ -20,6 +21,7 @@ export interface ProviderInput {
   name: string;
   vendor: string;
   api_base: string;
+  models_endpoint?: string;
   api_key?: string;
   auth_mode?: string;
   oauth_meta?: string;
@@ -43,6 +45,14 @@ export interface ProviderDeleteImpact {
   routes: ProviderDeleteImpactRoute[];
 }
 
+export interface ProviderModelEntry {
+  id: string;
+}
+
+export interface ProviderModelsResponse {
+  models: ProviderModelEntry[];
+}
+
 export interface ProviderCatalogEntry {
   id: string;
   display_name: string;
@@ -62,10 +72,7 @@ export interface ModelCatalogStatus {
  *  (snake_case). `undefined`/absent means the route inherits the gateway-wide
  *  default strategy. */
 export type RoutingStrategyName =
-  | "weighted"
-  | "priority"
-  | "cooldown"
-  | "latency";
+  "weighted" | "priority" | "cooldown" | "latency";
 
 export interface RouteTarget {
   provider_id: string;
@@ -327,6 +334,7 @@ export interface ExportProvider {
   name: string;
   vendor: string;
   api_base: string;
+  models_endpoint: string;
   encrypted_api_key: string;
   auth_mode: string;
   encrypted_oauth_meta: string;

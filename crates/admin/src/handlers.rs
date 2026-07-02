@@ -86,7 +86,231 @@ pub fn router() -> Router<AdminState> {
             "/admin/v1/settings",
             get(list_settings).put(update_settings),
         )
+        .route("/admin/v1/providers/:id/models", get(list_provider_models))
         .route("/admin/v1/info", get(info))
+}
+
+// ---- provider model discovery ----
+
+#[derive(Debug, Serialize)]
+struct ProviderModelEntry {
+    id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ProviderModelsResponse {
+    models: Vec<ProviderModelEntry>,
+}
+
+/// Discover models available on a provider's upstream API.
+///
+/// Calls the provider's `models_endpoint` (or falls back to
+/// `api_base + /models`) to list available models. The response is
+/// normalized to `{ models: [{ id }] }` regardless of upstream format
+/// (OpenAI `data[].id`, Gemini `models[].name`, or generic
+/// `models[].id`). Any error — network, timeout, non-2xx, parse
+/// failure — is logged and returns an empty list with HTTP 200 so the
+/// UI silently degrades to a plain input.
+async fn list_provider_models(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> Result<Response, AdminError> {
+    // Read the provider from the DB first, then try to get the
+    // decrypted API key from the in-memory snapshot (populated by
+    // `DbConfigStore::refresh()`). If the snapshot does not have it
+    // (e.g. no master key configured), fall back to the encrypted
+    // column as-is (cleartext-fallback mode).
+    let provider = state
+        .store
+        .get_provider(&id)
+        .await?
+        .ok_or_else(|| AdminError::NotFound(format!("provider {id}")))?;
+
+    let api_key = if let Some(snap) = state.store.snapshot().snapshot() {
+        snap.providers
+            .get(&id)
+            .and_then(|p| p.api_key_cleartext.clone())
+    } else {
+        None
+    }
+    .unwrap_or_else(|| {
+        // No master key configured: the encrypted column holds the
+        // cleartext verbatim.
+        if provider.encrypted_api_key.is_empty() {
+            String::new()
+        } else {
+            provider.encrypted_api_key.clone()
+        }
+    });
+
+    // Resolve the discovery URL.
+    let url = if !provider.models_endpoint.is_empty() {
+        provider.models_endpoint.clone()
+    } else {
+        format!("{}/models", provider.api_base.trim_end_matches('/'))
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| AdminError::Internal(format!("http client build: {e}")))?;
+
+    let mut req = client.get(&url);
+
+    // For OAuth-mode providers, obtain an access token via the
+    // process-global OAuthTokenCache instead of using a static API
+    // key (which is empty for OAuth providers).
+    if matches!(provider.auth_mode, tiygate_store::models::AuthMode::OAuth) {
+        let cache = tiygate_auth::provider_oauth::OAuthTokenCache::global();
+        // Build the OAuth target config from the provider's
+        // metadata + decrypted refresh token.
+        if let Some(oauth_config) =
+            tiygate_store::config_store::build_oauth_target_config(&provider)
+        {
+            // The cache is keyed by "{provider_id}:{label}".
+            // Model discovery is not tied to a specific route
+            // target, so we use a synthetic label.
+            let label = "__model_discovery__";
+            cache.seed(&id, label, &oauth_config.refresh_token);
+
+            let mut headers = reqwest::header::HeaderMap::new();
+            match cache
+                .apply(&mut headers, &id, label, &oauth_config, &client)
+                .await
+            {
+                Ok(()) => {
+                    // Merge the injected headers into the reqwest
+                    // request builder.
+                    for (name, value) in headers.iter() {
+                        if let Ok(v) = reqwest::header::HeaderValue::from_bytes(value.as_bytes()) {
+                            req = req.header(name.as_str(), v);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        provider = %id,
+                        error = %e,
+                        "OAuth token refresh failed for model discovery; \
+                         returning empty list"
+                    );
+                    return Ok(Json(ProviderModelsResponse { models: vec![] }).into_response());
+                }
+            }
+        } else {
+            tracing::warn!(
+                provider = %id,
+                "OAuth provider missing OAuth config for model discovery; \
+                 returning empty list"
+            );
+            return Ok(Json(ProviderModelsResponse { models: vec![] }).into_response());
+        }
+    } else if !api_key.is_empty() {
+        req = req.bearer_auth(&api_key);
+    }
+
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(
+                provider = %id,
+                url = %url,
+                error = %e,
+                "provider model discovery request failed; returning empty list"
+            );
+            return Ok(Json(ProviderModelsResponse { models: vec![] }).into_response());
+        }
+    };
+
+    if !resp.status().is_success() {
+        tracing::warn!(
+            provider = %id,
+            url = %url,
+            status = %resp.status(),
+            "provider model discovery returned non-2xx; returning empty list"
+        );
+        return Ok(Json(ProviderModelsResponse { models: vec![] }).into_response());
+    }
+
+    let body: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                provider = %id,
+                url = %url,
+                error = %e,
+                "provider model discovery response parse failed; returning empty list"
+            );
+            return Ok(Json(ProviderModelsResponse { models: vec![] }).into_response());
+        }
+    };
+
+    let models = parse_model_list(&body);
+    Ok(Json(ProviderModelsResponse { models }).into_response())
+}
+
+/// Normalize upstream model-list responses into a sorted list of
+/// `ProviderModelEntry`. Supports:
+/// - OpenAI: `{ "data": [{ "id": "gpt-4o", ... }] }`
+/// - Gemini: `{ "models": [{ "name": "models/gemini-pro", ... }] }`
+/// - Generic: `{ "models": [{ "id": "..." }] }`
+fn parse_model_list(body: &serde_json::Value) -> Vec<ProviderModelEntry> {
+    let mut ids: Vec<String> = Vec::new();
+
+    // OpenAI format: data[].id
+    if let Some(data) = body.get("data").and_then(|d| d.as_array()) {
+        for item in data {
+            if let Some(id) = item.get("id").and_then(|i| i.as_str()) {
+                if !id.is_empty() {
+                    ids.push(id.to_string());
+                }
+            }
+        }
+    }
+
+    // Gemini / generic format: models[].name or models[].id
+    if ids.is_empty() {
+        if let Some(models) = body.get("models").and_then(|m| m.as_array()) {
+            for item in models {
+                // Gemini uses "name" with a "models/" prefix
+                if let Some(name) = item.get("name").and_then(|n| n.as_str()) {
+                    let id = name.strip_prefix("models/").unwrap_or(name);
+                    if !id.is_empty() {
+                        ids.push(id.to_string());
+                    }
+                } else if let Some(id) = item.get("id").and_then(|i| i.as_str()) {
+                    if !id.is_empty() {
+                        ids.push(id.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: if neither data[] nor models[] matched, try to find
+    // any array of objects with an "id" field at the top level.
+    if ids.is_empty() {
+        if let Some(obj) = body.as_object() {
+            for (_key, val) in obj {
+                if let Some(arr) = val.as_array() {
+                    for item in arr {
+                        if let Some(id) = item.get("id").and_then(|i| i.as_str()) {
+                            if !id.is_empty() {
+                                ids.push(id.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    ids.sort();
+    ids.dedup();
+    ids.into_iter()
+        .map(|id| ProviderModelEntry { id })
+        .collect()
 }
 
 // ---- health ----
@@ -121,6 +345,7 @@ fn provider_snapshot(p: &Provider) -> serde_json::Value {
         "name": p.name,
         "vendor": p.vendor,
         "api_base": p.api_base,
+        "models_endpoint": p.models_endpoint,
         "auth_mode": p.auth_mode.as_str(),
         "enabled": p.enabled,
         "metadata": p.metadata_json,
@@ -210,6 +435,7 @@ struct ProviderRequest {
     name: String,
     vendor: String,
     api_base: String,
+    models_endpoint: Option<String>,
     api_key: Option<String>,
     auth_mode: Option<String>,
     oauth_meta: Option<String>,
@@ -223,6 +449,7 @@ struct ProviderView {
     name: String,
     vendor: String,
     api_base: String,
+    models_endpoint: String,
     auth_mode: String,
     encrypted_api_key: String,
     encrypted_oauth_meta: String,
@@ -239,6 +466,7 @@ impl From<Provider> for ProviderView {
             name: p.name,
             vendor: p.vendor,
             api_base: p.api_base,
+            models_endpoint: p.models_endpoint,
             auth_mode: p.auth_mode.as_str().to_string(),
             encrypted_api_key: tiygate_store::encryption::KeyEncryption::redact(
                 &p.encrypted_api_key,
@@ -301,6 +529,7 @@ async fn create_provider(
             &req.name,
             &req.vendor,
             &req.api_base,
+            req.models_endpoint.as_deref().unwrap_or(""),
             req.api_key.as_deref(),
             auth_mode,
             req.oauth_meta.as_deref(),
@@ -347,6 +576,7 @@ async fn update_provider(
             &req.name,
             &req.vendor,
             &req.api_base,
+            req.models_endpoint.as_deref().unwrap_or(""),
             req.api_key.as_deref(),
             auth_mode,
             req.oauth_meta.as_deref(),
