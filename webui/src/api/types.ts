@@ -187,6 +187,7 @@ export interface StatBucket {
   cache_read_tokens: number;
   cache_write_tokens: number;
   total_tokens: number;
+  cost: number;
   avg_latency_ms?: number;
   avg_throughput_tps?: number;
 }
@@ -255,6 +256,10 @@ export interface RequestLogEntry {
   cache_write_tokens?: number | null;
   total_tokens?: number | null;
   cost?: number | null;
+  input_cost?: number | null;
+  output_cost?: number | null;
+  cache_read_cost?: number | null;
+  cache_write_cost?: number | null;
   api_key_id?: string | null;
   client_ip?: string | null;
   user_agent?: string | null;
@@ -337,6 +342,7 @@ export interface OAuthTokenResponse {
 export interface TokenDayActivity {
   day: string;
   total_tokens: number;
+  total_cost: number;
   request_count: number;
 }
 
@@ -347,6 +353,8 @@ export interface TokenActivityResponse {
 export interface TokenSummaryData {
   lifetime_tokens: number;
   peak_day_tokens: number;
+  lifetime_cost: number;
+  peak_day_cost: number;
   longest_task_ms: number;
   current_streak: number;
   longest_streak: number;
@@ -426,6 +434,7 @@ export interface ExportTokenDailyStat {
   prompt_tokens: number;
   completion_tokens: number;
   reasoning_tokens: number;
+  total_cost: number;
   peak_single_request: number;
   longest_task_ms: number;
 }
