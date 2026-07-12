@@ -10,6 +10,22 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Transport used for an OAuth provider's data-plane requests.
+///
+/// OAuth providers normally use HTTP. Codex's ChatGPT Responses surface is
+/// an exception: requests are created through a WebSocket session while the
+/// gateway continues to expose the normal HTTP/SSE API to its own clients.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamTransport {
+    /// Conventional HTTP request, optionally followed by an SSE response.
+    #[default]
+    Http,
+    /// OpenAI Codex Responses WebSocket (`response.create`) transport.
+    #[serde(rename = "codex_responses_websocket")]
+    CodexResponsesWebSocket,
+}
+
 /// How the token endpoint expects the refresh / exchange request body.
 ///
 /// Most providers (OpenAI/Codex, xAI) use the standard
@@ -39,6 +55,11 @@ pub enum TokenRequestStyle {
 /// serialised into logs, snapshots, or debug output.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OAuthTargetConfig {
+    /// Data-plane transport selected for this OAuth provider. Kept here so
+    /// the routing core remains pure data while the server owns all socket
+    /// I/O. Existing persisted configurations deserialize to HTTP.
+    #[serde(default)]
+    pub upstream_transport: UpstreamTransport,
     /// Token endpoint URL for refresh / exchange.
     pub token_url: String,
     /// OAuth client identifier (public client — no secret needed
@@ -70,6 +91,11 @@ pub struct OAuthTargetConfig {
     /// for Claude OAuth).
     #[serde(default)]
     pub extra_headers: Vec<(String, String)>,
+    /// Stable upstream account/workspace identifier associated with
+    /// this credential. OAuth access tokens are cached per provider
+    /// credential (not per routed model), using this value when present.
+    #[serde(default)]
+    pub account_id: Option<String>,
 }
 
 impl OAuthTargetConfig {
@@ -85,6 +111,13 @@ impl OAuthTargetConfig {
     /// to `"Bearer "`.
     pub fn bearer_prefix(&self) -> &str {
         self.authorization_prefix.as_deref().unwrap_or("Bearer ")
+    }
+
+    /// Cache label shared by every route using this provider credential.
+    /// A provider row owns one OAuth credential, so model or route labels
+    /// must not split refresh-token rotation into independent caches.
+    pub fn cache_label(&self) -> &str {
+        self.account_id.as_deref().unwrap_or("__provider__")
     }
 }
 
@@ -110,6 +143,7 @@ mod tests {
     #[test]
     fn oauth_target_config_skip_serializing_refresh_token() {
         let cfg = OAuthTargetConfig {
+            upstream_transport: UpstreamTransport::Http,
             token_url: "https://example.com/token".to_string(),
             client_id: "test-client".to_string(),
             client_secret: None,
@@ -119,6 +153,7 @@ mod tests {
             authorization_header: None,
             authorization_prefix: None,
             extra_headers: vec![],
+            account_id: None,
         };
         let json = serde_json::to_value(&cfg).unwrap();
         // refresh_token must not appear in serialised output.
@@ -133,6 +168,7 @@ mod tests {
     #[test]
     fn oauth_target_config_defaults() {
         let cfg = OAuthTargetConfig {
+            upstream_transport: UpstreamTransport::Http,
             token_url: String::new(),
             client_id: String::new(),
             client_secret: None,
@@ -142,8 +178,10 @@ mod tests {
             authorization_header: None,
             authorization_prefix: None,
             extra_headers: vec![],
+            account_id: None,
         };
         assert_eq!(cfg.header_name(), "authorization");
         assert_eq!(cfg.bearer_prefix(), "Bearer ");
+        assert_eq!(cfg.cache_label(), "__provider__");
     }
 }

@@ -8,8 +8,8 @@ use serde_json::{json, Value};
 
 use tiygate_core::{
     Content, EndpointCapabilities, EndpointCodec, ErrorClass, FinishReason, IrRequest, IrResponse,
-    Message, ProtocolEndpoint, ProtocolSuite, RawEnvelope, Role, StreamDecoder, StreamEncoder,
-    StreamPart, Tool, Usage,
+    Message, PromptCacheBreakpoint, ProtocolEndpoint, ProtocolSuite, RawEnvelope, Role,
+    StreamDecoder, StreamEncoder, StreamPart, Tool, Usage, Verbosity,
 };
 
 /// Map an `ErrorClass` to the OpenAI-native `error.type` string.
@@ -31,6 +31,28 @@ fn error_type_for_class(class: ErrorClass) -> &'static str {
         ErrorClass::AuthDisabled => "permission_error",
         ErrorClass::Overloaded => "overloaded_error",
     }
+}
+
+/// Whether an IR tool-call originated from either OpenAI custom-tool wire
+/// shape. Chat Completions uses `"custom"`; Responses uses
+/// `"custom_tool_call"`. Treat both as custom when crossing between the two
+/// OpenAI protocols.
+fn is_openai_custom_tool_call(wire_type: Option<&str>) -> bool {
+    matches!(wire_type, Some("custom") | Some("custom_tool_call"))
+}
+
+/// Recover the free-form input carried by an OpenAI custom tool call.
+///
+/// Chat Completions represents it as a string, while the Responses decoder
+/// may preserve it as `{ "input": "..." }`. Supporting both keeps the
+/// canonical IR usable in either direction.
+fn custom_tool_input(arguments: &Value) -> String {
+    arguments
+        .get("input")
+        .and_then(Value::as_str)
+        .map(String::from)
+        .or_else(|| arguments.as_str().map(String::from))
+        .unwrap_or_else(|| arguments.to_string())
 }
 
 /// Chat Completions protocol identity.
@@ -68,6 +90,8 @@ impl ChatCompletionsCodec {
                 structured_output: true,
                 function_calling: true,
                 parallel_tool_calls: true,
+                hosted_tools: false,
+                programmatic_tool_calling: false,
                 extended_reasoning: false,
                 deterministic_seed: true,
                 tool_choice_required: true,
@@ -131,6 +155,8 @@ impl EndpointCodec for ChatCompletionsCodec {
                             name: msg["name"].as_str().unwrap_or("").to_string(),
                             content: msg["content"].as_str().unwrap_or("").to_string(),
                             id: None,
+                            caller: None,
+                            wire_type: None,
                         }]
                     }
                 } else if let Some(text) = msg["content"].as_str() {
@@ -142,6 +168,7 @@ impl EndpointCodec for ChatCompletionsCodec {
                         vec![Content::Text {
                             text: text.to_string(),
                             annotations: None,
+                            prompt_cache_breakpoint: None,
                         }]
                     }
                 } else if let Some(arr) = msg["content"].as_array() {
@@ -181,23 +208,39 @@ impl EndpointCodec for ChatCompletionsCodec {
                 // unknown id (upstream 400 invalid_params).
                 if let Some(tool_calls) = msg["tool_calls"].as_array() {
                     for tc in tool_calls {
-                        let arguments = match &tc["function"]["arguments"] {
-                            // OpenAI sends arguments as a JSON string; parse to
-                            // object. If it is not valid JSON, preserve the raw
-                            // string as a JSON string value rather than dropping
-                            // it to `{}`, so non-standard payloads survive.
-                            serde_json::Value::String(s) => serde_json::from_str(s)
-                                .unwrap_or_else(|_| serde_json::Value::String(s.clone())),
-                            // Some compatible providers may already send an object.
-                            serde_json::Value::Null => json!({}),
-                            other => other.clone(),
-                        };
-                        content.push(Content::ToolCall {
-                            id: tc["id"].as_str().unwrap_or("").to_string(),
-                            name: tc["function"]["name"].as_str().unwrap_or("").to_string(),
-                            arguments,
-                            call_id: None,
-                        });
+                        if tc["type"].as_str() == Some("custom") {
+                            content.push(Content::ToolCall {
+                                id: tc["id"].as_str().unwrap_or("").to_string(),
+                                name: tc["custom"]["name"].as_str().unwrap_or("").to_string(),
+                                arguments: tc["custom"]["input"]
+                                    .as_str()
+                                    .map(|input| Value::String(input.to_string()))
+                                    .unwrap_or_else(|| Value::String(String::new())),
+                                call_id: None,
+                                caller: None,
+                                wire_type: Some("custom".to_string()),
+                            });
+                        } else {
+                            let arguments = match &tc["function"]["arguments"] {
+                                // OpenAI sends arguments as a JSON string; parse to
+                                // object. If it is not valid JSON, preserve the raw
+                                // string as a JSON string value rather than dropping
+                                // it to `{}`, so non-standard payloads survive.
+                                serde_json::Value::String(s) => serde_json::from_str(s)
+                                    .unwrap_or_else(|_| serde_json::Value::String(s.clone())),
+                                // Some compatible providers may already send an object.
+                                serde_json::Value::Null => json!({}),
+                                other => other.clone(),
+                            };
+                            content.push(Content::ToolCall {
+                                id: tc["id"].as_str().unwrap_or("").to_string(),
+                                name: tc["function"]["name"].as_str().unwrap_or("").to_string(),
+                                arguments,
+                                call_id: None,
+                                caller: None,
+                                wire_type: None,
+                            });
+                        }
                     }
                 }
 
@@ -207,6 +250,7 @@ impl EndpointCodec for ChatCompletionsCodec {
                     content.push(Content::Text {
                         text: String::new(),
                         annotations: None,
+                        prompt_cache_breakpoint: None,
                     });
                 }
 
@@ -214,30 +258,73 @@ impl EndpointCodec for ChatCompletionsCodec {
             }
         }
 
+        // Detect whether ANY system message carries a prompt-cache
+        // breakpoint.  When breakpoints are present, ALL system messages
+        // must remain in the ordered message list — flattening even the
+        // non-breakpoint ones into the top-level `system` string would
+        // reorder them relative to the breakpoint-carrying messages and
+        // shift the cache boundary position.
+        let any_system_breakpoint = messages.iter().any(|message| {
+            message.role == Role::System
+                && message.content.iter().any(|content| {
+                    matches!(
+                        content,
+                        Content::Text {
+                            prompt_cache_breakpoint: Some(_),
+                            ..
+                        } | Content::Media {
+                            prompt_cache_breakpoint: Some(_),
+                            ..
+                        }
+                    )
+                })
+        });
+
         // Extract system message(s) if present. OpenAI permits multiple
         // system/developer messages anywhere in the list; concatenate all of
         // their text parts so none are lost. The previous implementation only
         // captured the first text part of the first system message.
-        let system_chunks: Vec<String> = messages
-            .iter()
-            .filter(|m| m.role == Role::System)
-            .flat_map(|m| {
-                m.content.iter().filter_map(|c| match c {
-                    Content::Text { text, .. } => Some(text.clone()),
-                    _ => None,
+        //
+        // When any system message carries a breakpoint, skip extraction so
+        // every system message stays in the ordered list at its original
+        // position (see filter below).
+        let system_chunks: Vec<String> = if any_system_breakpoint {
+            Vec::new()
+        } else {
+            messages
+                .iter()
+                .filter(|message| message.role == Role::System)
+                .flat_map(|message| {
+                    message.content.iter().filter_map(|content| match content {
+                        Content::Text { text, .. } => Some(text.clone()),
+                        _ => None,
+                    })
                 })
-            })
-            .collect();
+                .collect()
+        };
         let system = if system_chunks.is_empty() {
             None
         } else {
             Some(system_chunks.join("\n"))
         };
 
-        // Filter out system messages from the list
+        // Keep system/developer messages in the ordered message list when
+        // any of them carry explicit prompt-cache breakpoints.  When no
+        // breakpoints are present, system messages are flattened into the
+        // request-level system string (above) and removed from the list.
         let messages: Vec<Message> = messages
             .into_iter()
-            .filter(|m| m.role != Role::System)
+            .filter(|message| {
+                if message.role != Role::System {
+                    return true;
+                }
+                if any_system_breakpoint {
+                    // Keep all system messages to preserve ordering.
+                    return true;
+                }
+                // No breakpoints — system messages were extracted above.
+                false
+            })
             .collect();
 
         // Parse tools
@@ -263,11 +350,50 @@ impl EndpointCodec for ChatCompletionsCodec {
             .as_array()
             .map(|arr| {
                 arr.iter()
-                    .map(|t| Tool {
-                        name: t["function"]["name"].as_str().unwrap_or("").to_string(),
-                        description: t["function"]["description"].as_str().map(|s| s.to_string()),
-                        parameters: Some(t["function"]["parameters"].clone()),
-                        required: mark_required,
+                    .map(|t| {
+                        let tool_type = t["type"].as_str().unwrap_or("function");
+                        if tool_type == "custom" {
+                            // OpenAI custom tools: type + remaining fields
+                            // (name/description/format/...) live at the top
+                            // level. Stash non-standard fields in config so a
+                            // same-protocol re-encode restores the wire shape.
+                            let mut config = serde_json::Map::new();
+                            if let Some(obj) = t.as_object() {
+                                for (k, v) in obj {
+                                    if k != "type"
+                                        && k != "name"
+                                        && k != "description"
+                                        && k != "parameters"
+                                    {
+                                        config.insert(k.clone(), v.clone());
+                                    }
+                                }
+                            }
+                            Tool {
+                                name: t["name"].as_str().unwrap_or("").to_string(),
+                                description: t["description"].as_str().map(|s| s.to_string()),
+                                parameters: t.get("parameters").cloned(),
+                                required: mark_required,
+                                tool_type: Some("custom".to_string()),
+                                config: if config.is_empty() {
+                                    None
+                                } else {
+                                    Some(Value::Object(config))
+                                },
+                            }
+                        } else {
+                            // Default / function tools (and any unknown type
+                            // that still carries a nested `function` object).
+                            Tool {
+                                name: t["function"]["name"].as_str().unwrap_or("").to_string(),
+                                description: t["function"]["description"]
+                                    .as_str()
+                                    .map(|s| s.to_string()),
+                                parameters: Some(t["function"]["parameters"].clone()),
+                                required: mark_required,
+                                ..Default::default()
+                            }
+                        }
                     })
                     .collect()
             })
@@ -306,6 +432,9 @@ impl EndpointCodec for ChatCompletionsCodec {
                 "metadata",
                 "prompt_cache_key",
                 "prompt_cache_retention",
+                "prompt_cache_options",
+                "safety_identifier",
+                "verbosity",
             ] {
                 if let Some(v) = body.get(key) {
                     extra.insert(key.to_string(), v.clone());
@@ -314,6 +443,35 @@ impl EndpointCodec for ChatCompletionsCodec {
             if !extra.is_empty() {
                 extensions.insert("openai_extra".to_string(), json!(extra));
             }
+        }
+
+        if let Some(value) = body.get("safety_identifier") {
+            extensions.insert("openai.safety_identifier".to_string(), value.clone());
+        }
+        if let Some(value) = body.get("prompt_cache_options") {
+            extensions.insert("openai.prompt_cache_options".to_string(), value.clone());
+        }
+        // Shared OpenAI cache-key extensions so Chat ↔ Responses conversion
+        // preserves prompt_cache_key / prompt_cache_retention (not only the
+        // protocol-local openai_extra / responses_extra bags).
+        if let Some(value) = body.get("prompt_cache_key") {
+            extensions.insert("openai.prompt_cache_key".to_string(), value.clone());
+        }
+        if let Some(value) = body.get("prompt_cache_retention") {
+            extensions.insert("openai.prompt_cache_retention".to_string(), value.clone());
+        }
+        // Preserve which Chat Completions token-limit field the caller used.
+        // This is protocol provenance, not model/routing knowledge: a later
+        // Chat encoder can replay the same field, while requests translated
+        // from another protocol fall back to the broadly-compatible legacy
+        // `max_tokens` field.
+        if body.get("max_completion_tokens").is_some() {
+            extensions.insert(
+                "openai.max_tokens_field".to_string(),
+                json!("max_completion_tokens"),
+            );
+        } else if body.get("max_tokens").is_some() {
+            extensions.insert("openai.max_tokens_field".to_string(), json!("max_tokens"));
         }
 
         let params = tiygate_core::GenerationParams {
@@ -335,21 +493,28 @@ impl EndpointCodec for ChatCompletionsCodec {
                         .collect()
                 })
                 .unwrap_or_default(),
-            thinking: body["reasoning_effort"].as_str().map(|s| {
+            thinking: body["reasoning_effort"].as_str().and_then(|s| {
                 use tiygate_core::ThinkingEffort;
                 let effort = match s {
-                    "minimal" => ThinkingEffort::Minimal,
-                    "low" => ThinkingEffort::Low,
-                    "medium" => ThinkingEffort::Medium,
-                    "high" => ThinkingEffort::High,
-                    "xhigh" => ThinkingEffort::XHigh,
-                    "max" => ThinkingEffort::Max,
-                    _ => ThinkingEffort::High,
-                };
-                tiygate_core::ThinkingConfig {
+                    "none" => Some(ThinkingEffort::None),
+                    "minimal" => Some(ThinkingEffort::Minimal),
+                    "low" => Some(ThinkingEffort::Low),
+                    "medium" => Some(ThinkingEffort::Medium),
+                    "high" => Some(ThinkingEffort::High),
+                    "xhigh" => Some(ThinkingEffort::XHigh),
+                    "max" => Some(ThinkingEffort::Max),
+                    _ => None,
+                }?;
+                Some(tiygate_core::ThinkingConfig {
                     effort: Some(effort),
                     ..Default::default()
-                }
+                })
+            }),
+            verbosity: body["verbosity"].as_str().and_then(|value| match value {
+                "low" => Some(Verbosity::Low),
+                "medium" => Some(Verbosity::Medium),
+                "high" => Some(Verbosity::High),
+                _ => None,
             }),
             ..Default::default()
         };
@@ -408,7 +573,9 @@ impl EndpointCodec for ChatCompletionsCodec {
 
         for content in &ir.content {
             match content {
-                Content::Text { text, annotations } => {
+                Content::Text {
+                    text, annotations, ..
+                } => {
                     message_content.push_str(text);
                     if let Some(ref anns) = annotations {
                         for a in anns {
@@ -446,16 +613,30 @@ impl EndpointCodec for ChatCompletionsCodec {
                     id,
                     name,
                     arguments,
+                    call_id,
+                    wire_type,
                     ..
                 } => {
-                    tool_calls_json.push(json!({
-                        "id": id,
-                        "type": "function",
-                        "function": {
-                            "name": name,
-                            "arguments": serde_json::to_string(arguments).unwrap_or_default(),
-                        }
-                    }));
+                    let wire_id = call_id.as_deref().unwrap_or(id);
+                    if is_openai_custom_tool_call(wire_type.as_deref()) {
+                        tool_calls_json.push(json!({
+                            "id": wire_id,
+                            "type": "custom",
+                            "custom": {
+                                "name": name,
+                                "input": custom_tool_input(arguments),
+                            }
+                        }));
+                    } else {
+                        tool_calls_json.push(json!({
+                            "id": wire_id,
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": serde_json::to_string(arguments).unwrap_or_default(),
+                            }
+                        }));
+                    }
                 }
                 Content::Refusal { text, .. } => {
                     if !message_refusal.is_empty() {
@@ -507,9 +688,14 @@ impl EndpointCodec for ChatCompletionsCodec {
                 "completion_tokens": usage.completion_tokens,
                 "total_tokens": total_for_openai,
             });
+            let mut details = serde_json::Map::new();
             if cache_read > 0 {
-                let mut details = serde_json::Map::new();
                 details.insert("cached_tokens".to_string(), json!(cache_read));
+            }
+            if cache_write > 0 {
+                details.insert("cache_write_tokens".to_string(), json!(cache_write));
+            }
+            if !details.is_empty() {
                 response["usage"]["prompt_tokens_details"] = json!(details);
             }
             if let Some(rt) = usage.reasoning_tokens {
@@ -544,6 +730,12 @@ impl EndpointCodec for ChatCompletionsCodec {
         &self,
         ir: &IrRequest,
     ) -> Result<(serde_json::Value, HeaderMap), tiygate_core::Error> {
+        tiygate_core::protocol::structured_output::validate_response_format_for_target(
+            ir.response_format.as_ref(),
+            self.id(),
+        )
+        .map_err(|error| tiygate_core::Error::Codec(error.to_string()))?;
+
         let mut body = json!({
             "model": ir.model,
             "stream": ir.stream,
@@ -577,8 +769,16 @@ impl EndpointCodec for ChatCompletionsCodec {
 
             for content in &msg.content {
                 match content {
-                    Content::Text { text, .. } => {
-                        text_parts.push(json!({"type": "text", "text": text}));
+                    Content::Text {
+                        text,
+                        prompt_cache_breakpoint,
+                        ..
+                    } => {
+                        let mut part = json!({"type": "text", "text": text});
+                        if let Some(breakpoint) = prompt_cache_breakpoint {
+                            part["prompt_cache_breakpoint"] = json!(breakpoint);
+                        }
+                        text_parts.push(part);
                     }
                     Content::Reasoning { text, .. } => {
                         // Per Deepseek thinking-mode spec, the assistant message
@@ -595,38 +795,58 @@ impl EndpointCodec for ChatCompletionsCodec {
                         id,
                         name,
                         arguments,
+                        call_id,
+                        wire_type,
                         ..
                     } => {
+                        // Prefer normalized function-call id when present
+                        // (Responses items keep a separate item ref in `id`).
+                        let wire_id = call_id.as_deref().unwrap_or(id);
                         // Re-emit the tool call on the assistant message so the
                         // downstream API sees a self-consistent turn.
-                        let args_str = match arguments {
-                            serde_json::Value::String(s) => s.clone(),
-                            other => other.to_string(),
-                        };
-                        tool_calls_json.push(json!({
-                            "id": id,
-                            "type": "function",
-                            "function": {
-                                "name": name,
-                                "arguments": args_str,
-                            }
-                        }));
+                        if is_openai_custom_tool_call(wire_type.as_deref()) {
+                            tool_calls_json.push(json!({
+                                "id": wire_id,
+                                "type": "custom",
+                                "custom": {
+                                    "name": name,
+                                    "input": custom_tool_input(arguments),
+                                }
+                            }));
+                        } else {
+                            let args_str = match arguments {
+                                serde_json::Value::String(s) => s.clone(),
+                                other => other.to_string(),
+                            };
+                            tool_calls_json.push(json!({
+                                "id": wire_id,
+                                "type": "function",
+                                "function": {
+                                    "name": name,
+                                    "arguments": args_str,
+                                }
+                            }));
+                        }
                     }
                     Content::Media {
                         source,
                         mime_type,
                         metadata,
-                        ..
+                        prompt_cache_breakpoint,
                     } => match source {
                         tiygate_core::ir::MediaSource::Url { url } => {
                             let mut img = json!({"url": url});
                             if let Some(d) = metadata.get(tiygate_core::ir::IMAGE_DETAIL_KEY) {
                                 img["detail"] = d.clone();
                             }
-                            text_parts.push(json!({
+                            let mut part = json!({
                                 "type": "image_url",
                                 "image_url": img
-                            }));
+                            });
+                            if let Some(breakpoint) = prompt_cache_breakpoint {
+                                part["prompt_cache_breakpoint"] = json!(breakpoint);
+                            }
+                            text_parts.push(part);
                         }
                         tiygate_core::ir::MediaSource::Inline { data } => {
                             let mut img =
@@ -634,10 +854,14 @@ impl EndpointCodec for ChatCompletionsCodec {
                             if let Some(d) = metadata.get(tiygate_core::ir::IMAGE_DETAIL_KEY) {
                                 img["detail"] = d.clone();
                             }
-                            text_parts.push(json!({
+                            let mut part = json!({
                                 "type": "image_url",
                                 "image_url": img
-                            }));
+                            });
+                            if let Some(breakpoint) = prompt_cache_breakpoint {
+                                part["prompt_cache_breakpoint"] = json!(breakpoint);
+                            }
+                            text_parts.push(part);
                         }
                         _ => {}
                     },
@@ -660,10 +884,17 @@ impl EndpointCodec for ChatCompletionsCodec {
                     Content::Refusal { text, .. } => {
                         text_parts.push(json!({"type": "text", "text": text}));
                     }
+                    Content::Program { .. } | Content::ProgramOutput { .. } => {
+                        // Rejected by the cross-protocol lossy guard before this
+                        // encoder is reached. Never flatten PTC state into Chat.
+                    }
                 }
             }
 
-            if text_parts.len() == 1 && text_parts[0].get("text").is_some() {
+            if text_parts.len() == 1
+                && text_parts[0].get("text").is_some()
+                && text_parts[0].get("prompt_cache_breakpoint").is_none()
+            {
                 msg_json["content"] = text_parts[0]["text"].clone();
             } else if !text_parts.is_empty() {
                 msg_json["content"] = json!(text_parts);
@@ -705,32 +936,61 @@ impl EndpointCodec for ChatCompletionsCodec {
 
         body["messages"] = json!(messages);
 
-        // Tools
+        // Tools — emit function tools and custom tools; hosted tools are
+        // Responses-only and are rejected by the lossy guard before we reach
+        // this encoder on cross-protocol paths.
         if !ir.tools.is_empty() {
             let tools: Vec<Value> = ir
                 .tools
                 .iter()
+                .filter(|t| t.is_function() || t.is_custom())
                 .map(|t| {
-                    json!({
-                        "type": "function",
-                        "function": {
-                            "name": t.name,
-                            "description": t.description,
-                            "parameters": t.parameters,
+                    if t.is_custom() {
+                        let mut obj = serde_json::Map::new();
+                        obj.insert("type".to_string(), json!("custom"));
+                        if !t.name.is_empty() {
+                            obj.insert("name".to_string(), json!(t.name));
                         }
-                    })
+                        if let Some(ref desc) = t.description {
+                            obj.insert("description".to_string(), json!(desc));
+                        }
+                        if let Some(ref params) = t.parameters {
+                            obj.insert("parameters".to_string(), params.clone());
+                        }
+                        if let Some(Value::Object(cfg)) = &t.config {
+                            for (k, v) in cfg {
+                                obj.entry(k.clone()).or_insert_with(|| v.clone());
+                            }
+                        }
+                        Value::Object(obj)
+                    } else {
+                        json!({
+                            "type": "function",
+                            "function": {
+                                "name": t.name,
+                                "description": t.description,
+                                "parameters": t.parameters,
+                            }
+                        })
+                    }
                 })
                 .collect();
-            body["tools"] = json!(tools);
+            if !tools.is_empty() {
+                body["tools"] = json!(tools);
+            }
         }
 
-        // Generation params
+        // Preserve the Chat field used at ingress. For cross-protocol requests
+        // there is no Chat provenance, so prefer the legacy field implemented
+        // by the widest set of OpenAI-compatible providers.
         if let Some(mt) = ir.params.max_tokens {
-            body["max_tokens"] = json!(mt);
-            // OpenAI o-series models require max_completion_tokens;
-            // max_tokens is deprecated in the Chat Completions spec.
-            // Emit both so the request works across all model families.
-            body["max_completion_tokens"] = json!(mt);
+            let field = ir
+                .extensions
+                .get("openai.max_tokens_field")
+                .and_then(Value::as_str)
+                .filter(|field| matches!(*field, "max_tokens" | "max_completion_tokens"))
+                .unwrap_or("max_tokens");
+            body[field] = json!(mt);
         }
         if let Some(t) = ir.params.temperature {
             body["temperature"] = json!(t);
@@ -760,17 +1020,25 @@ impl EndpointCodec for ChatCompletionsCodec {
                     .map(tiygate_core::ThinkingConfig::budget_to_effort)
             });
             if let Some(effort) = effort {
-                // OpenAI supports minimal/low/medium/high/xhigh; Max clamps to
-                // "xhigh" since OpenAI has no "max" effort level.
+                // GPT-5.6+ supports max natively on OpenAI Chat Completions.
                 body["reasoning_effort"] = json!(match effort {
+                    tiygate_core::ThinkingEffort::None => "none",
                     tiygate_core::ThinkingEffort::Minimal => "minimal",
                     tiygate_core::ThinkingEffort::Low => "low",
                     tiygate_core::ThinkingEffort::Medium => "medium",
                     tiygate_core::ThinkingEffort::High => "high",
                     tiygate_core::ThinkingEffort::XHigh => "xhigh",
-                    tiygate_core::ThinkingEffort::Max => "xhigh",
+                    tiygate_core::ThinkingEffort::Max => "max",
                 });
             }
+        }
+
+        if let Some(verbosity) = ir.params.verbosity {
+            body["verbosity"] = json!(match verbosity {
+                Verbosity::Low => "low",
+                Verbosity::Medium => "medium",
+                Verbosity::High => "high",
+            });
         }
 
         // Metadata: output from ir.metadata as JSON object
@@ -808,16 +1076,30 @@ impl EndpointCodec for ChatCompletionsCodec {
 
         // Replay OpenAI-specific top-level fields captured at decode time.
         // Only fields not already set by the modeled path above are written,
-        // so explicit params win over the passthrough copy.
+        // so explicit params win over the passthrough copy — except
+        // `metadata`, where the original extra value may contain non-string
+        // entries that ir.metadata (HashMap<String, String>) cannot represent,
+        // so it takes priority over the lossy IR subset.
         if let Some(extra) = ir
             .extensions
             .get("openai_extra")
             .and_then(|v| v.as_object())
         {
             for (k, v) in extra {
-                if body.get(k).is_none() {
+                if k == "metadata" || body.get(k).is_none() {
                     body[k] = v.clone();
                 }
+            }
+        }
+
+        for (extension, field) in [
+            ("openai.safety_identifier", "safety_identifier"),
+            ("openai.prompt_cache_options", "prompt_cache_options"),
+            ("openai.prompt_cache_key", "prompt_cache_key"),
+            ("openai.prompt_cache_retention", "prompt_cache_retention"),
+        ] {
+            if let Some(value) = ir.extensions.get(extension) {
+                body[field] = value.clone();
             }
         }
 
@@ -869,6 +1151,7 @@ impl EndpointCodec for ChatCompletionsCodec {
                         content.push(Content::Text {
                             text: text.to_string(),
                             annotations,
+                            prompt_cache_breakpoint: None,
                         });
                     }
                 }
@@ -905,16 +1188,32 @@ impl EndpointCodec for ChatCompletionsCodec {
                 // Tool calls
                 if let Some(tc_arr) = msg["tool_calls"].as_array() {
                     for tc in tc_arr {
-                        let args: serde_json::Value = serde_json::from_str(
-                            tc["function"]["arguments"].as_str().unwrap_or("{}"),
-                        )
-                        .unwrap_or(json!({}));
-                        content.push(Content::ToolCall {
-                            id: tc["id"].as_str().unwrap_or("").to_string(),
-                            name: tc["function"]["name"].as_str().unwrap_or("").to_string(),
-                            arguments: args,
-                            call_id: None,
-                        });
+                        if tc["type"].as_str() == Some("custom") {
+                            content.push(Content::ToolCall {
+                                id: tc["id"].as_str().unwrap_or("").to_string(),
+                                name: tc["custom"]["name"].as_str().unwrap_or("").to_string(),
+                                arguments: tc["custom"]["input"]
+                                    .as_str()
+                                    .map(|input| Value::String(input.to_string()))
+                                    .unwrap_or_else(|| Value::String(String::new())),
+                                call_id: None,
+                                caller: None,
+                                wire_type: Some("custom".to_string()),
+                            });
+                        } else {
+                            let args: serde_json::Value = serde_json::from_str(
+                                tc["function"]["arguments"].as_str().unwrap_or("{}"),
+                            )
+                            .unwrap_or(json!({}));
+                            content.push(Content::ToolCall {
+                                id: tc["id"].as_str().unwrap_or("").to_string(),
+                                name: tc["function"]["name"].as_str().unwrap_or("").to_string(),
+                                arguments: args,
+                                call_id: None,
+                                caller: None,
+                                wire_type: None,
+                            });
+                        }
                     }
                 }
 
@@ -997,20 +1296,23 @@ impl EndpointCodec for ChatCompletionsCodec {
             })
             .map(|u| {
                 let cache_read = u["prompt_tokens_details"]["cached_tokens"].as_u64();
+                let cache_write = u["prompt_tokens_details"]["cache_write_tokens"].as_u64();
                 // OpenAI's `prompt_tokens` INCLUDES the cached portion. The IR
                 // convention is that `prompt_tokens` is the NON-cached prompt and
                 // cache lives in its own bucket, so subtract the cache here. This
                 // prevents double-counting when the IR is later re-encoded to a
                 // protocol whose encoder adds the cache back into prompt_tokens.
                 let raw_prompt = u["prompt_tokens"].as_u64().unwrap_or(0);
-                let prompt_excl_cache = raw_prompt.saturating_sub(cache_read.unwrap_or(0));
+                let prompt_excl_cache = raw_prompt
+                    .saturating_sub(cache_read.unwrap_or(0))
+                    .saturating_sub(cache_write.unwrap_or(0));
                 Usage {
                     prompt_tokens: prompt_excl_cache,
                     completion_tokens: u["completion_tokens"].as_u64().unwrap_or(0),
                     total_tokens: u["total_tokens"].as_u64().unwrap_or(0),
                     reasoning_tokens: u["completion_tokens_details"]["reasoning_tokens"].as_u64(),
                     cache_read_tokens: cache_read,
-                    ..Default::default()
+                    cache_write_tokens: cache_write,
                 }
             });
 
@@ -1111,6 +1413,7 @@ impl StreamEncoder for ChatCompletionsStreamEncoder {
                 id,
                 name,
                 arguments,
+                ..
             } => {
                 let tc_index = self.tool_call_index(id);
                 let resp_id = self.response_id.clone().unwrap_or_default();
@@ -1140,6 +1443,11 @@ impl StreamEncoder for ChatCompletionsStreamEncoder {
                     })
                 )
             }
+            // Programmatic Tool Calling is Responses-only; Chat has no wire
+            // carrier, so these item-level parts are no-ops here.
+            StreamPart::ProgramDelta { .. } | StreamPart::ProgramOutputDelta { .. } => {
+                String::new()
+            }
             StreamPart::Usage { usage } => {
                 let id = self.response_id.as_deref().unwrap_or("");
                 // The IR keeps prompt_tokens cache-free; OpenAI's wire format
@@ -1154,10 +1462,19 @@ impl StreamEncoder for ChatCompletionsStreamEncoder {
                     "completion_tokens": usage.completion_tokens,
                     "total_tokens": prompt_for_openai + usage.completion_tokens,
                 });
+                let mut prompt_details = serde_json::Map::new();
                 if let Some(cr) = usage.cache_read_tokens {
                     if cr > 0 {
-                        usage_obj["prompt_tokens_details"] = json!({"cached_tokens": cr});
+                        prompt_details.insert("cached_tokens".to_string(), json!(cr));
                     }
+                }
+                if let Some(cw) = usage.cache_write_tokens {
+                    if cw > 0 {
+                        prompt_details.insert("cache_write_tokens".to_string(), json!(cw));
+                    }
+                }
+                if !prompt_details.is_empty() {
+                    usage_obj["prompt_tokens_details"] = json!(prompt_details);
                 }
                 if let Some(rt) = usage.reasoning_tokens {
                     if rt > 0 {
@@ -1335,7 +1652,12 @@ impl StreamDecoder for ChatCompletionsStreamDecoder {
                 }
 
                 // Handle error (can appear in any chunk)
-                if let Some(error) = chunk.get("error") {
+                if let Some(error) = chunk
+                    .get("error")
+                    .and_then(|value| value.as_object())
+                    .filter(|error| !error.is_empty())
+                {
+                    let error = Value::Object(error.clone());
                     let code = error["code"].as_str().or_else(|| error["type"].as_str());
                     let upstream_code = code.map(String::from);
                     let class = tiygate_core::classify_upstream_error(None, code);
@@ -1427,12 +1749,18 @@ impl StreamDecoder for ChatCompletionsStreamDecoder {
                                             id: id.clone(),
                                             name: Some(n),
                                             arguments: String::new(),
+                                            wire_type: None,
+                                            item_id: None,
+                                            caller: None,
                                         });
                                         if !args.is_empty() {
                                             parts.push(StreamPart::ToolCallDelta {
                                                 id,
                                                 name: None,
                                                 arguments: args,
+                                                wire_type: None,
+                                                item_id: None,
+                                                caller: None,
                                             });
                                         }
                                     }
@@ -1441,6 +1769,9 @@ impl StreamDecoder for ChatCompletionsStreamDecoder {
                                             id,
                                             name: Some(n),
                                             arguments: String::new(),
+                                            wire_type: None,
+                                            item_id: None,
+                                            caller: None,
                                         });
                                     }
                                     (None, Some(args)) => {
@@ -1448,6 +1779,9 @@ impl StreamDecoder for ChatCompletionsStreamDecoder {
                                             id,
                                             name: None,
                                             arguments: args,
+                                            wire_type: None,
+                                            item_id: None,
+                                            caller: None,
                                         });
                                     }
                                     (None, None) => {}
@@ -1491,12 +1825,16 @@ impl StreamDecoder for ChatCompletionsStreamDecoder {
                             .as_u64()
                             .unwrap_or(raw_prompt + completion);
                         let cache_read = usage["prompt_tokens_details"]["cached_tokens"].as_u64();
+                        let cache_write =
+                            usage["prompt_tokens_details"]["cache_write_tokens"].as_u64();
                         let reasoning =
                             usage["completion_tokens_details"]["reasoning_tokens"].as_u64();
                         // OpenAI's prompt_tokens includes cache; the IR convention
                         // keeps prompt_tokens cache-free. Subtract to avoid double
                         // counting on re-encode.
-                        let prompt = raw_prompt.saturating_sub(cache_read.unwrap_or(0));
+                        let prompt = raw_prompt
+                            .saturating_sub(cache_read.unwrap_or(0))
+                            .saturating_sub(cache_write.unwrap_or(0));
                         parts.push(StreamPart::Usage {
                             usage: Usage {
                                 prompt_tokens: prompt,
@@ -1504,7 +1842,7 @@ impl StreamDecoder for ChatCompletionsStreamDecoder {
                                 total_tokens: total,
                                 reasoning_tokens: reasoning,
                                 cache_read_tokens: cache_read,
-                                ..Default::default()
+                                cache_write_tokens: cache_write,
                             },
                         });
                     }
@@ -1555,6 +1893,7 @@ fn parse_content_array(arr: &[Value], role: &Role) -> Vec<Content> {
             Some("text") => Content::Text {
                 text: item["text"].as_str().unwrap_or("").to_string(),
                 annotations: None,
+                prompt_cache_breakpoint: decode_chat_prompt_cache_breakpoint(item),
             },
             Some("image_url") => {
                 // Accept both the standard object form
@@ -1581,6 +1920,7 @@ fn parse_content_array(arr: &[Value], role: &Role) -> Vec<Content> {
                     source,
                     mime_type,
                     metadata,
+                    prompt_cache_breakpoint: decode_chat_prompt_cache_breakpoint(item),
                 }
             }
             Some("tool_use") | Some("tool_result") => {
@@ -1590,21 +1930,33 @@ fn parse_content_array(arr: &[Value], role: &Role) -> Vec<Content> {
                         name: String::new(),
                         content: item["content"].as_str().unwrap_or("").to_string(),
                         id: None,
+                        caller: None,
+                        wire_type: None,
                     }
                 } else {
                     Content::Text {
                         text: item["content"].as_str().unwrap_or("").to_string(),
                         annotations: None,
+                        prompt_cache_breakpoint: None,
                     }
                 }
             }
             _ => Content::Text {
                 text: item["text"].as_str().unwrap_or("").to_string(),
                 annotations: None,
+                prompt_cache_breakpoint: None,
             },
         });
     }
     parts
+}
+
+fn decode_chat_prompt_cache_breakpoint(item: &Value) -> Option<PromptCacheBreakpoint> {
+    (item["prompt_cache_breakpoint"]["mode"].as_str() == Some("explicit")).then_some(
+        PromptCacheBreakpoint {
+            mode: tiygate_core::PromptCacheBreakpointMode::Explicit,
+        },
+    )
 }
 
 /// Parse OpenAI-style annotations array into IR annotations.
@@ -1724,6 +2076,148 @@ mod tests {
             original_body_size: 0,
             timestamp: chrono::Utc::now(),
         }
+    }
+
+    #[test]
+    fn test_chat_cache_write_usage_roundtrip() {
+        let codec = ChatCompletionsCodec::new();
+        let decoded = codec
+            .decode_response(json!({
+                "id": "chat_1",
+                "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+                "usage": {
+                    "prompt_tokens": 100,
+                    "completion_tokens": 10,
+                    "total_tokens": 110,
+                    "prompt_tokens_details": {"cached_tokens": 20, "cache_write_tokens": 30}
+                }
+            }))
+            .unwrap();
+        let usage = decoded.usage.as_ref().unwrap();
+        assert_eq!(usage.prompt_tokens, 50);
+        assert_eq!(usage.cache_read_tokens, Some(20));
+        assert_eq!(usage.cache_write_tokens, Some(30));
+        let encoded = codec.encode_response(&decoded).unwrap();
+        assert_eq!(encoded["usage"]["prompt_tokens"], 100);
+        assert_eq!(
+            encoded["usage"]["prompt_tokens_details"]["cached_tokens"],
+            20
+        );
+        assert_eq!(
+            encoded["usage"]["prompt_tokens_details"]["cache_write_tokens"],
+            30
+        );
+    }
+
+    #[test]
+    fn test_gpt56_request_controls_roundtrip() {
+        let codec = ChatCompletionsCodec::new();
+        let env = make_raw_envelope();
+        let body = json!({
+            "model": "gpt-5.6",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "hello",
+                    "prompt_cache_breakpoint": {"mode": "explicit"}
+                }, {
+                    "type": "image_url",
+                    "image_url": {"url": "https://example.com/a.png", "detail": "original"}
+                }]
+            }],
+            "reasoning_effort": "none",
+            "verbosity": "low",
+            "prompt_cache_options": {"mode": "explicit", "ttl": "30m"},
+            "safety_identifier": "safe-user"
+        });
+        let ir = codec.decode_request(body, &env).unwrap();
+        assert_eq!(
+            ir.params.thinking.as_ref().and_then(|v| v.effort),
+            Some(tiygate_core::ThinkingEffort::None)
+        );
+        assert_eq!(ir.params.verbosity, Some(Verbosity::Low));
+        let (encoded, _) = codec.encode_request(&ir).unwrap();
+        assert_eq!(encoded["reasoning_effort"], "none");
+        assert_eq!(encoded["verbosity"], "low");
+        assert_eq!(encoded["prompt_cache_options"]["mode"], "explicit");
+        assert_eq!(encoded["safety_identifier"], "safe-user");
+        assert_eq!(
+            encoded["messages"][0]["content"][0]["prompt_cache_breakpoint"]["mode"],
+            "explicit"
+        );
+        assert_eq!(
+            encoded["messages"][0]["content"][1]["image_url"]["detail"],
+            "original"
+        );
+    }
+
+    #[test]
+    fn test_system_messages_with_breakpoint_preserve_order() {
+        // Regression: when any system message carries a prompt-cache
+        // breakpoint, ALL system messages must remain in the ordered message
+        // list at their original positions.  Previously, non-breakpoint system
+        // messages were flattened into the top-level `system` string and
+        // emitted first, reordering [system+breakpoint, system+plain] →
+        // [system+plain, system+breakpoint] and shifting the cache boundary.
+        let codec = ChatCompletionsCodec::new();
+        let env = make_raw_envelope();
+        let body = json!({
+            "model": "gpt-5.6",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": [{
+                        "type": "text",
+                        "text": "breakpoint system",
+                        "prompt_cache_breakpoint": {"mode": "explicit"}
+                    }]
+                },
+                {
+                    "role": "system",
+                    "content": "plain system"
+                },
+                {
+                    "role": "user",
+                    "content": "hello"
+                }
+            ]
+        });
+        let ir = codec.decode_request(body, &env).unwrap();
+        // system string must be empty — no flattening when breakpoints exist.
+        assert!(
+            ir.system.is_none(),
+            "system must be None when breakpoints present"
+        );
+        // All three messages preserved in order.
+        assert_eq!(ir.messages.len(), 3);
+        // First message: system with breakpoint.
+        assert!(matches!(ir.messages[0].role, Role::System));
+        assert!(ir.messages[0].content.iter().any(|c| matches!(
+            c,
+            Content::Text { text, prompt_cache_breakpoint: Some(_), .. } if text == "breakpoint system"
+        )));
+        // Second message: plain system (no breakpoint).
+        assert!(matches!(ir.messages[1].role, Role::System));
+        assert!(ir.messages[1].content.iter().any(|c| matches!(
+            c,
+            Content::Text { text, prompt_cache_breakpoint: None, .. } if text == "plain system"
+        )));
+        // Third message: user.
+        assert!(matches!(ir.messages[2].role, Role::User));
+
+        // Re-encode and verify order is preserved.
+        let (encoded, _) = codec.encode_request(&ir).unwrap();
+        let msgs = encoded["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(
+            msgs[0]["content"][0]["prompt_cache_breakpoint"]["mode"],
+            "explicit"
+        );
+        assert_eq!(msgs[1]["role"], "system");
+        assert_eq!(msgs[1]["content"], "plain system");
+        assert_eq!(msgs[2]["role"], "user");
     }
 
     #[test]
@@ -1880,6 +2374,7 @@ mod tests {
             content: vec![Content::Text {
                 text: "Hello!".to_string(),
                 annotations: None,
+                prompt_cache_breakpoint: None,
             }],
             usage: Some(Usage {
                 prompt_tokens: 10,
@@ -1909,6 +2404,8 @@ mod tests {
                 name: "get_weather".to_string(),
                 arguments: json!({"city": "London"}),
                 call_id: None,
+                caller: None,
+                wire_type: None,
             }],
             usage: None,
             finish_reason: Some(FinishReason::ToolCalls),
@@ -1960,6 +2457,21 @@ mod tests {
                 id: "tc1".to_string(),
                 name: Some("fn".to_string()),
                 arguments: "{}".to_string(),
+                wire_type: None,
+                item_id: None,
+                caller: None,
+            },
+            StreamPart::ProgramDelta {
+                id: "prog_1".to_string(),
+                call_id: "call_prog_1".to_string(),
+                code: "await tools.f({})".to_string(),
+                fingerprint: "fp".to_string(),
+            },
+            StreamPart::ProgramOutputDelta {
+                id: "progo_1".to_string(),
+                call_id: "call_prog_1".to_string(),
+                result: "ok".to_string(),
+                status: "completed".to_string(),
             },
             StreamPart::Usage {
                 usage: Usage::default(),
@@ -2032,6 +2544,7 @@ mod tests {
                 id,
                 name: None,
                 arguments,
+                ..
             } => Some((id.clone(), arguments.clone())),
             _ => None,
         });
@@ -2040,6 +2553,7 @@ mod tests {
                 id,
                 name: None,
                 arguments,
+                ..
             } => Some((id.clone(), arguments.clone())),
             _ => None,
         });
@@ -2113,6 +2627,22 @@ mod tests {
     }
 
     #[test]
+    fn test_stream_decoder_error_null_is_ignored() {
+        let mut decoder = ChatCompletionsStreamDecoder::new();
+        let parts = decoder
+            .feed(
+                "data: {\"id\":\"r1\",\"object\":\"chat.completion.chunk\",\"error\":null,\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n",
+            )
+            .unwrap();
+        assert!(parts
+            .iter()
+            .any(|part| matches!(part, StreamPart::TextDelta { text } if text == "ok")));
+        assert!(!parts
+            .iter()
+            .any(|part| matches!(part, StreamPart::Error { .. })));
+    }
+
+    #[test]
     fn test_stream_decoder_error_frame() {
         let mut decoder = ChatCompletionsStreamDecoder::new();
         let line = "data: {\"error\":{\"message\":\"rate limit\",\"code\":\"429\"}}\n";
@@ -2174,6 +2704,7 @@ mod tests {
             content: vec![Content::Text {
                 text: "ok".to_string(),
                 annotations: None,
+                prompt_cache_breakpoint: None,
             }],
             usage: Some(Usage {
                 prompt_tokens: 100,
@@ -2237,6 +2768,7 @@ mod tests {
                     content: vec![Content::Text {
                         text: "天气?".to_string(),
                         annotations: None,
+                        prompt_cache_breakpoint: None,
                     }],
                 },
                 // 含 tool_calls 的轮:reasoning_content 应回传
@@ -2254,6 +2786,8 @@ mod tests {
                             name: "get_weather".to_string(),
                             arguments: json!({"city": "杭州"}),
                             call_id: None,
+                            caller: None,
+                            wire_type: None,
                         },
                     ],
                 },
@@ -2264,6 +2798,8 @@ mod tests {
                         name: "get_weather".to_string(),
                         content: "sunny".to_string(),
                         id: None,
+                        caller: None,
+                        wire_type: None,
                     }],
                 },
                 // 纯文本轮:reasoning_content 应丢弃
@@ -2279,6 +2815,7 @@ mod tests {
                         Content::Text {
                             text: "杭州今天晴。".to_string(),
                             annotations: None,
+                            prompt_cache_breakpoint: None,
                         },
                     ],
                 },
@@ -2449,5 +2986,172 @@ mod tests {
             ir.usage.is_none(),
             "null usage must decode to None, not a zero-valued Usage"
         );
+    }
+
+    #[test]
+    fn test_custom_tool_roundtrip() {
+        let codec = ChatCompletionsCodec::new();
+        let env = make_raw_envelope();
+        let body = json!({
+            "model": "gpt-5.6",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{
+                "type": "custom",
+                "name": "code_exec",
+                "description": "run code",
+                "format": {"type": "text"}
+            }]
+        });
+        let ir = codec.decode_request(body, &env).unwrap();
+        assert_eq!(ir.tools.len(), 1);
+        assert!(ir.tools[0].is_custom());
+        assert_eq!(ir.tools[0].name, "code_exec");
+        assert_eq!(
+            ir.tools[0]
+                .config
+                .as_ref()
+                .and_then(|c| c.get("format"))
+                .and_then(|f| f.get("type"))
+                .and_then(|t| t.as_str()),
+            Some("text")
+        );
+        let (encoded, _) = codec.encode_request(&ir).unwrap();
+        assert_eq!(encoded["tools"][0]["type"], "custom");
+        assert_eq!(encoded["tools"][0]["name"], "code_exec");
+        assert_eq!(encoded["tools"][0]["format"]["type"], "text");
+    }
+
+    #[test]
+    fn test_custom_tool_calls_survive_chat_responses_conversion() {
+        let chat = ChatCompletionsCodec::new();
+        let responses = crate::responses::ResponsesCodec::new();
+        let env = make_raw_envelope();
+
+        let request = json!({
+            "model": "gpt-5.6",
+            "messages": [
+                {"role": "user", "content": "run this"},
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_custom_1",
+                        "type": "custom",
+                        "custom": {"name": "code_exec", "input": "print(1)"}
+                    }]
+                }
+            ]
+        });
+        let request_ir = chat.decode_request(request, &env).unwrap();
+        let (responses_request, _) = responses.encode_request(&request_ir).unwrap();
+        assert!(responses_request["input"].as_array().is_some_and(|items| {
+            items.iter().any(|item| {
+                item["type"] == "custom_tool_call"
+                    && item["name"] == "code_exec"
+                    && item["input"] == "print(1)"
+            })
+        }));
+
+        let response = json!({
+            "id": "chatcmpl_1",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_custom_2",
+                        "type": "custom",
+                        "custom": {"name": "code_exec", "input": "print(2)"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        let response_ir = chat.decode_response(response).unwrap();
+        let chat_response = chat.encode_response(&response_ir).unwrap();
+        assert_eq!(
+            chat_response["choices"][0]["message"]["tool_calls"][0]["type"],
+            "custom"
+        );
+        assert_eq!(
+            chat_response["choices"][0]["message"]["tool_calls"][0]["custom"]["input"],
+            "print(2)"
+        );
+
+        let responses_response = responses.encode_response(&response_ir).unwrap();
+        assert_eq!(responses_response["output"][0]["type"], "custom_tool_call");
+        assert_eq!(responses_response["output"][0]["input"], "print(2)");
+    }
+
+    #[test]
+    fn test_max_token_field_provenance_is_preserved() {
+        let codec = ChatCompletionsCodec::new();
+        let env = make_raw_envelope();
+        for field in ["max_tokens", "max_completion_tokens"] {
+            let mut body = json!({
+                "model": "gpt-5.6",
+                "messages": [{"role": "user", "content": "hi"}]
+            });
+            body[field] = json!(128);
+            let ir = codec.decode_request(body, &env).unwrap();
+            assert_eq!(ir.params.max_tokens, Some(128));
+            assert_eq!(
+                ir.extensions
+                    .get("openai.max_tokens_field")
+                    .and_then(Value::as_str),
+                Some(field)
+            );
+            let (encoded, _) = codec.encode_request(&ir).unwrap();
+            assert_eq!(encoded[field], 128, "{encoded}");
+            let other = if field == "max_tokens" {
+                "max_completion_tokens"
+            } else {
+                "max_tokens"
+            };
+            assert!(encoded.get(other).is_none(), "{encoded}");
+        }
+    }
+
+    #[test]
+    fn test_cross_protocol_max_tokens_defaults_to_legacy_field() {
+        let codec = ChatCompletionsCodec::new();
+        let env = make_raw_envelope();
+        let mut ir = codec
+            .decode_request(
+                json!({
+                    "model": "virtual-model",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_completion_tokens": 128
+                }),
+                &env,
+            )
+            .unwrap();
+        ir.extensions.remove("openai.max_tokens_field");
+        let (encoded, _) = codec.encode_request(&ir).unwrap();
+        assert_eq!(encoded["max_tokens"], 128, "{encoded}");
+        assert!(encoded.get("max_completion_tokens").is_none(), "{encoded}");
+    }
+
+    #[test]
+    fn test_prompt_cache_key_cross_protocol() {
+        let chat = ChatCompletionsCodec::new();
+        let responses = crate::responses::ResponsesCodec::new();
+        let env = make_raw_envelope();
+        let body = json!({
+            "model": "gpt-5.6",
+            "messages": [{"role": "user", "content": "hi"}],
+            "prompt_cache_key": "cache-k1",
+            "prompt_cache_retention": "24h"
+        });
+        let ir = chat.decode_request(body, &env).unwrap();
+        assert_eq!(
+            ir.extensions
+                .get("openai.prompt_cache_key")
+                .and_then(|v| v.as_str()),
+            Some("cache-k1")
+        );
+        let (encoded, _) = responses.encode_request(&ir).unwrap();
+        assert_eq!(encoded["prompt_cache_key"], "cache-k1");
+        assert_eq!(encoded["prompt_cache_retention"], "24h");
     }
 }

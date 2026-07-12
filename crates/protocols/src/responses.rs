@@ -7,8 +7,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use tiygate_core::{
     Content, EndpointCapabilities, EndpointCodec, ErrorClass, FinishReason, IrRequest, IrResponse,
-    Message, ProtocolEndpoint, ProtocolSuite, RawEnvelope, Role, StreamDecoder, StreamEncoder,
-    StreamPart, Tool, Usage,
+    Message, PromptCacheBreakpoint, ProtocolEndpoint, ProtocolSuite, RawEnvelope, Role,
+    StreamDecoder, StreamEncoder, StreamPart, Tool, ToolCaller, Usage, Verbosity,
 };
 
 /// Map an `ErrorClass` to the OpenAI Responses-native `error.type` string.
@@ -75,12 +75,283 @@ fn responses_function_call_output(
     tool_call_id: &str,
     content: &str,
     item_id: Option<&str>,
+    caller: Option<&ToolCaller>,
 ) -> Value {
     let mut v = json!({"type": "function_call_output", "call_id": tool_call_id, "output": content});
     if let Some(id) = item_id {
         v["id"] = json!(id);
     }
+    if let Some(caller) = caller {
+        v["caller"] = json!(caller);
+    }
     v
+}
+
+fn decode_tool_caller(item: &Value) -> Option<ToolCaller> {
+    match item
+        .get("caller")
+        .and_then(|caller| caller["type"].as_str())
+    {
+        Some("direct") => Some(ToolCaller::Direct),
+        Some("program") => {
+            item["caller"]["caller_id"]
+                .as_str()
+                .map(|caller_id| ToolCaller::Program {
+                    caller_id: caller_id.to_string(),
+                })
+        }
+        _ => None,
+    }
+}
+
+fn decode_prompt_cache_breakpoint(part: &Value) -> Option<PromptCacheBreakpoint> {
+    (part["prompt_cache_breakpoint"]["mode"].as_str() == Some("explicit")).then_some(
+        PromptCacheBreakpoint {
+            mode: tiygate_core::PromptCacheBreakpointMode::Explicit,
+        },
+    )
+}
+
+/// Chat Completions labels custom calls as `custom`, while Responses uses
+/// `custom_tool_call`. Both forms may enter the shared IR during a
+/// cross-protocol conversion.
+fn is_responses_custom_tool_call(wire_type: Option<&str>) -> bool {
+    matches!(wire_type, Some("custom") | Some("custom_tool_call"))
+}
+
+/// Recover a custom tool's free-form input from either OpenAI protocol's IR
+/// representation.
+fn responses_custom_tool_input(arguments: &Value) -> String {
+    arguments
+        .get("input")
+        .and_then(Value::as_str)
+        .map(String::from)
+        .or_else(|| arguments.as_str().map(String::from))
+        .unwrap_or_else(|| arguments.to_string())
+}
+
+/// Map Responses `text.format` into the shared IR `response_format` so Chat ↔
+/// Responses Convert can carry structured-output constraints both ways.
+fn decode_text_format(text: &Value) -> Option<tiygate_core::ResponseFormat> {
+    let format = text.get("format")?;
+    match format["type"].as_str() {
+        Some("json_schema") => {
+            // Responses nests schema under `format` itself (name/schema/strict)
+            // rather than under a `json_schema` wrapper like Chat Completions.
+            let name = format["name"]
+                .as_str()
+                .or_else(|| format["json_schema"]["name"].as_str())
+                .unwrap_or("response")
+                .to_string();
+            let schema = if format.get("schema").is_some_and(|s| !s.is_null()) {
+                format["schema"].clone()
+            } else if format
+                .pointer("/json_schema/schema")
+                .is_some_and(|s| !s.is_null())
+            {
+                format["json_schema"]["schema"].clone()
+            } else {
+                // Malformed json_schema without a real schema object — do not
+                // promote a null/missing schema into IR.
+                return None;
+            };
+            if !schema.is_object() {
+                return None;
+            }
+            let strict = format["strict"]
+                .as_bool()
+                .or_else(|| format["json_schema"]["strict"].as_bool());
+            Some(tiygate_core::ResponseFormat::JsonSchema {
+                name,
+                schema,
+                strict,
+            })
+        }
+        Some("json_object") => Some(tiygate_core::ResponseFormat::JsonObject),
+        Some("text") => Some(tiygate_core::ResponseFormat::Text),
+        _ => None,
+    }
+}
+
+fn encode_text_format(format: &tiygate_core::ResponseFormat) -> Value {
+    match format {
+        tiygate_core::ResponseFormat::JsonSchema {
+            name,
+            schema,
+            strict,
+        } => {
+            let mut obj = json!({
+                "type": "json_schema",
+                "name": name,
+                "schema": schema,
+            });
+            if let Some(strict) = strict {
+                obj["strict"] = json!(strict);
+            }
+            obj
+        }
+        tiygate_core::ResponseFormat::JsonObject => json!({"type": "json_object"}),
+        tiygate_core::ResponseFormat::Text => json!({"type": "text"}),
+    }
+}
+
+fn is_image_mime(mime_type: &str) -> bool {
+    mime_type.starts_with("image/") || mime_type == "image/*" || mime_type.is_empty()
+}
+
+/// Encode IR media into a Responses content part. FileId sources map to
+/// `input_image`/`input_file` with a top-level `file_id` field; Url/Inline
+/// non-image media map to `input_file` with `file_url` / `file_data`.
+fn encode_responses_media_part(
+    source: &tiygate_core::ir::MediaSource,
+    mime_type: &str,
+    metadata: &std::collections::HashMap<String, Value>,
+    prompt_cache_breakpoint: &Option<PromptCacheBreakpoint>,
+) -> Option<Value> {
+    let image = is_image_mime(mime_type);
+    let mut part = match source {
+        tiygate_core::ir::MediaSource::Url { url } => {
+            if image {
+                json!({
+                    "type": "input_image",
+                    "image_url": url,
+                })
+            } else {
+                let mut obj = json!({
+                    "type": "input_file",
+                    "file_url": url,
+                });
+                if let Some(name) = metadata.get("filename").and_then(|v| v.as_str()) {
+                    obj["filename"] = json!(name);
+                }
+                obj
+            }
+        }
+        tiygate_core::ir::MediaSource::Inline { data } => {
+            if image {
+                json!({
+                    "type": "input_image",
+                    "image_url": format!("data:{mime_type};base64,{data}"),
+                })
+            } else {
+                let mut obj = json!({
+                    "type": "input_file",
+                    "file_data": format!("data:{mime_type};base64,{data}"),
+                });
+                if let Some(name) = metadata.get("filename").and_then(|v| v.as_str()) {
+                    obj["filename"] = json!(name);
+                }
+                obj
+            }
+        }
+        tiygate_core::ir::MediaSource::FileId { id } => {
+            if image {
+                json!({
+                    "type": "input_image",
+                    "file_id": id,
+                })
+            } else {
+                let mut obj = json!({
+                    "type": "input_file",
+                    "file_id": id,
+                });
+                if let Some(name) = metadata.get("filename").and_then(|v| v.as_str()) {
+                    obj["filename"] = json!(name);
+                }
+                obj
+            }
+        }
+    };
+    if part["type"] == "input_image" {
+        if let Some(detail) = metadata.get(tiygate_core::ir::IMAGE_DETAIL_KEY) {
+            part["detail"] = detail.clone();
+        }
+    }
+    if let Some(breakpoint) = prompt_cache_breakpoint {
+        part["prompt_cache_breakpoint"] = json!(breakpoint);
+    }
+    Some(part)
+}
+
+/// Decode a Responses media content part (`input_image` / `input_file`) into IR.
+fn decode_responses_media_part(part: &Value) -> Option<Content> {
+    match part["type"].as_str() {
+        Some("input_image") => {
+            let detail = part["detail"]
+                .as_str()
+                .or_else(|| part["image_url"]["detail"].as_str());
+            let mut metadata = std::collections::HashMap::<String, Value>::new();
+            if let Some(d) = detail {
+                metadata.insert(
+                    tiygate_core::ir::IMAGE_DETAIL_KEY.to_string(),
+                    Value::String(d.to_string()),
+                );
+            }
+            if let Some(file_id) = part["file_id"].as_str().filter(|s| !s.is_empty()) {
+                return Some(Content::Media {
+                    source: tiygate_core::ir::MediaSource::FileId {
+                        id: file_id.to_string(),
+                    },
+                    mime_type: "image/*".to_string(),
+                    metadata,
+                    prompt_cache_breakpoint: decode_prompt_cache_breakpoint(part),
+                });
+            }
+            let raw_url = part["image_url"]
+                .as_str()
+                .or_else(|| part["image_url"]["url"].as_str())
+                .unwrap_or_default();
+            if raw_url.is_empty() {
+                return None;
+            }
+            let (source, mime_type) =
+                tiygate_core::ir::MediaSource::from_data_url(raw_url, "image/*");
+            Some(Content::Media {
+                source,
+                mime_type,
+                metadata,
+                prompt_cache_breakpoint: decode_prompt_cache_breakpoint(part),
+            })
+        }
+        Some("input_file") => {
+            let mut metadata = std::collections::HashMap::<String, Value>::new();
+            if let Some(name) = part["filename"].as_str().filter(|s| !s.is_empty()) {
+                metadata.insert("filename".to_string(), Value::String(name.to_string()));
+            }
+            if let Some(file_id) = part["file_id"].as_str().filter(|s| !s.is_empty()) {
+                return Some(Content::Media {
+                    source: tiygate_core::ir::MediaSource::FileId {
+                        id: file_id.to_string(),
+                    },
+                    mime_type: "application/octet-stream".to_string(),
+                    metadata,
+                    prompt_cache_breakpoint: decode_prompt_cache_breakpoint(part),
+                });
+            }
+            if let Some(url) = part["file_url"].as_str().filter(|s| !s.is_empty()) {
+                return Some(Content::Media {
+                    source: tiygate_core::ir::MediaSource::Url {
+                        url: url.to_string(),
+                    },
+                    mime_type: "application/octet-stream".to_string(),
+                    metadata,
+                    prompt_cache_breakpoint: decode_prompt_cache_breakpoint(part),
+                });
+            }
+            if let Some(data) = part["file_data"].as_str().filter(|s| !s.is_empty()) {
+                let (source, mime_type) =
+                    tiygate_core::ir::MediaSource::from_data_url(data, "application/octet-stream");
+                return Some(Content::Media {
+                    source,
+                    mime_type,
+                    metadata,
+                    prompt_cache_breakpoint: decode_prompt_cache_breakpoint(part),
+                });
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 impl ResponsesCodec {
@@ -99,6 +370,8 @@ impl ResponsesCodec {
                 structured_output: true,
                 function_calling: true,
                 parallel_tool_calls: true,
+                hosted_tools: true,
+                programmatic_tool_calling: true,
                 extended_reasoning: true,
                 deterministic_seed: false,
                 tool_choice_required: true,
@@ -131,14 +404,40 @@ impl EndpointCodec for ResponsesCodec {
         let stream = body["stream"].as_bool().unwrap_or(false);
         let system = body["instructions"].as_str().map(String::from);
         let mut messages: Vec<Message> = Vec::new();
-        let mut codex_opaque_items: Vec<Value> = Vec::new();
+        // Ordered bag of Responses-only opaque input items (Codex + multi-agent).
+        // Each entry is `{ "index": <original_input_index>, "item": <raw_json> }`
+        // so same-protocol re-encode can restore original interleaving.
+        let mut opaque_input_items: Vec<Value> = Vec::new();
+        // Separate multi-agent presence bag for lossy rejection (content only).
+        let mut multi_agent_items: Vec<Value> = Vec::new();
 
         if let Some(arr) = body["input"].as_array() {
             let mut call_id_counts: HashMap<String, usize> = HashMap::new();
             let mut call_id_remap: HashMap<String, VecDeque<String>> = HashMap::new();
             let mut used_call_ids: HashSet<String> = HashSet::new();
+            // Once an opaque item is present, every modeled input item must
+            // retain its own boundary. The opaque-item replay indexes refer to
+            // the original input array, while coalescing consecutive messages
+            // would reduce the modeled item count and shift later indexes.
+            let preserve_input_item_boundaries = arr.iter().any(|item| {
+                matches!(
+                    item["type"].as_str(),
+                    Some("tool_search_call")
+                        | Some("tool_search_output")
+                        | Some("agent_message")
+                        | Some("compaction")
+                        | Some("compaction_trigger")
+                        | Some("context_compaction")
+                        | Some("multi_agent_call")
+                        | Some("multi_agent_call_output")
+                )
+            });
+            // When an opaque item appears between two same-role messages,
+            // keep those messages separate so ordered opaque replay can
+            // reinsert the item at its original index.
+            let mut break_role_merge = false;
 
-            for item in arr {
+            for (input_index, item) in arr.iter().enumerate() {
                 // Responses typed items (function_call, function_call_output,
                 // reasoning) do NOT carry a `role` field — their semantic role
                 // is implied by the item type. Determine role from `type` first
@@ -147,10 +446,12 @@ impl EndpointCodec for ResponsesCodec {
                 // requires for tool_use blocks).
                 let role = match item["type"].as_str() {
                     Some("function_call")
+                    | Some("program")
                     | Some("reasoning")
                     | Some("local_shell_call")
                     | Some("custom_tool_call") => Role::Assistant,
                     Some("function_call_output")
+                    | Some("program_output")
                     | Some("local_shell_call_output")
                     | Some("custom_tool_call_output") => Role::Tool,
                     _ => match item["role"].as_str().unwrap_or("user") {
@@ -171,16 +472,37 @@ impl EndpointCodec for ResponsesCodec {
                         | Some("context_compaction")
                 ) {
                     // Known Codex opaque item types: preserve the raw JSON
-                    // for same-protocol replay. Cross-protocol egress drops
-                    // these silently (no lossy rejection). Must be checked
-                    // BEFORE the content-based branches because some opaque
-                    // items (e.g. agent_message) carry a `content` field.
-                    codex_opaque_items.push(item.clone());
+                    // with its original input index for same-protocol replay.
+                    // Cross-protocol egress drops these silently (no lossy
+                    // rejection). Must be checked BEFORE the content-based
+                    // branches because some opaque items (e.g. agent_message)
+                    // carry a `content` field.
+                    opaque_input_items.push(json!({
+                        "index": input_index,
+                        "item": item,
+                    }));
+                    vec![]
+                } else if matches!(
+                    item["type"].as_str(),
+                    Some("multi_agent_call") | Some("multi_agent_call_output")
+                ) {
+                    // GPT-5.6 Multi-agent Beta items: keep raw JSON under a
+                    // dedicated ordered extension so same-protocol re-encode
+                    // restores original interleaving, and keep a content-only
+                    // multi_agent_items bag so cross-protocol conversion can
+                    // hard-reject (unlike codex opaque items which drop
+                    // silently).
+                    multi_agent_items.push(item.clone());
+                    opaque_input_items.push(json!({
+                        "index": input_index,
+                        "item": item,
+                    }));
                     vec![]
                 } else if let Some(text) = item["content"].as_str() {
                     vec![Content::Text {
                         text: text.to_string(),
                         annotations: None,
+                        prompt_cache_breakpoint: None,
                     }]
                 } else if let Some(content_arr) = item["content"].as_array() {
                     let mut parts = Vec::new();
@@ -190,47 +512,32 @@ impl EndpointCodec for ResponsesCodec {
                                 parts.push(Content::Text {
                                     text: part["text"].as_str().unwrap_or("").to_string(),
                                     annotations: None,
+                                    prompt_cache_breakpoint: decode_prompt_cache_breakpoint(part),
                                 });
                             }
-                            Some("input_image") => {
-                                // Accept both the string form
-                                // `{"image_url": "data:..."}` and the object
-                                // form `{"image_url": {"url": "...",
-                                // "detail": "..."}}`.
-                                let (raw_url, detail) = if let Some(s) = part["image_url"].as_str()
-                                {
-                                    (s, None)
-                                } else if let Some(s) = part["image_url"]["url"].as_str() {
-                                    (s, part["image_url"]["detail"].as_str())
-                                } else {
-                                    ("", None)
-                                };
-                                if !raw_url.is_empty() {
-                                    let (source, mime_type) =
-                                        tiygate_core::ir::MediaSource::from_data_url(
-                                            raw_url, "image/*",
-                                        );
-                                    let mut metadata = std::collections::HashMap::<
-                                        String,
-                                        serde_json::Value,
-                                    >::new();
-                                    if let Some(d) = detail {
-                                        metadata.insert(
-                                            tiygate_core::ir::IMAGE_DETAIL_KEY.to_string(),
-                                            serde_json::Value::String(d.to_string()),
-                                        );
-                                    }
-                                    parts.push(Content::Media {
-                                        source,
-                                        mime_type,
-                                        metadata,
-                                    });
+                            Some("input_image") | Some("input_file") => {
+                                if let Some(media) = decode_responses_media_part(part) {
+                                    parts.push(media);
                                 }
                             }
                             _ => {}
                         }
                     }
                     parts
+                } else if item["type"] == "program" {
+                    vec![Content::Program {
+                        id: item["id"].as_str().unwrap_or("").to_string(),
+                        call_id: item["call_id"].as_str().unwrap_or("").to_string(),
+                        code: item["code"].as_str().unwrap_or("").to_string(),
+                        fingerprint: item["fingerprint"].as_str().unwrap_or("").to_string(),
+                    }]
+                } else if item["type"] == "program_output" {
+                    vec![Content::ProgramOutput {
+                        id: item["id"].as_str().unwrap_or("").to_string(),
+                        call_id: item["call_id"].as_str().unwrap_or("").to_string(),
+                        result: item["result"].as_str().unwrap_or("").to_string(),
+                        status: item["status"].as_str().unwrap_or("completed").to_string(),
+                    }]
                 } else if item["type"] == "function_call" {
                     // Responses uses `call_id`; fall back to `id` for proxies
                     // that only emit the item id. Some clients emit duplicated
@@ -258,15 +565,18 @@ impl EndpointCodec for ResponsesCodec {
                     let original_call_id = item["call_id"].as_str().map(|s| s.to_string());
                     // If the item has both `id` (item ref) and `call_id`
                     // (function-call identifier), store the item ref in IR
-                    // `id` and the call_id in IR `call_id`. Otherwise the
-                    // deduped id serves both roles.
+                    // `id` and the *normalized unique* call_id in IR
+                    // `call_id`. Cross-protocol encoders (Anthropic/Chat)
+                    // pair tool_use/tool_result via
+                    // `call_id.as_deref().unwrap_or(id)`, so the unique
+                    // call_id must live in IR.call_id (and in the remap
+                    // queue for following outputs). Using the raw
+                    // (possibly duplicated) call_id here would leave
+                    // ToolCall and ToolResult with mismatched pairing ids.
                     let (ir_id, ir_call_id) = if item_ref.is_some() && original_call_id.is_some() {
                         // IR `id` = item reference (e.g. `fc_xxx`)
-                        // IR `call_id` = function-call id (e.g. `call_xxx`)
-                        (
-                            item_ref.clone().unwrap_or_default(),
-                            original_call_id.clone(),
-                        )
+                        // IR `call_id` = unique function-call id
+                        (item_ref.clone().unwrap_or_default(), Some(id))
                     } else {
                         (id, None)
                     };
@@ -277,6 +587,8 @@ impl EndpointCodec for ResponsesCodec {
                         arguments: serde_json::from_str(item["arguments"].as_str().unwrap_or("{}"))
                             .unwrap_or(json!({})),
                         call_id: ir_call_id,
+                        caller: decode_tool_caller(item),
+                        wire_type: None,
                     }]
                 } else if item["type"] == "function_call_output" {
                     // `output` is usually a string but some clients send a
@@ -300,6 +612,8 @@ impl EndpointCodec for ResponsesCodec {
                         name: String::new(),
                         content: output,
                         id: item_id,
+                        caller: decode_tool_caller(item),
+                        wire_type: None,
                     }]
                 } else if item["type"] == "reasoning" {
                     // Reasoning input item (replayed assistant chain-of-thought).
@@ -340,6 +654,8 @@ impl EndpointCodec for ResponsesCodec {
                         call_id: Some(id),
                         name: "local_shell".to_string(),
                         arguments,
+                        caller: None,
+                        wire_type: Some("local_shell_call".to_string()),
                     }]
                 } else if item["type"] == "local_shell_call_output" {
                     let output = match &item["output"] {
@@ -353,10 +669,14 @@ impl EndpointCodec for ResponsesCodec {
                         name: String::new(),
                         content: output,
                         id: None,
+                        caller: None,
+                        wire_type: Some("local_shell_call_output".to_string()),
                     }]
                 } else if item["type"] == "custom_tool_call" {
                     // Codex custom_tool_call: map to a ToolCall with the
                     // tool name and input text wrapped as JSON arguments.
+                    // Preserve wire_type so same-protocol re-encode restores
+                    // `custom_tool_call` rather than function_call.
                     let id = responses_call_id(item).unwrap_or("").to_string();
                     let name = item["name"].as_str().unwrap_or("").to_string();
                     let input_text = item["input"].as_str().unwrap_or("").to_string();
@@ -365,6 +685,8 @@ impl EndpointCodec for ResponsesCodec {
                         call_id: Some(id),
                         name,
                         arguments: json!({"input": input_text}),
+                        caller: None,
+                        wire_type: Some("custom_tool_call".to_string()),
                     }]
                 } else if item["type"] == "custom_tool_call_output" {
                     let output = match &item["output"] {
@@ -378,11 +700,14 @@ impl EndpointCodec for ResponsesCodec {
                         name: String::new(),
                         content: output,
                         id: None,
+                        caller: None,
+                        wire_type: Some("custom_tool_call_output".to_string()),
                     }]
                 } else {
                     vec![Content::Text {
                         text: String::new(),
                         annotations: None,
+                        prompt_cache_breakpoint: None,
                     }]
                 };
                 // Merge consecutive items with the same role into one Message
@@ -391,13 +716,20 @@ impl EndpointCodec for ResponsesCodec {
                 // cross-protocol conversion: the Chat Completions encoder gates
                 // reasoning_content on the presence of tool_calls *within the
                 // same message*, so splitting them would silently drop reasoning.
+                //
+                // Exception: when an opaque Codex / multi-agent item sits between
+                // two same-role messages, do NOT merge them — otherwise the
+                // original input interleaving cannot be restored on re-encode.
                 if content.is_empty() {
-                    // Opaque Codex items produce no IR content; skip message
-                    // creation to avoid inserting empty placeholder messages.
+                    // Opaque Codex / multi-agent items produce no IR content;
+                    // skip message creation and force the next same-role item
+                    // to start a new message so ordered opaque replay stays
+                    // index-aligned with modeled items.
+                    break_role_merge = true;
                     continue;
                 }
                 if let Some(last) = messages.last_mut() {
-                    if last.role == role {
+                    if last.role == role && !break_role_merge && !preserve_input_item_boundaries {
                         last.content.extend(content);
                     } else {
                         messages.push(Message { role, content });
@@ -405,6 +737,7 @@ impl EndpointCodec for ResponsesCodec {
                 } else {
                     messages.push(Message { role, content });
                 }
+                break_role_merge = false;
             }
         } else if let Some(text) = body["input"].as_str() {
             // OpenAI Responses API allows `input` to be a plain string
@@ -415,6 +748,7 @@ impl EndpointCodec for ResponsesCodec {
                 content: vec![Content::Text {
                     text: text.to_string(),
                     annotations: None,
+                    prompt_cache_breakpoint: None,
                 }],
             });
         }
@@ -423,11 +757,82 @@ impl EndpointCodec for ResponsesCodec {
             .as_array()
             .map(|arr| {
                 arr.iter()
-                    .map(|t| Tool {
-                        name: t["name"].as_str().unwrap_or("").to_string(),
-                        description: t["description"].as_str().map(String::from),
-                        parameters: t["parameters"].as_object().map(|p| json!(p)),
-                        required: false,
+                    .map(|t| {
+                        let tool_type = t["type"].as_str().map(String::from);
+                        match tool_type.as_deref() {
+                            None | Some("function") => {
+                                let mut config = t.as_object().cloned().unwrap_or_default();
+                                for key in ["type", "name", "description", "parameters"] {
+                                    config.remove(key);
+                                }
+                                Tool {
+                                    name: t["name"].as_str().unwrap_or("").to_string(),
+                                    description: t["description"].as_str().map(String::from),
+                                    parameters: t["parameters"].as_object().map(|p| json!(p)),
+                                    required: false,
+                                    tool_type: if tool_type.as_deref() == Some("function") {
+                                        Some("function".to_string())
+                                    } else {
+                                        None
+                                    },
+                                    config: (!config.is_empty()).then_some(Value::Object(config)),
+                                }
+                            }
+                            Some("custom") => {
+                                // OpenAI custom tools are first-class on Chat and
+                                // Responses (not hosted tools). Keep remaining
+                                // non-standard fields in config for round-trip.
+                                let mut config = serde_json::Map::new();
+                                if let Some(obj) = t.as_object() {
+                                    for (k, v) in obj {
+                                        if k != "type"
+                                            && k != "name"
+                                            && k != "description"
+                                            && k != "parameters"
+                                        {
+                                            config.insert(k.clone(), v.clone());
+                                        }
+                                    }
+                                }
+                                Tool {
+                                    name: t["name"].as_str().unwrap_or("").to_string(),
+                                    description: t["description"].as_str().map(String::from),
+                                    parameters: t.get("parameters").cloned(),
+                                    required: false,
+                                    tool_type: Some("custom".to_string()),
+                                    config: if config.is_empty() {
+                                        None
+                                    } else {
+                                        Some(Value::Object(config))
+                                    },
+                                }
+                            }
+                            _ => {
+                                // Hosted tools: preserve type + remaining fields.
+                                let mut config = t.as_object().cloned().unwrap_or_default();
+                                config.remove("type");
+                                let name = config
+                                    .remove("name")
+                                    .and_then(|v| v.as_str().map(String::from))
+                                    .unwrap_or_default();
+                                let description = config
+                                    .remove("description")
+                                    .and_then(|v| v.as_str().map(String::from));
+                                let parameters = config.remove("parameters");
+                                Tool {
+                                    name,
+                                    description,
+                                    parameters,
+                                    required: false,
+                                    tool_type,
+                                    config: if config.is_empty() {
+                                        None
+                                    } else {
+                                        Some(Value::Object(config))
+                                    },
+                                }
+                            }
+                        }
                     })
                     .collect()
             })
@@ -446,29 +851,42 @@ impl EndpointCodec for ResponsesCodec {
                 })
                 .unwrap_or_default(),
             thinking: body.get("reasoning").and_then(|r| {
-                let effort = r.get("effort").and_then(|v| v.as_str()).map(|s| {
+                let effort = r.get("effort").and_then(|v| v.as_str()).and_then(|s| {
                     use tiygate_core::ThinkingEffort;
                     match s {
-                        "minimal" => ThinkingEffort::Minimal,
-                        "low" => ThinkingEffort::Low,
-                        "medium" => ThinkingEffort::Medium,
-                        "high" => ThinkingEffort::High,
-                        "xhigh" => ThinkingEffort::XHigh,
-                        "max" => ThinkingEffort::Max,
-                        _ => ThinkingEffort::High,
+                        "none" => Some(ThinkingEffort::None),
+                        "minimal" => Some(ThinkingEffort::Minimal),
+                        "low" => Some(ThinkingEffort::Low),
+                        "medium" => Some(ThinkingEffort::Medium),
+                        "high" => Some(ThinkingEffort::High),
+                        "xhigh" => Some(ThinkingEffort::XHigh),
+                        "max" => Some(ThinkingEffort::Max),
+                        _ => None,
                     }
                 });
                 let summary = r.get("summary").and_then(|v| v.as_str()).map(String::from);
-                if effort.is_none() && summary.is_none() {
+                let mode = r.get("mode").and_then(|v| v.as_str()).map(String::from);
+                let context = r.get("context").cloned();
+                if effort.is_none() && summary.is_none() && mode.is_none() && context.is_none() {
                     None
                 } else {
                     Some(tiygate_core::ThinkingConfig {
                         effort,
                         summary,
+                        mode,
+                        context,
                         ..Default::default()
                     })
                 }
             }),
+            verbosity: body["text"]["verbosity"]
+                .as_str()
+                .and_then(|value| match value {
+                    "low" => Some(Verbosity::Low),
+                    "medium" => Some(Verbosity::Medium),
+                    "high" => Some(Verbosity::High),
+                    _ => None,
+                }),
             ..Default::default()
         };
 
@@ -491,6 +909,27 @@ impl EndpointCodec for ResponsesCodec {
             extensions.insert("reasoning_full".to_string(), re.clone());
         }
 
+        if let Some(safety_identifier) = body.get("safety_identifier") {
+            extensions.insert(
+                "openai.safety_identifier".to_string(),
+                safety_identifier.clone(),
+            );
+        }
+        if let Some(prompt_cache_options) = body.get("prompt_cache_options") {
+            extensions.insert(
+                "openai.prompt_cache_options".to_string(),
+                prompt_cache_options.clone(),
+            );
+        }
+        // Shared OpenAI cache-key extensions so Chat ↔ Responses conversion
+        // preserves prompt_cache_key / prompt_cache_retention.
+        if let Some(value) = body.get("prompt_cache_key") {
+            extensions.insert("openai.prompt_cache_key".to_string(), value.clone());
+        }
+        if let Some(value) = body.get("prompt_cache_retention") {
+            extensions.insert("openai.prompt_cache_retention".to_string(), value.clone());
+        }
+
         // Preserve Responses-specific top-level fields the IR does not model so
         // a same-protocol re-encode is lossless. Stored under a prefixed key.
         {
@@ -506,7 +945,9 @@ impl EndpointCodec for ResponsesCodec {
                 "include",
                 "prompt_cache_key",
                 "prompt_cache_retention",
+                "prompt_cache_options",
                 "client_metadata",
+                "multi_agent",
             ] {
                 if let Some(v) = body.get(key) {
                     extra.insert(key.to_string(), v.clone());
@@ -517,12 +958,46 @@ impl EndpointCodec for ResponsesCodec {
             }
         }
 
-        // Preserve Codex opaque input items (tool_search_call, agent_message,
-        // compaction, etc.) for same-protocol replay. Cross-protocol egress
-        // drops these silently.
+        // Ordered opaque input items (Codex + multi-agent) for same-protocol
+        // re-encode that preserves original input interleaving. Cross-protocol
+        // egress drops these silently unless multi-agent hard-reject fires.
+        if !opaque_input_items.is_empty() {
+            extensions.insert(
+                "responses_opaque_input_items".to_string(),
+                json!(opaque_input_items),
+            );
+        }
+        // Backward-compatible Codex bag (content only, no indices). Prefer the
+        // ordered extension on encode; this remains for older IR snapshots.
+        let codex_opaque_items: Vec<Value> = opaque_input_items
+            .iter()
+            .filter_map(|entry| {
+                let item = entry.get("item")?;
+                match item.get("type").and_then(|v| v.as_str()) {
+                    Some("tool_search_call")
+                    | Some("tool_search_output")
+                    | Some("agent_message")
+                    | Some("compaction")
+                    | Some("compaction_trigger")
+                    | Some("context_compaction") => Some(item.clone()),
+                    _ => None,
+                }
+            })
+            .collect();
         if !codex_opaque_items.is_empty() {
             extensions.insert("codex_opaque_items".to_string(), json!(codex_opaque_items));
         }
+
+        // GPT-5.6 Multi-agent Beta input items (content only) so lossy guard
+        // can hard-reject cross-protocol conversion.
+        if !multi_agent_items.is_empty() {
+            extensions.insert("multi_agent_items".to_string(), json!(multi_agent_items));
+        }
+
+        // Promote `text.format` into IR response_format so Chat ↔ Responses
+        // Convert can rehydrate structured-output constraints. The full `text`
+        // object remains in extensions for same-protocol fidelity.
+        let response_format = body.get("text").and_then(decode_text_format);
 
         Ok(IrRequest {
             model,
@@ -530,7 +1005,7 @@ impl EndpointCodec for ResponsesCodec {
             messages,
             tools,
             params,
-            response_format: None,
+            response_format,
             stream,
             ingress_protocol: self.id.clone(),
             metadata: body.get("metadata").and_then(|m| m.as_object()).map(|obj| {
@@ -548,12 +1023,23 @@ impl EndpointCodec for ResponsesCodec {
             response["id"] = json!(id);
         }
         let mut output_items = Vec::new();
-        let mut message_text = String::new();
-        let mut tool_calls = Vec::new();
+        let mut pending_text = String::new();
+        let flush_text = |pending: &mut String, output: &mut Vec<Value>| {
+            if pending.is_empty() {
+                return;
+            }
+            let index = output.len();
+            output.push(json!({
+                "id": format!("{}_msg_{index}", ir.response_id.as_deref().unwrap_or("msg")),
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": std::mem::take(pending)}]
+            }));
+        };
         for c in &ir.content {
             match c {
                 Content::Text { text, .. } => {
-                    message_text.push_str(text);
+                    pending_text.push_str(text);
                 }
                 Content::Reasoning {
                     text,
@@ -561,6 +1047,7 @@ impl EndpointCodec for ResponsesCodec {
                     encrypted_content,
                     ..
                 } => {
+                    flush_text(&mut pending_text, &mut output_items);
                     // Empty reasoning text re-encodes to `summary: []` (not a
                     // summary part with an empty string) so encrypted-only
                     // reasoning round-trips to the exact OpenAI wire shape.
@@ -583,36 +1070,111 @@ impl EndpointCodec for ResponsesCodec {
                     name,
                     arguments,
                     call_id,
+                    caller,
+                    wire_type,
                 } => {
+                    flush_text(&mut pending_text, &mut output_items);
                     // Use `call_id` when available (Responses round-trip),
                     // otherwise fall back to `id` (cross-protocol).
                     let wire_call_id = call_id.as_deref().unwrap_or(id);
-                    let mut tc = json!({"type": "function_call", "call_id": wire_call_id, "name": name, "arguments": serde_json::to_string(arguments).unwrap_or_default(), "status": "completed"});
+                    let item_type = wire_type.as_deref().unwrap_or("function_call");
+                    let mut tc = if is_responses_custom_tool_call(wire_type.as_deref()) {
+                        let input = responses_custom_tool_input(arguments);
+                        json!({
+                            "type": "custom_tool_call",
+                            "call_id": wire_call_id,
+                            "name": name,
+                            "input": input,
+                            "status": "completed"
+                        })
+                    } else if item_type == "local_shell_call" {
+                        json!({
+                            "type": "local_shell_call",
+                            "call_id": wire_call_id,
+                            "action": arguments,
+                            "status": "completed"
+                        })
+                    } else {
+                        json!({
+                            "type": "function_call",
+                            "call_id": wire_call_id,
+                            "name": name,
+                            "arguments": serde_json::to_string(arguments).unwrap_or_default(),
+                            "status": "completed"
+                        })
+                    };
                     // Include the item reference `id` when available.
                     if call_id.is_some() {
                         tc["id"] = json!(id);
                     }
-                    tool_calls.push(tc);
+                    if let Some(caller) = caller {
+                        tc["caller"] = json!(caller);
+                    }
+                    output_items.push(tc);
+                }
+                Content::Program {
+                    id,
+                    call_id,
+                    code,
+                    fingerprint,
+                } => {
+                    flush_text(&mut pending_text, &mut output_items);
+                    output_items.push(json!({
+                        "type": "program",
+                        "id": id,
+                        "call_id": call_id,
+                        "code": code,
+                        "fingerprint": fingerprint,
+                    }));
+                }
+                Content::ProgramOutput {
+                    id,
+                    call_id,
+                    result,
+                    status,
+                } => {
+                    flush_text(&mut pending_text, &mut output_items);
+                    output_items.push(json!({
+                        "type": "program_output",
+                        "id": id,
+                        "call_id": call_id,
+                        "result": result,
+                        "status": status,
+                    }));
                 }
                 Content::Refusal { text, .. } => {
+                    flush_text(&mut pending_text, &mut output_items);
                     output_items.push(json!({"type": "refusal", "refusal": text}));
                 }
                 _ => {}
             }
         }
-        if !message_text.is_empty() {
-            output_items.push(json!({"id": ir.response_id.as_deref().unwrap_or("msg_0"), "type": "message", "role": "assistant", "content": [{"type": "output_text", "text": message_text}]}));
+        flush_text(&mut pending_text, &mut output_items);
+        if let Some(original_output) = ir
+            .extensions
+            .get("responses_original_output")
+            .and_then(|value| value.as_array())
+        {
+            // Opaque output items can be interleaved with several modeled
+            // message items. `IrResponse::content` intentionally flattens
+            // those messages, so rebuilding then inserting opaque items by
+            // their old indexes can move later text ahead of a hosted-tool
+            // result. Same-protocol replay uses this source snapshot to retain
+            // the exact item order and item boundaries.
+            response["output"] = json!(original_output);
+        } else {
+            response["output"] = json!(output_items);
         }
-        for tc in &tool_calls {
-            output_items.push(tc.clone());
-        }
-        response["output"] = json!(output_items);
         if let Some(fr) = &ir.finish_reason {
             response["status"] = json!(match fr {
                 FinishReason::Stop => "completed",
                 FinishReason::Length => "incomplete",
                 FinishReason::ContentFilter => "incomplete",
-                FinishReason::ToolCalls => "incomplete",
+                // OpenAI Responses reports `status: "completed"` for tool-call
+                // turns.  The streaming encoder already maps ToolCalls →
+                // "completed"; align the non-streaming encoder so cross-protocol
+                // round-trips preserve the status.
+                FinishReason::ToolCalls => "completed",
                 _ => "completed",
             });
         }
@@ -628,8 +1190,15 @@ impl EndpointCodec for ResponsesCodec {
                 "output_tokens": usage.completion_tokens,
                 "total_tokens": total_for_responses,
             });
+            let mut input_details = serde_json::Map::new();
             if cache_read > 0 {
-                response["usage"]["input_tokens_details"] = json!({"cached_tokens": cache_read});
+                input_details.insert("cached_tokens".to_string(), json!(cache_read));
+            }
+            if cache_write > 0 {
+                input_details.insert("cache_write_tokens".to_string(), json!(cache_write));
+            }
+            if !input_details.is_empty() {
+                response["usage"]["input_tokens_details"] = json!(input_details);
             }
             if let Some(rt) = usage.reasoning_tokens {
                 response["usage"]["output_tokens_details"] = json!({"reasoning_tokens": rt});
@@ -646,18 +1215,86 @@ impl EndpointCodec for ResponsesCodec {
     }
 
     fn encode_request(&self, ir: &IrRequest) -> Result<(Value, HeaderMap), tiygate_core::Error> {
+        tiygate_core::protocol::structured_output::validate_response_format_for_target(
+            ir.response_format.as_ref(),
+            self.id(),
+        )
+        .map_err(|error| tiygate_core::Error::Codec(error.to_string()))?;
+
         let mut body = json!({"model": ir.model, "stream": ir.stream});
         if let Some(sys) = &ir.system {
             body["instructions"] = json!(sys);
         }
         let mut input_items = Vec::new();
+        // Opaque input entries are indexed against the original Responses
+        // input array. Keep developer messages as input items in this mode;
+        // flattening them into `instructions` would remove an indexed item and
+        // shift every opaque entry that follows it.
+        let preserve_input_item_boundaries = ir
+            .extensions
+            .get("responses_opaque_input_items")
+            .and_then(|value| value.as_array())
+            .is_some_and(|items| !items.is_empty());
         for msg in &ir.messages {
             match msg.role {
                 Role::System => {
-                    for c in &msg.content {
-                        if let Content::Text { text, .. } = c {
-                            let existing = body["instructions"].as_str().unwrap_or("");
-                            body["instructions"] = json!(format!("{existing}\n{text}"));
+                    let has_breakpoint = msg.content.iter().any(|content| {
+                        matches!(
+                            content,
+                            Content::Text {
+                                prompt_cache_breakpoint: Some(_),
+                                ..
+                            } | Content::Media {
+                                prompt_cache_breakpoint: Some(_),
+                                ..
+                            }
+                        )
+                    });
+                    if has_breakpoint || preserve_input_item_boundaries {
+                        let mut content_parts = Vec::new();
+                        for content in &msg.content {
+                            match content {
+                                Content::Text {
+                                    text,
+                                    prompt_cache_breakpoint,
+                                    ..
+                                } => {
+                                    let mut part = json!({"type": "input_text", "text": text});
+                                    if let Some(breakpoint) = prompt_cache_breakpoint {
+                                        part["prompt_cache_breakpoint"] = json!(breakpoint);
+                                    }
+                                    content_parts.push(part);
+                                }
+                                Content::Media {
+                                    source,
+                                    mime_type,
+                                    metadata,
+                                    prompt_cache_breakpoint,
+                                } => {
+                                    if let Some(part) = encode_responses_media_part(
+                                        source,
+                                        mime_type,
+                                        metadata,
+                                        prompt_cache_breakpoint,
+                                    ) {
+                                        content_parts.push(part);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        if !content_parts.is_empty() {
+                            input_items.push(json!({
+                                "role": "developer",
+                                "content": content_parts,
+                            }));
+                        }
+                    } else {
+                        for c in &msg.content {
+                            if let Content::Text { text, .. } = c {
+                                let existing = body["instructions"].as_str().unwrap_or("");
+                                body["instructions"] = json!(format!("{existing}\n{text}"));
+                            }
                         }
                     }
                 }
@@ -667,74 +1304,74 @@ impl EndpointCodec for ResponsesCodec {
                         Role::Assistant => "assistant",
                         _ => "user",
                     };
+                    // Walk content in original order so PTC interleaving
+                    // (reasoning / program / function_call / text / outputs)
+                    // is preserved. Text and media parts are buffered and
+                    // flushed as a single message item when a non-text item
+                    // arrives or the turn ends.
                     let mut text_parts: Vec<Value> = Vec::new();
-                    let mut reasoning_items: Vec<Value> = Vec::new();
-                    let mut tool_calls_json: Vec<Value> = Vec::new();
-                    let mut tool_outputs_json: Vec<Value> = Vec::new();
+
+                    let flush_text_message =
+                        |text_parts: &mut Vec<Value>,
+                         input_items: &mut Vec<Value>,
+                         role_str: &str| {
+                            if text_parts.is_empty() {
+                                return;
+                            }
+                            let parts = std::mem::take(text_parts);
+                            let mut item = json!({"role": role_str});
+                            if parts.len() == 1
+                                && parts[0]
+                                    .get("type")
+                                    .map(|v| v == "input_text")
+                                    .unwrap_or(false)
+                                && parts[0].get("prompt_cache_breakpoint").is_none()
+                            {
+                                item["content"] = parts[0]["text"].clone();
+                            } else {
+                                item["content"] = json!(parts);
+                            }
+                            input_items.push(item);
+                        };
 
                     for c in &msg.content {
                         match c {
-                            Content::Text { text, .. } => {
-                                text_parts.push(json!({"type": "input_text", "text": text}));
+                            Content::Text {
+                                text,
+                                prompt_cache_breakpoint,
+                                ..
+                            } => {
+                                let mut part = json!({"type": "input_text", "text": text});
+                                if let Some(breakpoint) = prompt_cache_breakpoint {
+                                    part["prompt_cache_breakpoint"] = json!(breakpoint);
+                                }
+                                text_parts.push(part);
                             }
                             Content::Media {
                                 source,
                                 mime_type,
                                 metadata,
-                                ..
-                            } => match source {
-                                tiygate_core::ir::MediaSource::Url { url } => {
-                                    let mut obj = json!({
-                                        "type": "input_image",
-                                        "image_url": url
-                                    });
-                                    if let Some(d) =
-                                        metadata.get(tiygate_core::ir::IMAGE_DETAIL_KEY)
-                                    {
-                                        obj["detail"] = d.clone();
-                                    }
-                                    text_parts.push(obj);
+                                prompt_cache_breakpoint,
+                            } => {
+                                if let Some(part) = encode_responses_media_part(
+                                    source,
+                                    mime_type,
+                                    metadata,
+                                    prompt_cache_breakpoint,
+                                ) {
+                                    text_parts.push(part);
                                 }
-                                tiygate_core::ir::MediaSource::Inline { data } => {
-                                    let mut obj = json!({
-                                        "type": "input_image",
-                                        "image_url": format!("data:{};base64,{}", mime_type, data)
-                                    });
-                                    if let Some(d) =
-                                        metadata.get(tiygate_core::ir::IMAGE_DETAIL_KEY)
-                                    {
-                                        obj["detail"] = d.clone();
-                                    }
-                                    text_parts.push(obj);
-                                }
-                                _ => {}
-                            },
+                            }
                             Content::Reasoning {
                                 text,
                                 id,
                                 encrypted_content,
                                 ..
                             } => {
+                                flush_text_message(&mut text_parts, &mut input_items, role_str);
                                 // Responses API treats reasoning as a sibling
-                                // output/input item, NOT as a content sub-part
-                                // of the message. The OpenAI Responses spec
-                                // (and the Deepseek thinking-mode spec it
-                                // mirrors) requires that the reasoning item be
-                                // echoed back alongside any function_call
-                                // item the same turn produced — otherwise
-                                // the request is rejected.
-                                //
-                                // Each reasoning block is emitted as its own
-                                // item so a Responses-issued `id` (`rs_...`)
-                                // can be replayed verbatim. The Responses API
-                                // pairs each reasoning item with the following
-                                // item by id; replaying the original id keeps
-                                // same-protocol multi-turn from 400ing with
-                                // "Item provided without its required preceding
-                                // item of type reasoning". Cross-protocol
-                                // reasoning has no Responses id (id == None),
-                                // so we emit it idless rather than fabricate
-                                // one.
+                                // input item. Replay the original `rs_...` id
+                                // when present so multi-turn pairing stays valid.
                                 let summary = if text.is_empty() {
                                     json!([])
                                 } else {
@@ -750,52 +1387,126 @@ impl EndpointCodec for ResponsesCodec {
                                 if let Some(enc) = encrypted_content {
                                     item["encrypted_content"] = json!(enc);
                                 }
-                                reasoning_items.push(item);
+                                input_items.push(item);
                             }
                             Content::ToolCall {
                                 id,
                                 name,
                                 arguments,
                                 call_id,
+                                caller,
+                                wire_type,
                             } => {
-                                let args_str = match arguments {
-                                    serde_json::Value::String(s) => s.clone(),
-                                    other => other.to_string(),
-                                };
-                                // Use the dedicated `call_id` when present
-                                // (Responses round-trip); otherwise `id` serves
-                                // both roles (cross-protocol).
+                                flush_text_message(&mut text_parts, &mut input_items, role_str);
                                 let wire_call_id = call_id.as_deref().unwrap_or(id);
-                                let mut fc = json!({
-                                    "type": "function_call",
-                                    "call_id": wire_call_id,
-                                    "name": name,
-                                    "arguments": args_str,
-                                });
-                                // Include the item reference `id` when the IR
-                                // carries a separate call_id.
+                                let item_type = wire_type.as_deref().unwrap_or("function_call");
+                                let mut fc = if is_responses_custom_tool_call(wire_type.as_deref())
+                                {
+                                    let input = responses_custom_tool_input(arguments);
+                                    json!({
+                                        "type": "custom_tool_call",
+                                        "call_id": wire_call_id,
+                                        "name": name,
+                                        "input": input,
+                                    })
+                                } else if item_type == "local_shell_call" {
+                                    json!({
+                                        "type": "local_shell_call",
+                                        "call_id": wire_call_id,
+                                        "action": arguments,
+                                    })
+                                } else {
+                                    let args_str = match arguments {
+                                        serde_json::Value::String(s) => s.clone(),
+                                        other => other.to_string(),
+                                    };
+                                    json!({
+                                        "type": "function_call",
+                                        "call_id": wire_call_id,
+                                        "name": name,
+                                        "arguments": args_str,
+                                    })
+                                };
                                 if call_id.is_some() {
                                     fc["id"] = json!(id);
                                 }
-                                tool_calls_json.push(fc);
+                                if let Some(caller) = caller {
+                                    fc["caller"] = json!(caller);
+                                }
+                                input_items.push(fc);
                             }
                             Content::ToolResult {
                                 tool_call_id,
                                 name: _,
                                 content,
                                 id,
+                                caller,
+                                wire_type,
                             } => {
+                                flush_text_message(&mut text_parts, &mut input_items, role_str);
                                 // Cross-protocol Anthropic Messages carries
-                                // `tool_result` blocks inside a user message,
-                                // while Responses requires a sibling
-                                // `function_call_output` input item. Preserve
-                                // them regardless of the IR message role so
-                                // prior function calls have matching outputs.
-                                tool_outputs_json.push(responses_function_call_output(
-                                    tool_call_id,
-                                    content,
-                                    id.as_deref(),
-                                ));
+                                // tool_result inside a user message; Responses
+                                // requires a sibling function_call_output item.
+                                // Preserve custom/local_shell wire types for
+                                // same-protocol multi-turn fidelity.
+                                if wire_type.as_deref() == Some("custom_tool_call_output") {
+                                    let mut item = json!({
+                                        "type": "custom_tool_call_output",
+                                        "call_id": tool_call_id,
+                                        "output": content,
+                                    });
+                                    if let Some(item_id) = id {
+                                        item["id"] = json!(item_id);
+                                    }
+                                    input_items.push(item);
+                                } else if wire_type.as_deref() == Some("local_shell_call_output") {
+                                    let mut item = json!({
+                                        "type": "local_shell_call_output",
+                                        "call_id": tool_call_id,
+                                        "output": content,
+                                    });
+                                    if let Some(item_id) = id {
+                                        item["id"] = json!(item_id);
+                                    }
+                                    input_items.push(item);
+                                } else {
+                                    input_items.push(responses_function_call_output(
+                                        tool_call_id,
+                                        content,
+                                        id.as_deref(),
+                                        caller.as_ref(),
+                                    ));
+                                }
+                            }
+                            Content::Program {
+                                id,
+                                call_id,
+                                code,
+                                fingerprint,
+                            } => {
+                                flush_text_message(&mut text_parts, &mut input_items, role_str);
+                                input_items.push(json!({
+                                    "type": "program",
+                                    "id": id,
+                                    "call_id": call_id,
+                                    "code": code,
+                                    "fingerprint": fingerprint,
+                                }));
+                            }
+                            Content::ProgramOutput {
+                                id,
+                                call_id,
+                                result,
+                                status,
+                            } => {
+                                flush_text_message(&mut text_parts, &mut input_items, role_str);
+                                input_items.push(json!({
+                                    "type": "program_output",
+                                    "id": id,
+                                    "call_id": call_id,
+                                    "result": result,
+                                    "status": status,
+                                }));
                             }
                             Content::Refusal { text, .. } => {
                                 text_parts.push(json!({"type": "input_text", "text": text}));
@@ -803,36 +1514,7 @@ impl EndpointCodec for ResponsesCodec {
                         }
                     }
 
-                    for item in reasoning_items {
-                        input_items.push(item);
-                    }
-
-                    for tc in tool_calls_json {
-                        input_items.push(tc);
-                    }
-
-                    // Only emit a message item if there is text/image content.
-                    // A turn that is purely reasoning + function_call (the
-                    // shape Responses actually returns) is fully represented
-                    // by the items above.
-                    if !text_parts.is_empty() {
-                        let mut item = json!({"role": role_str});
-                        if text_parts.len() == 1
-                            && text_parts[0]
-                                .get("type")
-                                .map(|v| v == "input_text")
-                                .unwrap_or(false)
-                        {
-                            item["content"] = text_parts[0]["text"].clone();
-                        } else {
-                            item["content"] = json!(text_parts);
-                        }
-                        input_items.push(item);
-                    }
-
-                    for output in tool_outputs_json {
-                        input_items.push(output);
-                    }
+                    flush_text_message(&mut text_parts, &mut input_items, role_str);
                 }
                 Role::Tool => {
                     for c in &msg.content {
@@ -841,34 +1523,189 @@ impl EndpointCodec for ResponsesCodec {
                             name: _,
                             content,
                             id,
+                            caller,
+                            wire_type,
                         } = c
                         {
-                            input_items.push(responses_function_call_output(
-                                tool_call_id,
-                                content,
-                                id.as_deref(),
-                            ));
+                            if wire_type.as_deref() == Some("custom_tool_call_output") {
+                                let mut item = json!({
+                                    "type": "custom_tool_call_output",
+                                    "call_id": tool_call_id,
+                                    "output": content,
+                                });
+                                if let Some(item_id) = id {
+                                    item["id"] = json!(item_id);
+                                }
+                                input_items.push(item);
+                            } else if wire_type.as_deref() == Some("local_shell_call_output") {
+                                let mut item = json!({
+                                    "type": "local_shell_call_output",
+                                    "call_id": tool_call_id,
+                                    "output": content,
+                                });
+                                if let Some(item_id) = id {
+                                    item["id"] = json!(item_id);
+                                }
+                                input_items.push(item);
+                            } else {
+                                input_items.push(responses_function_call_output(
+                                    tool_call_id,
+                                    content,
+                                    id.as_deref(),
+                                    caller.as_ref(),
+                                ));
+                            }
+                        } else if let Content::ProgramOutput {
+                            id,
+                            call_id,
+                            result,
+                            status,
+                        } = c
+                        {
+                            input_items.push(json!({
+                                "type": "program_output",
+                                "id": id,
+                                "call_id": call_id,
+                                "result": result,
+                                "status": status,
+                            }));
                         }
                     }
                 }
             }
         }
-        body["input"] = json!(input_items);
-        // Restore Codex opaque input items (tool_search_call, agent_message,
-        // compaction, etc.) from extensions for same-protocol replay.
-        if let Some(opaque) = ir
+        // Merge modeled IR messages with ordered opaque input items so
+        // multi-agent / Codex items keep their original interleaving.
+        let ordered_opaque: Vec<(usize, Value)> = ir
             .extensions
-            .get("codex_opaque_items")
+            .get("responses_opaque_input_items")
             .and_then(|v| v.as_array())
-        {
-            if let Some(arr) = body["input"].as_array_mut() {
-                for item in opaque {
-                    arr.push(item.clone());
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|entry| {
+                        let index = entry.get("index")?.as_u64()? as usize;
+                        let item = entry.get("item")?.clone();
+                        Some((index, item))
+                    })
+                    .collect()
+            })
+            .unwrap_or_else(|| {
+                // Backward-compatible fallback: append-only bags from older IR.
+                let mut fallback = Vec::new();
+                let mut next = input_items.len();
+                if let Some(items) = ir
+                    .extensions
+                    .get("codex_opaque_items")
+                    .and_then(|v| v.as_array())
+                {
+                    for item in items {
+                        fallback.push((next, item.clone()));
+                        next += 1;
+                    }
+                }
+                if let Some(items) = ir
+                    .extensions
+                    .get("multi_agent_items")
+                    .and_then(|v| v.as_array())
+                {
+                    for item in items {
+                        fallback.push((next, item.clone()));
+                        next += 1;
+                    }
+                }
+                fallback
+            });
+        if ordered_opaque.is_empty() {
+            body["input"] = json!(input_items);
+        } else {
+            let mut merged = Vec::with_capacity(input_items.len() + ordered_opaque.len());
+            let mut opaque_iter = ordered_opaque.into_iter().peekable();
+            let mut modeled_idx = 0usize;
+            let mut cursor = 0usize;
+            while modeled_idx < input_items.len() || opaque_iter.peek().is_some() {
+                if let Some((index, _)) = opaque_iter.peek() {
+                    if *index == cursor || modeled_idx >= input_items.len() {
+                        if let Some((_, item)) = opaque_iter.next() {
+                            merged.push(item);
+                            cursor += 1;
+                        }
+                        continue;
+                    }
+                }
+                if modeled_idx < input_items.len() {
+                    merged.push(input_items[modeled_idx].clone());
+                    modeled_idx += 1;
+                    cursor += 1;
                 }
             }
+            body["input"] = json!(merged);
         }
         if !ir.tools.is_empty() {
-            let tools: Vec<Value> = ir.tools.iter().map(|t| json!({"type": "function", "name": t.name, "description": t.description, "parameters": t.parameters})).collect();
+            let tools: Vec<Value> = ir
+                .tools
+                .iter()
+                .map(|t| {
+                    if t.is_function() {
+                        let mut obj = json!({
+                            "type": "function",
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.parameters
+                        });
+                        if let Some(Value::Object(config)) = &t.config {
+                            if let Some(map) = obj.as_object_mut() {
+                                for (key, value) in config {
+                                    map.entry(key.clone()).or_insert_with(|| value.clone());
+                                }
+                            }
+                        }
+                        obj
+                    } else if t.is_custom() {
+                        // Custom tools share the Chat/Responses top-level shape:
+                        // { "type":"custom", "name", "description", ...config }
+                        let mut obj = serde_json::Map::new();
+                        obj.insert("type".to_string(), json!("custom"));
+                        if !t.name.is_empty() {
+                            obj.insert("name".to_string(), json!(t.name));
+                        }
+                        if let Some(ref desc) = t.description {
+                            obj.insert("description".to_string(), json!(desc));
+                        }
+                        if let Some(ref params) = t.parameters {
+                            obj.insert("parameters".to_string(), params.clone());
+                        }
+                        if let Some(Value::Object(cfg)) = &t.config {
+                            for (k, v) in cfg {
+                                obj.entry(k.clone()).or_insert_with(|| v.clone());
+                            }
+                        }
+                        Value::Object(obj)
+                    } else {
+                        // Hosted tools: emit type + config fields, plus any
+                        // name/description/parameters that were preserved.
+                        let mut obj = serde_json::Map::new();
+                        if let Some(ref ty) = t.tool_type {
+                            obj.insert("type".to_string(), json!(ty));
+                        }
+                        if !t.name.is_empty() {
+                            obj.insert("name".to_string(), json!(t.name));
+                        }
+                        if let Some(ref desc) = t.description {
+                            obj.insert("description".to_string(), json!(desc));
+                        }
+                        if let Some(ref params) = t.parameters {
+                            obj.insert("parameters".to_string(), params.clone());
+                        }
+                        if let Some(Value::Object(cfg)) = &t.config {
+                            for (k, v) in cfg {
+                                obj.entry(k.clone()).or_insert_with(|| v.clone());
+                            }
+                        }
+                        Value::Object(obj)
+                    }
+                })
+                .collect();
             body["tools"] = json!(tools);
         }
         if let Some(mt) = ir.params.max_tokens {
@@ -901,6 +1738,36 @@ impl EndpointCodec for ResponsesCodec {
         if let Some(tf) = ir.extensions.get("text") {
             body["text"] = tf.clone();
         }
+        // Synthesize text.format from IR response_format when the extension
+        // path did not already carry a format (e.g. Chat → Responses Convert).
+        if let Some(format) = ir.response_format.as_ref() {
+            if !body["text"].is_object() {
+                body["text"] = json!({});
+            }
+            if body["text"].get("format").is_none() {
+                body["text"]["format"] = encode_text_format(format);
+            }
+        }
+        if let Some(verbosity) = ir.params.verbosity {
+            if !body["text"].is_object() {
+                body["text"] = json!({});
+            }
+            body["text"]["verbosity"] = json!(match verbosity {
+                Verbosity::Low => "low",
+                Verbosity::Medium => "medium",
+                Verbosity::High => "high",
+            });
+        }
+        for (extension, field) in [
+            ("openai.safety_identifier", "safety_identifier"),
+            ("openai.prompt_cache_options", "prompt_cache_options"),
+            ("openai.prompt_cache_key", "prompt_cache_key"),
+            ("openai.prompt_cache_retention", "prompt_cache_retention"),
+        ] {
+            if let Some(value) = ir.extensions.get(extension) {
+                body[field] = value.clone();
+            }
+        }
         // Thinking config: output reasoning.effort from params.thinking
         // or from the legacy extensions["reasoning_effort"] fallback.
         // Cross-protocol derivation: when effort is missing but budget_tokens
@@ -917,23 +1784,39 @@ impl EndpointCodec for ResponsesCodec {
                         .map(tiygate_core::ThinkingConfig::budget_to_effort)
                 });
                 if let Some(effort) = effort {
-                    // OpenAI supports minimal/low/medium/high/xhigh; Max clamps
-                    // to "xhigh" since OpenAI has no "max" effort level.
+                    // GPT-5.6+ supports max natively; emit the IR level as-is.
                     body["reasoning"] = json!({"effort": match effort {
+                        tiygate_core::ThinkingEffort::None => "none",
                         tiygate_core::ThinkingEffort::Minimal => "minimal",
                         tiygate_core::ThinkingEffort::Low => "low",
                         tiygate_core::ThinkingEffort::Medium => "medium",
                         tiygate_core::ThinkingEffort::High => "high",
                         tiygate_core::ThinkingEffort::XHigh => "xhigh",
-                        tiygate_core::ThinkingEffort::Max => "xhigh",
+                        tiygate_core::ThinkingEffort::Max => "max",
                     }});
                 }
-                // Attach reasoning.summary if present in params.thinking.
+                // Attach reasoning.summary / mode / context when present.
+                let ensure_reasoning_obj = |body: &mut Value| {
+                    if body.get("reasoning").is_none() {
+                        body["reasoning"] = json!({});
+                    }
+                };
                 if let Some(ref summary) = thinking.summary {
+                    ensure_reasoning_obj(&mut body);
                     if let Some(obj) = body["reasoning"].as_object_mut() {
                         obj.insert("summary".to_string(), json!(summary));
-                    } else {
-                        body["reasoning"] = json!({"summary": summary});
+                    }
+                }
+                if let Some(ref mode) = thinking.mode {
+                    ensure_reasoning_obj(&mut body);
+                    if let Some(obj) = body["reasoning"].as_object_mut() {
+                        obj.insert("mode".to_string(), json!(mode));
+                    }
+                }
+                if let Some(ref context) = thinking.context {
+                    ensure_reasoning_obj(&mut body);
+                    if let Some(obj) = body["reasoning"].as_object_mut() {
+                        obj.insert("context".to_string(), context.clone());
                     }
                 }
             } else if let Some(effort) = ir
@@ -945,13 +1828,17 @@ impl EndpointCodec for ResponsesCodec {
             }
         }
         // Replay Responses-specific top-level passthrough fields.
+        // `metadata` from responses_extra may contain non-string entries that
+        // ir.metadata (HashMap<String, String>) cannot represent, so it takes
+        // priority over the lossy IR subset; other fields follow the usual
+        // "modeled path wins" rule.
         if let Some(extra) = ir
             .extensions
             .get("responses_extra")
             .and_then(|v| v.as_object())
         {
             for (k, v) in extra {
-                if body.get(k).is_none() {
+                if k == "metadata" || body.get(k).is_none() {
                     body[k] = v.clone();
                 }
             }
@@ -968,8 +1855,12 @@ impl EndpointCodec for ResponsesCodec {
     fn decode_response(&self, body: Value) -> Result<IrResponse, tiygate_core::Error> {
         let response_id = body["id"].as_str().map(String::from);
         let mut content = Vec::new();
+        // Ordered opaque output items (hosted tool results, multi-agent, etc.)
+        // for same-protocol re-encode. Modeled content is rebuilt separately;
+        // these entries keep original interleaving by index.
+        let mut opaque_output_items: Vec<Value> = Vec::new();
         if let Some(output) = body["output"].as_array() {
-            for item in output {
+            for (output_index, item) in output.iter().enumerate() {
                 match item["type"].as_str() {
                     Some("message") => {
                         if let Some(content_arr) = item["content"].as_array() {
@@ -1001,11 +1892,28 @@ impl EndpointCodec for ResponsesCodec {
                                         content.push(Content::Text {
                                             text: text.to_string(),
                                             annotations,
+                                            prompt_cache_breakpoint: None,
                                         });
                                     }
                                 }
                             }
                         }
+                    }
+                    Some("program") => {
+                        content.push(Content::Program {
+                            id: item["id"].as_str().unwrap_or("").to_string(),
+                            call_id: item["call_id"].as_str().unwrap_or("").to_string(),
+                            code: item["code"].as_str().unwrap_or("").to_string(),
+                            fingerprint: item["fingerprint"].as_str().unwrap_or("").to_string(),
+                        });
+                    }
+                    Some("program_output") => {
+                        content.push(Content::ProgramOutput {
+                            id: item["id"].as_str().unwrap_or("").to_string(),
+                            call_id: item["call_id"].as_str().unwrap_or("").to_string(),
+                            result: item["result"].as_str().unwrap_or("").to_string(),
+                            status: item["status"].as_str().unwrap_or("completed").to_string(),
+                        });
                     }
                     Some("function_call") => {
                         let args: Value =
@@ -1023,6 +1931,8 @@ impl EndpointCodec for ResponsesCodec {
                             name: item["name"].as_str().unwrap_or("").to_string(),
                             arguments: args,
                             call_id,
+                            caller: decode_tool_caller(item),
+                            wire_type: None,
                         });
                     }
                     Some("reasoning") => {
@@ -1083,6 +1993,8 @@ impl EndpointCodec for ResponsesCodec {
                             call_id: Some(id),
                             name: "local_shell".to_string(),
                             arguments,
+                            caller: None,
+                            wire_type: Some("local_shell_call".to_string()),
                         });
                     }
                     Some("custom_tool_call") => {
@@ -1095,19 +2007,43 @@ impl EndpointCodec for ResponsesCodec {
                             call_id: Some(id),
                             name,
                             arguments: json!({"input": input_text}),
+                            caller: None,
+                            wire_type: Some("custom_tool_call".to_string()),
                         });
                     }
-                    _ => {}
+                    // Hosted tool / multi-agent / other provider-specific output
+                    // items are not first-class IR content. Keep the raw wire
+                    // object with its original index for same-protocol re-encode.
+                    Some(_) | None => {
+                        opaque_output_items.push(json!({
+                            "index": output_index,
+                            "item": item,
+                        }));
+                    }
                 }
             }
         }
+        // OpenAI Responses reports `status: "completed"` even for tool-call
+        // turns — the only reliable signal that the turn ended to call a tool
+        // is the presence of a `function_call` / `program` / `local_shell_call`
+        // / `custom_tool_call` output item, NOT the status.  This mirrors the
+        // streaming decoder's `saw_function_call` latch so the non-streaming
+        // HTTP path emits `FinishReason::ToolCalls` for PTC turns, otherwise
+        // the cross-protocol encoder produces `finish_reason: "stop"` and the
+        // client never runs the tool.
+        let has_tool_call = content
+            .iter()
+            .any(|c| matches!(c, Content::ToolCall { .. } | Content::Program { .. }));
         let finish_reason = body["status"].as_str().map(|s| match s {
-            "completed" => FinishReason::Stop,
+            "completed" => {
+                if has_tool_call {
+                    FinishReason::ToolCalls
+                } else {
+                    FinishReason::Stop
+                }
+            }
             "incomplete" => {
-                if content
-                    .iter()
-                    .any(|c| matches!(c, Content::ToolCall { .. }))
-                {
+                if has_tool_call {
                     FinishReason::ToolCalls
                 } else {
                     FinishReason::Length
@@ -1129,28 +2065,53 @@ impl EndpointCodec for ResponsesCodec {
         } else {
             None
         };
-        let usage = body.get("usage").map(|u| {
-            let cache_read = u["input_tokens_details"]["cached_tokens"].as_u64();
-            // Responses' `input_tokens` includes the cached portion; the IR
-            // convention keeps prompt_tokens cache-free. Subtract to avoid
-            // double-counting when re-encoded downstream.
-            let raw_input = u["input_tokens"].as_u64().unwrap_or(0);
-            Usage {
-                prompt_tokens: raw_input.saturating_sub(cache_read.unwrap_or(0)),
-                completion_tokens: u["output_tokens"].as_u64().unwrap_or(0),
-                total_tokens: u["total_tokens"].as_u64().unwrap_or(0),
-                reasoning_tokens: u["output_tokens_details"]["reasoning_tokens"].as_u64(),
-                cache_read_tokens: cache_read,
-                ..Default::default()
-            }
-        });
+        let usage = body
+            .get("usage")
+            .filter(|usage| {
+                usage.is_object()
+                    && (usage["input_tokens"].is_u64()
+                        || usage["output_tokens"].is_u64()
+                        || usage["total_tokens"].is_u64())
+            })
+            .map(|u| {
+                let cache_read = u["input_tokens_details"]["cached_tokens"].as_u64();
+                let cache_write = u["input_tokens_details"]["cache_write_tokens"].as_u64();
+                // Responses' `input_tokens` includes the cached portion; the IR
+                // convention keeps prompt_tokens cache-free. Subtract to avoid
+                // double-counting when re-encoded downstream.
+                let raw_input = u["input_tokens"].as_u64().unwrap_or(0);
+                Usage {
+                    prompt_tokens: raw_input
+                        .saturating_sub(cache_read.unwrap_or(0))
+                        .saturating_sub(cache_write.unwrap_or(0)),
+                    completion_tokens: u["output_tokens"].as_u64().unwrap_or(0),
+                    total_tokens: u["total_tokens"].as_u64().unwrap_or(0),
+                    reasoning_tokens: u["output_tokens_details"]["reasoning_tokens"].as_u64(),
+                    cache_read_tokens: cache_read,
+                    cache_write_tokens: cache_write,
+                }
+            });
+        let mut extensions = std::collections::HashMap::new();
+        if !opaque_output_items.is_empty() {
+            extensions.insert(
+                "responses_opaque_output_items".to_string(),
+                json!(opaque_output_items),
+            );
+            // Preserve the full source layout for same-protocol replay. The
+            // modeled IR intentionally flattens message content, so opaque
+            // indexes alone are insufficient to reconstruct interleaving.
+            extensions.insert(
+                "responses_original_output".to_string(),
+                body["output"].clone(),
+            );
+        }
         Ok(IrResponse {
             content,
             usage,
             finish_reason,
             response_id,
             stop_details,
-            extensions: Default::default(),
+            extensions,
         })
     }
 
@@ -1176,6 +2137,8 @@ pub struct ResponsesStreamEncoder {
     /// output_index assigned to the assistant text message (lazily allocated
     /// on the first TextDelta), so all text fragments share one index.
     text_output_index: Option<u32>,
+    /// Accumulated assistant text used by terminal item snapshots.
+    text: String,
     /// Maps a function-call id to its allocated output_index, so argument
     /// fragments target the correct call.
     tool_output_indices: std::collections::HashMap<String, u32>,
@@ -1192,8 +2155,6 @@ pub struct ResponsesStreamEncoder {
     /// Monotonic sequence_number stamped on every emitted event, per the
     /// Responses streaming contract.
     sequence_number: u64,
-    /// Whether `response.in_progress` has been emitted yet.
-    in_progress_sent: bool,
     /// Usage stashed from a `StreamPart::Usage`, emitted inside the terminal
     /// `response.completed`. Emitting `response.completed` early (on Usage)
     /// terminated the stream prematurely for strict clients; we now defer it
@@ -1224,6 +2185,16 @@ pub struct ResponsesStreamEncoder {
     /// the terminal reasoning `output_item.done` and the reconstructed
     /// `response.completed.output` item for cross-turn replay.
     reasoning_encrypted: Option<String>,
+    /// PTC (program / program_output) items emitted during the stream, paired
+    /// with their allocated output indexes so the terminal snapshot preserves
+    /// the same ordering as incremental lifecycle events.
+    program_items: Vec<(u32, Value)>,
+    /// Original Responses wire type per call_id (function_call/custom_tool_call/local_shell_call).
+    tool_wire_types: HashMap<String, String>,
+    /// Responses item id (fc_*) per call_id when distinct from the call id.
+    tool_item_ids: HashMap<String, String>,
+    /// PTC caller metadata per call_id.
+    tool_callers: HashMap<String, ToolCaller>,
 }
 impl Default for ResponsesStreamEncoder {
     fn default() -> Self {
@@ -1237,13 +2208,13 @@ impl ResponsesStreamEncoder {
             response_id: None,
             next_output_index: 0,
             text_output_index: None,
+            text: String::new(),
             tool_output_indices: std::collections::HashMap::new(),
             tool_output_order: Vec::new(),
             tool_names: std::collections::HashMap::new(),
             tool_arguments: std::collections::HashMap::new(),
             tool_done: std::collections::HashSet::new(),
             sequence_number: 0,
-            in_progress_sent: false,
             pending_usage: None,
             completed_sent: false,
             pending_finish_status: None,
@@ -1251,6 +2222,10 @@ impl ResponsesStreamEncoder {
             reasoning_text: String::new(),
             reasoning_id: None,
             reasoning_encrypted: None,
+            program_items: Vec::new(),
+            tool_wire_types: HashMap::new(),
+            tool_item_ids: HashMap::new(),
+            tool_callers: HashMap::new(),
         }
     }
 
@@ -1279,7 +2254,14 @@ impl ResponsesStreamEncoder {
         format!("data: {}\n\n", value)
     }
 
-    fn open_tool_call(&mut self, id: &str, name: &str) -> String {
+    fn open_tool_call(
+        &mut self,
+        id: &str,
+        name: &str,
+        wire_type: Option<&str>,
+        item_id: Option<&str>,
+        caller: Option<&ToolCaller>,
+    ) -> String {
         let already_open = self.tool_output_indices.contains_key(id);
         let idx = if let Some(idx) = self.tool_output_indices.get(id).copied() {
             idx
@@ -1294,10 +2276,45 @@ impl ResponsesStreamEncoder {
             .entry(id.to_string())
             .or_insert_with(|| name.to_string());
         self.tool_arguments.entry(id.to_string()).or_default();
+        if is_responses_custom_tool_call(wire_type) {
+            self.tool_wire_types
+                .entry(id.to_string())
+                .or_insert_with(|| "custom_tool_call".to_string());
+        } else if let Some(wt) = wire_type {
+            self.tool_wire_types
+                .entry(id.to_string())
+                .or_insert_with(|| wt.to_string());
+        }
+        if let Some(iid) = item_id.filter(|v| !v.is_empty()) {
+            self.tool_item_ids
+                .entry(id.to_string())
+                .or_insert_with(|| iid.to_string());
+        }
+        if let Some(c) = caller {
+            self.tool_callers
+                .entry(id.to_string())
+                .or_insert_with(|| c.clone());
+        }
         if already_open {
             return String::new();
         }
-        self.event(json!({"type": "response.output_item.added", "output_index": idx, "item": {"id": id, "call_id": id, "type": "function_call", "name": name, "arguments": "", "status": "in_progress"}}))
+        let item_type = if is_responses_custom_tool_call(wire_type) {
+            "custom_tool_call"
+        } else {
+            wire_type.unwrap_or("function_call")
+        };
+        let wire_item_id = self.tool_item_ids.get(id).map(String::as_str).unwrap_or(id);
+        let mut item = if item_type == "custom_tool_call" {
+            json!({"id": wire_item_id, "call_id": id, "type": "custom_tool_call", "name": name, "input": "", "status": "in_progress"})
+        } else if item_type == "local_shell_call" {
+            json!({"id": wire_item_id, "call_id": id, "type": "local_shell_call", "action": {}, "status": "in_progress"})
+        } else {
+            json!({"id": wire_item_id, "call_id": id, "type": "function_call", "name": name, "arguments": "", "status": "in_progress"})
+        };
+        if let Some(c) = self.tool_callers.get(id) {
+            item["caller"] = json!(c);
+        }
+        self.event(json!({"type": "response.output_item.added", "output_index": idx, "item": item}))
     }
 
     fn append_tool_arguments(&mut self, id: &str, arguments: &str) -> String {
@@ -1306,7 +2323,18 @@ impl ResponsesStreamEncoder {
             .entry(id.to_string())
             .or_default()
             .push_str(arguments);
-        self.event(json!({"type": "response.function_call_arguments.delta", "item_id": id, "output_index": idx, "delta": arguments}))
+        let item_id = self.tool_item_ids.get(id).map(String::as_str).unwrap_or(id);
+        let item_type = self
+            .tool_wire_types
+            .get(id)
+            .map(String::as_str)
+            .unwrap_or("function_call");
+        let event_type = if item_type == "custom_tool_call" {
+            "response.custom_tool_call_input.delta"
+        } else {
+            "response.function_call_arguments.delta"
+        };
+        self.event(json!({"type": event_type, "item_id": item_id, "output_index": idx, "delta": arguments}))
     }
 
     fn close_tool_calls(&mut self, status: &str) -> String {
@@ -1322,8 +2350,38 @@ impl ResponsesStreamEncoder {
                 .get(&call_id)
                 .cloned()
                 .unwrap_or_default();
-            out.push_str(&self.event(json!({"type": "response.function_call_arguments.done", "item_id": call_id, "output_index": idx, "arguments": arguments})));
-            out.push_str(&self.event(json!({"type": "response.output_item.done", "output_index": idx, "item": {"id": call_id, "call_id": call_id, "type": "function_call", "name": name, "arguments": arguments, "status": status}})));
+            let item_type = self
+                .tool_wire_types
+                .get(&call_id)
+                .cloned()
+                .unwrap_or_else(|| "function_call".to_string());
+            let wire_item_id = self
+                .tool_item_ids
+                .get(&call_id)
+                .cloned()
+                .unwrap_or_else(|| call_id.clone());
+            if item_type == "function_call" {
+                out.push_str(&self.event(json!({"type": "response.function_call_arguments.done", "item_id": wire_item_id, "output_index": idx, "arguments": arguments})));
+            }
+            let mut item = if item_type == "custom_tool_call" {
+                let input = serde_json::from_str::<Value>(&arguments)
+                    .ok()
+                    .map(|value| responses_custom_tool_input(&value))
+                    .unwrap_or(arguments);
+                out.push_str(&self.event(json!({"type": "response.custom_tool_call_input.done", "item_id": wire_item_id, "output_index": idx, "input": input.clone()})));
+                json!({"id": wire_item_id, "call_id": call_id, "type": "custom_tool_call", "name": name, "input": input, "status": status})
+            } else if item_type == "local_shell_call" {
+                let action = serde_json::from_str::<Value>(&arguments).unwrap_or(json!({}));
+                json!({"id": wire_item_id, "call_id": call_id, "type": "local_shell_call", "action": action, "status": status})
+            } else {
+                json!({"id": wire_item_id, "call_id": call_id, "type": "function_call", "name": name, "arguments": arguments, "status": status})
+            };
+            if let Some(caller) = self.tool_callers.get(&call_id) {
+                item["caller"] = json!(caller);
+            }
+            out.push_str(&self.event(
+                json!({"type": "response.output_item.done", "output_index": idx, "item": item}),
+            ));
             self.tool_done.insert(call_id);
         }
         out
@@ -1345,8 +2403,15 @@ impl ResponsesStreamEncoder {
                 "output_tokens": usage.completion_tokens,
                 "total_tokens": input + usage.completion_tokens,
             });
+            let mut input_details = serde_json::Map::new();
             if cache_read > 0 {
-                response["usage"]["input_tokens_details"] = json!({"cached_tokens": cache_read});
+                input_details.insert("cached_tokens".to_string(), json!(cache_read));
+            }
+            if cache_write > 0 {
+                input_details.insert("cache_write_tokens".to_string(), json!(cache_write));
+            }
+            if !input_details.is_empty() {
+                response["usage"]["input_tokens_details"] = json!(input_details);
             }
             if let Some(rt) = usage.reasoning_tokens {
                 if rt > 0 {
@@ -1354,10 +2419,10 @@ impl ResponsesStreamEncoder {
                 }
             }
         }
-        // Build the output array so clients can reconstruct items from
-        // response.completed even when incremental events were missed.
-        let mut output = Vec::<Value>::new();
-        if self.reasoning_output_index.is_some() {
+        // Build the output array in output_index order so clients reconstruct
+        // the same item sequence even when incremental events were missed.
+        let mut indexed_output = Vec::<(u32, Value)>::new();
+        if let Some(index) = self.reasoning_output_index {
             let item_id = self.reasoning_item_id();
             let summary = if self.reasoning_text.is_empty() {
                 json!([])
@@ -1373,17 +2438,27 @@ impl ResponsesStreamEncoder {
             if let Some(enc) = &self.reasoning_encrypted {
                 item["encrypted_content"] = json!(enc);
             }
-            output.push(item);
+            indexed_output.push((index, item));
         }
-        if self.text_output_index.is_some() {
+        if let Some(index) = self.text_output_index {
             let item_id = format!("{}_msg", id);
-            output.push(json!({
-                "id": item_id,
-                "type": "message",
-                "role": "assistant",
-                "status": status,
-                "content": []
-            }));
+            indexed_output.push((
+                index,
+                json!({
+                    "id": item_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "status": status,
+                    "content": [{
+                        "type": "output_text",
+                        "text": &self.text,
+                        "annotations": []
+                    }]
+                }),
+            ));
+        }
+        for (index, item) in &self.program_items {
+            indexed_output.push((*index, item.clone()));
         }
         for call_id in self.tool_output_order.clone() {
             let name = self.tool_names.get(&call_id).cloned().unwrap_or_default();
@@ -1392,15 +2467,60 @@ impl ResponsesStreamEncoder {
                 .get(&call_id)
                 .cloned()
                 .unwrap_or_default();
-            output.push(json!({
-                "type": "function_call",
-                "id": call_id,
-                "call_id": call_id,
-                "name": name,
-                "arguments": arguments,
-                "status": status,
-            }));
+            let item_type = self
+                .tool_wire_types
+                .get(&call_id)
+                .map(String::as_str)
+                .unwrap_or("function_call");
+            let wire_item_id = self
+                .tool_item_ids
+                .get(&call_id)
+                .cloned()
+                .unwrap_or_else(|| call_id.clone());
+            let mut item = if item_type == "custom_tool_call" {
+                let input = serde_json::from_str::<Value>(&arguments)
+                    .ok()
+                    .and_then(|v| v.get("input").and_then(|x| x.as_str()).map(str::to_string))
+                    .unwrap_or(arguments);
+                json!({
+                    "type": "custom_tool_call",
+                    "id": wire_item_id,
+                    "call_id": call_id,
+                    "name": name,
+                    "input": input,
+                    "status": status,
+                })
+            } else if item_type == "local_shell_call" {
+                let action = serde_json::from_str::<Value>(&arguments).unwrap_or(json!({}));
+                json!({
+                    "type": "local_shell_call",
+                    "id": wire_item_id,
+                    "call_id": call_id,
+                    "action": action,
+                    "status": status,
+                })
+            } else {
+                json!({
+                    "type": "function_call",
+                    "id": wire_item_id,
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": arguments,
+                    "status": status,
+                })
+            };
+            if let Some(caller) = self.tool_callers.get(&call_id) {
+                item["caller"] = json!(caller);
+            }
+            let index = self
+                .tool_output_indices
+                .get(&call_id)
+                .copied()
+                .unwrap_or(u32::MAX);
+            indexed_output.push((index, item));
         }
+        indexed_output.sort_by_key(|(index, _)| *index);
+        let output: Vec<Value> = indexed_output.into_iter().map(|(_, item)| item).collect();
         if !output.is_empty() {
             response["output"] = json!(output);
         }
@@ -1417,7 +2537,6 @@ impl StreamEncoder for ResponsesStreamEncoder {
                 let created = self.event(json!({"type": "response.created", "response": {"id": id, "object": "response", "status": "in_progress"}}));
                 // Emit response.in_progress right after created so strict
                 // clients see the lifecycle transition.
-                self.in_progress_sent = true;
                 let in_progress = self.event(json!({"type": "response.in_progress", "response": {"id": id, "object": "response", "status": "in_progress"}}));
                 format!("{created}{in_progress}")
             }
@@ -1437,6 +2556,7 @@ impl StreamEncoder for ResponsesStreamEncoder {
                     out.push_str(&self.event(json!({"type": "response.content_part.added", "output_index": i, "item_id": item_id, "content_index": 0, "part": {"type": "output_text", "text": ""}})));
                     i
                 };
+                self.text.push_str(text);
                 out.push_str(&self.event(json!({"type": "response.output_text.delta", "item_id": item_id, "output_index": idx, "content_index": 0, "delta": text})));
                 out
             }
@@ -1489,10 +2609,19 @@ impl StreamEncoder for ResponsesStreamEncoder {
                 id,
                 name,
                 arguments,
+                wire_type,
+                item_id,
+                caller,
             } => {
                 if let Some(n) = name {
                     // Opener: allocate a distinct output_index for this call.
-                    let mut out = self.open_tool_call(id, n);
+                    let mut out = self.open_tool_call(
+                        id,
+                        n,
+                        wire_type.as_deref(),
+                        item_id.as_deref(),
+                        caller.as_ref(),
+                    );
                     if !arguments.is_empty() {
                         out.push_str(&self.append_tool_arguments(id, arguments));
                     }
@@ -1500,6 +2629,63 @@ impl StreamEncoder for ResponsesStreamEncoder {
                 } else {
                     self.append_tool_arguments(id, arguments)
                 }
+            }
+            // Item-level PTC events (complete program / program_output items).
+            StreamPart::ProgramDelta {
+                id,
+                call_id,
+                code,
+                fingerprint,
+            } => {
+                let idx = self.next_output_index;
+                self.next_output_index += 1;
+                let item = json!({
+                    "type": "program",
+                    "id": id,
+                    "call_id": call_id,
+                    "code": code,
+                    "fingerprint": fingerprint,
+                });
+                self.program_items.push((idx, item.clone()));
+                let mut out = self.event(json!({
+                    "type": "response.output_item.added",
+                    "output_index": idx,
+                    "item": item.clone(),
+                }));
+                out.push_str(&self.event(json!({
+                    "type": "response.output_item.done",
+                    "output_index": idx,
+                    "item": item,
+                })));
+                out
+            }
+            StreamPart::ProgramOutputDelta {
+                id,
+                call_id,
+                result,
+                status,
+            } => {
+                let idx = self.next_output_index;
+                self.next_output_index += 1;
+                let item = json!({
+                    "type": "program_output",
+                    "id": id,
+                    "call_id": call_id,
+                    "result": result,
+                    "status": status,
+                });
+                self.program_items.push((idx, item.clone()));
+                let mut out = self.event(json!({
+                    "type": "response.output_item.added",
+                    "output_index": idx,
+                    "item": item.clone(),
+                }));
+                out.push_str(&self.event(json!({
+                    "type": "response.output_item.done",
+                    "output_index": idx,
+                    "item": item,
+                })));
+                out
             }
             StreamPart::Usage { usage } => {
                 // Stash usage for the terminal response.completed instead of
@@ -1554,9 +2740,10 @@ impl StreamEncoder for ResponsesStreamEncoder {
                     }
                     if let Some(idx) = self.text_output_index {
                         let item_id = format!("{}_msg", self.response_id.as_deref().unwrap_or(""));
-                        out.push_str(&self.event(json!({"type": "response.output_text.done", "output_index": idx, "item_id": item_id, "content_index": 0})));
-                        out.push_str(&self.event(json!({"type": "response.content_part.done", "output_index": idx, "item_id": item_id, "content_index": 0})));
-                        out.push_str(&self.event(json!({"type": "response.output_item.done", "output_index": idx, "item": {"id": item_id, "type": "message", "role": "assistant", "status": "completed"}})));
+                        let text = self.text.clone();
+                        out.push_str(&self.event(json!({"type": "response.output_text.done", "output_index": idx, "item_id": item_id, "content_index": 0, "text": text})));
+                        out.push_str(&self.event(json!({"type": "response.content_part.done", "output_index": idx, "item_id": item_id, "content_index": 0, "part": {"type": "output_text", "text": text, "annotations": []}})));
+                        out.push_str(&self.event(json!({"type": "response.output_item.done", "output_index": idx, "item": {"id": item_id, "type": "message", "role": "assistant", "status": "completed", "content": [{"type": "output_text", "text": text, "annotations": []}]}})));
                     }
                     out.push_str(&self.close_tool_calls(status));
                     // When usage is already stashed (same-chunk finish+usage),
@@ -1622,9 +2809,11 @@ impl StreamEncoder for ResponsesStreamEncoder {
 
 pub struct ResponsesStreamDecoder {
     response_id: Option<String>,
-    in_function_call: bool,
+    /// Responses item id → canonical function call id/name. Argument deltas
+    /// identify their target by item_id and may be interleaved.
+    function_calls: HashMap<String, (String, Option<String>)>,
+    /// Fallback for compatible providers that omit item_id on argument deltas.
     current_call_id: Option<String>,
-    current_call_name: Option<String>,
     /// Whether ANY `function_call` output item appeared during this response.
     /// Unlike `in_function_call` (which is reset on `response.output_item.done`),
     /// this latches for the whole stream so the terminal `response.completed`
@@ -1642,6 +2831,10 @@ pub struct ResponsesStreamDecoder {
     /// (`response.output_item.added` or `.done`). Attached to a `ReasoningDelta`
     /// once and then cleared.
     pending_reasoning_encrypted: Option<String>,
+    /// Accumulated custom-tool input by call id. The `.done` event repeats the
+    /// complete input, so this lets us forward only a suffix that was not
+    /// already delivered via `.delta`.
+    custom_tool_inputs: HashMap<String, String>,
 }
 impl Default for ResponsesStreamDecoder {
     fn default() -> Self {
@@ -1653,12 +2846,12 @@ impl ResponsesStreamDecoder {
     pub fn new() -> Self {
         Self {
             response_id: None,
-            in_function_call: false,
+            function_calls: HashMap::new(),
             current_call_id: None,
-            current_call_name: None,
             saw_function_call: false,
             pending_reasoning_id: None,
             pending_reasoning_encrypted: None,
+            custom_tool_inputs: HashMap::new(),
         }
     }
 }
@@ -1716,14 +2909,30 @@ impl StreamDecoder for ResponsesStreamDecoder {
             Some("response.output_item.added") => {
                 let item = &event["item"];
                 if item["type"] == "function_call" {
-                    self.in_function_call = true;
                     self.saw_function_call = true;
-                    self.current_call_id = item["id"].as_str().map(String::from);
-                    self.current_call_name = item["name"].as_str().map(String::from);
+                    let item_id = item["id"].as_str().unwrap_or("").to_string();
+                    let call_id = item["call_id"]
+                        .as_str()
+                        .filter(|value| !value.is_empty())
+                        .or_else(|| item["id"].as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let name = item["name"].as_str().map(String::from);
+                    let dual_item_id = if !item_id.is_empty() && item_id != call_id {
+                        Some(item_id.clone())
+                    } else {
+                        None
+                    };
+                    self.function_calls
+                        .insert(item_id, (call_id.clone(), name.clone()));
+                    self.current_call_id = Some(call_id.clone());
                     parts.push(StreamPart::ToolCallDelta {
-                        id: self.current_call_id.clone().unwrap_or_default(),
-                        name: self.current_call_name.clone(),
+                        id: call_id,
+                        name,
                         arguments: String::new(),
+                        wire_type: None,
+                        item_id: dual_item_id,
+                        caller: decode_tool_caller(item),
                     });
                 } else if item["type"] == "reasoning" {
                     // Stash the reasoning item id / encrypted content so the
@@ -1736,47 +2945,138 @@ impl StreamDecoder for ResponsesStreamDecoder {
                     if let Some(enc) = item["encrypted_content"].as_str() {
                         self.pending_reasoning_encrypted = Some(enc.to_string());
                     }
+                } else if item["type"] == "program" {
+                    // Item-level PTC program (complete on added; done is ignored
+                    // to avoid double emission of the same item). Latch as a
+                    // tool-calling turn so finish_reason maps to ToolCalls.
+                    self.saw_function_call = true;
+                    parts.push(StreamPart::ProgramDelta {
+                        id: item["id"].as_str().unwrap_or("").to_string(),
+                        call_id: item["call_id"].as_str().unwrap_or("").to_string(),
+                        code: item["code"].as_str().unwrap_or("").to_string(),
+                        fingerprint: item["fingerprint"].as_str().unwrap_or("").to_string(),
+                    });
+                } else if item["type"] == "program_output" {
+                    // program_output is a *result* item, not a tool-call
+                    // request. Do NOT latch saw_function_call here — a lone
+                    // program_output (e.g. upstream replaying prior-turn
+                    // output) would otherwise force finish_reason to
+                    // ToolCalls even though the model made no tool call this
+                    // turn. Only the `program` item (the tool-call equivalent)
+                    // latches above.
+                    parts.push(StreamPart::ProgramOutputDelta {
+                        id: item["id"].as_str().unwrap_or("").to_string(),
+                        call_id: item["call_id"].as_str().unwrap_or("").to_string(),
+                        result: item["result"].as_str().unwrap_or("").to_string(),
+                        status: item["status"].as_str().unwrap_or("completed").to_string(),
+                    });
                 } else if item["type"] == "local_shell_call" {
                     // Codex local_shell_call: treat as a tool call so the
                     // streaming finish_reason is ToolCalls, not Stop.
-                    self.in_function_call = true;
                     self.saw_function_call = true;
                     let id = responses_call_id(item).unwrap_or("").to_string();
                     let action = item.get("action").cloned().unwrap_or(json!({}));
                     self.current_call_id = Some(id.clone());
-                    self.current_call_name = Some("local_shell".to_string());
                     parts.push(StreamPart::ToolCallDelta {
                         id,
                         name: Some("local_shell".to_string()),
                         arguments: action.to_string(),
+                        wire_type: Some("local_shell_call".to_string()),
+                        item_id: None,
+                        caller: None,
                     });
                 } else if item["type"] == "custom_tool_call" {
                     // Codex custom_tool_call: treat as a tool call so the
                     // streaming finish_reason is ToolCalls, not Stop.
-                    self.in_function_call = true;
                     self.saw_function_call = true;
+                    let item_id = item["id"].as_str().unwrap_or("").to_string();
                     let id = responses_call_id(item).unwrap_or("").to_string();
                     let name = item["name"].as_str().unwrap_or("").to_string();
                     let input_text = item["input"].as_str().unwrap_or("").to_string();
+                    let dual_item_id = if !item_id.is_empty() && item_id != id {
+                        Some(item_id.clone())
+                    } else {
+                        None
+                    };
+                    self.function_calls
+                        .insert(item_id, (id.clone(), Some(name.clone())));
+                    if !input_text.is_empty() {
+                        self.custom_tool_inputs
+                            .insert(id.clone(), input_text.clone());
+                    }
                     self.current_call_id = Some(id.clone());
-                    self.current_call_name = Some(name.clone());
                     parts.push(StreamPart::ToolCallDelta {
                         id,
                         name: Some(name),
-                        arguments: json!({"input": input_text}).to_string(),
+                        arguments: input_text,
+                        wire_type: Some("custom_tool_call".to_string()),
+                        item_id: dual_item_id,
+                        caller: decode_tool_caller(item),
                     });
                 }
             }
             Some("response.function_call_arguments.delta") => {
                 if let Some(args) = event["delta"].as_str() {
+                    let id = event["item_id"]
+                        .as_str()
+                        .and_then(|item_id| self.function_calls.get(item_id))
+                        .map(|(call_id, _)| call_id.clone())
+                        .or_else(|| self.current_call_id.clone())
+                        .unwrap_or_default();
                     // Argument fragment: `name: None` so cross-protocol
-                    // encoders route this to their argument-delta event
-                    // instead of re-opening the tool-call block.
+                    // encoders route this to their argument-delta event.
                     parts.push(StreamPart::ToolCallDelta {
-                        id: self.current_call_id.clone().unwrap_or_default(),
+                        id,
                         name: None,
                         arguments: args.to_string(),
+                        wire_type: None,
+                        item_id: None,
+                        caller: None,
                     });
+                }
+            }
+            Some("response.custom_tool_call_input.delta") => {
+                if let Some(input) = event["delta"].as_str() {
+                    let id = event["item_id"]
+                        .as_str()
+                        .and_then(|item_id| self.function_calls.get(item_id))
+                        .map(|(call_id, _)| call_id.clone())
+                        .or_else(|| self.current_call_id.clone())
+                        .unwrap_or_default();
+                    self.custom_tool_inputs
+                        .entry(id.clone())
+                        .or_default()
+                        .push_str(input);
+                    parts.push(StreamPart::ToolCallDelta {
+                        id,
+                        name: None,
+                        arguments: input.to_string(),
+                        wire_type: Some("custom_tool_call".to_string()),
+                        item_id: None,
+                        caller: None,
+                    });
+                }
+            }
+            Some("response.custom_tool_call_input.done") => {
+                if let Some(input) = event["input"].as_str() {
+                    let id = event["item_id"]
+                        .as_str()
+                        .and_then(|item_id| self.function_calls.get(item_id))
+                        .map(|(call_id, _)| call_id.clone())
+                        .or_else(|| self.current_call_id.clone())
+                        .unwrap_or_default();
+                    let delivered = self.custom_tool_inputs.remove(&id).unwrap_or_default();
+                    let remaining = input.strip_prefix(&delivered).unwrap_or(input);
+                    if !remaining.is_empty() {
+                        parts.push(StreamPart::ToolCallDelta {
+                            id,
+                            name: None,
+                            arguments: remaining.to_string(),
+                            wire_type: Some("custom_tool_call".to_string()),
+                            item_id: None,
+                            caller: None,
+                        });
+                    }
                 }
             }
             Some("response.output_item.done") => {
@@ -1803,10 +3103,16 @@ impl StreamDecoder for ResponsesStreamDecoder {
                             encrypted_content: self.pending_reasoning_encrypted.take(),
                         });
                     }
+                } else if item["type"] == "program" || item["type"] == "program_output" {
+                    // Already emitted on output_item.added; ignore done to
+                    // avoid duplicate ProgramDelta / ProgramOutputDelta.
                 }
-                self.in_function_call = false;
+                if item["type"] == "function_call" || item["type"] == "custom_tool_call" {
+                    if let Some(item_id) = item["id"].as_str() {
+                        self.function_calls.remove(item_id);
+                    }
+                }
                 self.current_call_id = None;
-                self.current_call_name = None;
             }
             // Lifecycle / bookkeeping events that carry no IR-relevant payload.
             // OpenAI Responses streams interleave many of these; they must be
@@ -1830,6 +3136,9 @@ impl StreamDecoder for ResponsesStreamDecoder {
                     let cache_read = usage
                         .get("input_tokens_details")
                         .and_then(|d| d["cached_tokens"].as_u64());
+                    let cache_write = usage
+                        .get("input_tokens_details")
+                        .and_then(|d| d["cache_write_tokens"].as_u64());
                     let raw_input = usage
                         .get("input_tokens")
                         .and_then(|v| v.as_u64())
@@ -1837,7 +3146,9 @@ impl StreamDecoder for ResponsesStreamDecoder {
                     parts.push(StreamPart::Usage {
                         usage: Usage {
                             // input_tokens includes cache; IR keeps it cache-free.
-                            prompt_tokens: raw_input.saturating_sub(cache_read.unwrap_or(0)),
+                            prompt_tokens: raw_input
+                                .saturating_sub(cache_read.unwrap_or(0))
+                                .saturating_sub(cache_write.unwrap_or(0)),
                             completion_tokens: usage
                                 .get("output_tokens")
                                 .and_then(|v| v.as_u64())
@@ -1850,7 +3161,7 @@ impl StreamDecoder for ResponsesStreamDecoder {
                                 .get("output_tokens_details")
                                 .and_then(|d| d["reasoning_tokens"].as_u64()),
                             cache_read_tokens: cache_read,
-                            ..Default::default()
+                            cache_write_tokens: cache_write,
                         },
                     });
                 }
@@ -1961,6 +3272,672 @@ mod tests {
     }
 
     #[test]
+    fn test_interleaved_ptc_wire_order_preserved() {
+        let codec = ResponsesCodec::new();
+        let env = make_raw_env();
+        // Wire order: user → program → function_call → text message → program_output
+        // must survive decode → encode without bucket reordering.
+        let body = json!({
+            "model": "gpt-5.6",
+            "input": [
+                {"role": "user", "content": "run"},
+                {"type": "program", "id": "prog_1", "call_id": "call_prog_1", "code": "await tools.lookup({})", "fingerprint": "fp_1"},
+                {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "lookup", "arguments": "{}", "caller": {"type": "program", "caller_id": "call_prog_1"}},
+                {"role": "assistant", "content": "mid"},
+                {"type": "program_output", "id": "progo_1", "call_id": "call_prog_1", "result": "done", "status": "completed"}
+            ]
+        });
+        let ir = codec.decode_request(body, &env).unwrap();
+        let (encoded, _) = codec.encode_request(&ir).unwrap();
+        let input = encoded["input"].as_array().unwrap();
+        let types: Vec<&str> = input
+            .iter()
+            .map(|item| {
+                if let Some(t) = item.get("type").and_then(|v| v.as_str()) {
+                    t
+                } else if item.get("role").is_some() {
+                    "message"
+                } else {
+                    "unknown"
+                }
+            })
+            .collect();
+        assert_eq!(
+            types,
+            vec![
+                "message",
+                "program",
+                "function_call",
+                "message",
+                "program_output"
+            ],
+            "PTC interleaving order must be preserved: {types:?}"
+        );
+        assert_eq!(input[3]["content"], "mid");
+    }
+
+    #[test]
+    fn test_stream_program_item_roundtrip() {
+        let mut decoder = ResponsesStreamDecoder::new();
+        let parts = decoder
+            .feed(r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"program","id":"prog_1","call_id":"call_prog_1","code":"await tools.f({})","fingerprint":"fp_1"}}"#)
+            .unwrap();
+        assert!(matches!(
+            &parts[0],
+            StreamPart::ProgramDelta {
+                id,
+                call_id,
+                code,
+                fingerprint
+            } if id == "prog_1" && call_id == "call_prog_1" && code.contains("tools.f") && fingerprint == "fp_1"
+        ));
+        let mut encoder = ResponsesStreamEncoder::new();
+        let bytes = encoder.encode_part(&parts[0]).unwrap();
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(s.contains("\"type\":\"response.output_item.added\""));
+        assert!(s.contains("\"type\":\"program\""));
+        assert!(s.contains("\"call_id\":\"call_prog_1\""));
+        assert!(s.contains("\"type\":\"response.output_item.done\""));
+    }
+
+    #[test]
+    fn test_stream_program_only_turn_finish_reason_tool_calls() {
+        let mut dec = ResponsesStreamDecoder::new();
+        dec.feed(r#"data: {"type":"response.created","response":{"id":"resp_1","object":"response","status":"in_progress"}}"#)
+            .unwrap();
+        dec.feed(r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"program","id":"prog_1","call_id":"call_prog_1","code":"await tools.f({})","fingerprint":"fp_1"}}"#)
+            .unwrap();
+        let parts = dec
+            .feed(r#"data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}"#)
+            .unwrap();
+        assert!(
+            parts.iter().any(|p| matches!(
+                p,
+                StreamPart::Finish {
+                    reason: FinishReason::ToolCalls
+                }
+            )),
+            "program-only stream must finish with ToolCalls, got: {parts:?}"
+        );
+    }
+
+    #[test]
+    fn test_stream_lone_program_output_does_not_latch_tool_calls() {
+        // A lone program_output (without a preceding program) is a *result*
+        // item, not a tool-call request. finish_reason should NOT be
+        // ToolCalls — the model made no tool call this turn.
+        let mut dec = ResponsesStreamDecoder::new();
+        dec.feed(r#"data: {"type":"response.created","response":{"id":"resp_1","object":"response","status":"in_progress"}}"#)
+            .unwrap();
+        dec.feed(r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"program_output","id":"progo_1","call_id":"call_prog_1","result":"ok","status":"completed"}}"#)
+            .unwrap();
+        let parts = dec
+            .feed(r#"data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}"#)
+            .unwrap();
+        assert!(
+            !parts.iter().any(|p| matches!(
+                p,
+                StreamPart::Finish {
+                    reason: FinishReason::ToolCalls
+                }
+            )),
+            "lone program_output must NOT finish with ToolCalls, got: {parts:?}"
+        );
+    }
+
+    #[test]
+    fn test_stream_completed_event_includes_ptc_items() {
+        // PTC items (program / program_output) must appear in the terminal
+        // response.completed.output array so strict clients that reconstruct
+        // from the snapshot don't lose them.
+        let mut encoder = ResponsesStreamEncoder::new();
+        encoder
+            .encode_part(&StreamPart::ResponseStarted {
+                id: "resp_1".to_string(),
+            })
+            .unwrap();
+        encoder
+            .encode_part(&StreamPart::ProgramDelta {
+                id: "prog_1".to_string(),
+                call_id: "call_prog_1".to_string(),
+                code: "await tools.f({})".to_string(),
+                fingerprint: "fp_1".to_string(),
+            })
+            .unwrap();
+        encoder
+            .encode_part(&StreamPart::ProgramOutputDelta {
+                id: "progo_1".to_string(),
+                call_id: "call_prog_1".to_string(),
+                result: "ok".to_string(),
+                status: "completed".to_string(),
+            })
+            .unwrap();
+        let bytes = encoder
+            .encode_part(&StreamPart::Finish {
+                reason: FinishReason::ToolCalls,
+            })
+            .unwrap();
+        // Finish defers response.completed when usage hasn't arrived yet.
+        // Feed Usage so completed_event fires and includes the output array.
+        let bytes2 = encoder
+            .encode_part(&StreamPart::Usage {
+                usage: Usage::default(),
+            })
+            .unwrap();
+        let combined = [bytes.as_slice(), bytes2.as_slice()].concat();
+        let s = String::from_utf8_lossy(&combined);
+        // The terminal response.completed must carry both PTC items in output.
+        assert!(
+            s.contains("\"type\":\"response.completed\""),
+            "must emit response.completed, got: {s}"
+        );
+        assert!(
+            s.contains("\"type\":\"program\""),
+            "completed output must include program item, got: {s}"
+        );
+        assert!(
+            s.contains("\"type\":\"program_output\""),
+            "completed output must include program_output item, got: {s}"
+        );
+        assert!(
+            s.contains("\"id\":\"prog_1\""),
+            "completed output must carry program id, got: {s}"
+        );
+        assert!(
+            s.contains("\"id\":\"progo_1\""),
+            "completed output must carry program_output id, got: {s}"
+        );
+    }
+
+    #[test]
+    fn test_stream_completed_output_preserves_output_index_order() {
+        let mut encoder = ResponsesStreamEncoder::new();
+        let _ = encoder
+            .encode_part(&StreamPart::ResponseStarted {
+                id: "resp_1".to_string(),
+            })
+            .unwrap();
+        let _ = encoder
+            .encode_part(&StreamPart::ProgramDelta {
+                id: "prog_1".to_string(),
+                call_id: "call_prog_1".to_string(),
+                code: "return 1".to_string(),
+                fingerprint: "fp".to_string(),
+            })
+            .unwrap();
+        let _ = encoder
+            .encode_part(&StreamPart::TextDelta {
+                text: "after program".to_string(),
+            })
+            .unwrap();
+        let _ = encoder
+            .encode_part(&StreamPart::ToolCallDelta {
+                id: "call_1".to_string(),
+                name: Some("lookup".to_string()),
+                arguments: "{}".to_string(),
+                wire_type: None,
+                item_id: Some("fc_1".to_string()),
+                caller: None,
+            })
+            .unwrap();
+        let _ = encoder
+            .encode_part(&StreamPart::Finish {
+                reason: FinishReason::ToolCalls,
+            })
+            .unwrap();
+        let completed = String::from_utf8(
+            encoder
+                .encode_part(&StreamPart::Usage {
+                    usage: Usage::default(),
+                })
+                .unwrap(),
+        )
+        .unwrap();
+        let event: Value = completed
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|payload| serde_json::from_str(payload).ok())
+            .find(|event: &Value| event["type"] == "response.completed")
+            .expect("response.completed event");
+        let types: Vec<&str> = event["response"]["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["type"].as_str())
+            .collect();
+        assert_eq!(types, vec!["program", "message", "function_call"]);
+    }
+
+    #[test]
+    fn test_prompt_cache_key_from_chat_shared_extension() {
+        let chat = crate::chat_completions::ChatCompletionsCodec::new();
+        let responses = ResponsesCodec::new();
+        let env = make_raw_env();
+        let ir = chat
+            .decode_request(
+                json!({
+                    "model": "gpt-5.6",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "prompt_cache_key": "shared-key",
+                    "prompt_cache_retention": "in_memory"
+                }),
+                &env,
+            )
+            .unwrap();
+        let (encoded, _) = responses.encode_request(&ir).unwrap();
+        assert_eq!(encoded["prompt_cache_key"], "shared-key");
+        assert_eq!(encoded["prompt_cache_retention"], "in_memory");
+    }
+
+    #[test]
+    fn test_system_image_breakpoint_survives_chat_to_responses() {
+        let chat = crate::chat_completions::ChatCompletionsCodec::new();
+        let responses = ResponsesCodec::new();
+        let env = make_raw_env();
+        let ir = chat
+            .decode_request(
+                json!({
+                    "model": "gpt-5.6",
+                    "messages": [{
+                        "role": "developer",
+                        "content": [{
+                            "type": "image_url",
+                            "image_url": {"url": "https://example.com/system.png", "detail": "original"},
+                            "prompt_cache_breakpoint": {"mode": "explicit"}
+                        }]
+                    }, {"role": "user", "content": "hello"}]
+                }),
+                &env,
+            )
+            .unwrap();
+        let (encoded, _) = responses.encode_request(&ir).unwrap();
+        assert_eq!(encoded["input"][0]["role"], "developer");
+        assert_eq!(encoded["input"][0]["content"][0]["type"], "input_image");
+        assert_eq!(encoded["input"][0]["content"][0]["detail"], "original");
+        assert_eq!(
+            encoded["input"][0]["content"][0]["prompt_cache_breakpoint"]["mode"],
+            "explicit"
+        );
+    }
+
+    #[test]
+    fn test_responses_cache_write_usage_roundtrip() {
+        let codec = ResponsesCodec::new();
+        let decoded = codec
+            .decode_response(json!({
+                "id": "resp_1",
+                "status": "completed",
+                "output": [],
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 10,
+                    "total_tokens": 110,
+                    "input_tokens_details": {"cached_tokens": 20, "cache_write_tokens": 30}
+                }
+            }))
+            .unwrap();
+        let usage = decoded.usage.as_ref().unwrap();
+        assert_eq!(usage.prompt_tokens, 50);
+        assert_eq!(usage.cache_read_tokens, Some(20));
+        assert_eq!(usage.cache_write_tokens, Some(30));
+        let encoded = codec.encode_response(&decoded).unwrap();
+        assert_eq!(encoded["usage"]["input_tokens"], 100);
+        assert_eq!(
+            encoded["usage"]["input_tokens_details"]["cached_tokens"],
+            20
+        );
+        assert_eq!(
+            encoded["usage"]["input_tokens_details"]["cache_write_tokens"],
+            30
+        );
+    }
+
+    #[test]
+    fn test_programmatic_tool_calling_response_roundtrip() {
+        let codec = ResponsesCodec::new();
+        let body = json!({
+            "id": "resp_1",
+            "status": "completed",
+            "output": [
+                {"type": "message", "id": "msg_1", "role": "assistant", "content": [{"type": "output_text", "text": "before"}]},
+                {"type": "program", "id": "prog_1", "call_id": "call_prog_1", "code": "await tools.lookup({})", "fingerprint": "fp_1"},
+                {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "lookup", "arguments": "{}", "caller": {"type": "program", "caller_id": "call_prog_1"}},
+                {"type": "program_output", "id": "progo_1", "call_id": "call_prog_1", "result": "done", "status": "completed"},
+                {"type": "message", "id": "msg_2", "role": "assistant", "content": [{"type": "output_text", "text": "after"}]}
+            ]
+        });
+        let decoded = codec.decode_response(body).unwrap();
+        assert!(matches!(
+            &decoded.content[0],
+            Content::Text { text, .. } if text == "before"
+        ));
+        assert!(matches!(
+            &decoded.content[1],
+            Content::Program { call_id, .. } if call_id == "call_prog_1"
+        ));
+        assert!(matches!(
+            &decoded.content[2],
+            Content::ToolCall { caller: Some(ToolCaller::Program { caller_id }), .. }
+                if caller_id == "call_prog_1"
+        ));
+        assert!(matches!(
+            &decoded.content[3],
+            Content::ProgramOutput { result, .. } if result == "done"
+        ));
+        assert!(matches!(
+            &decoded.content[4],
+            Content::Text { text, .. } if text == "after"
+        ));
+        let encoded = codec.encode_response(&decoded).unwrap();
+        assert_eq!(encoded["output"][0]["type"], "message");
+        assert_eq!(encoded["output"][0]["content"][0]["text"], "before");
+        assert_eq!(encoded["output"][1]["type"], "program");
+        assert_eq!(encoded["output"][2]["caller"]["caller_id"], "call_prog_1");
+        assert_eq!(encoded["output"][3]["type"], "program_output");
+        assert_eq!(encoded["output"][4]["type"], "message");
+        assert_eq!(encoded["output"][4]["content"][0]["text"], "after");
+    }
+
+    #[test]
+    fn test_http_decode_ptc_finish_reason_is_tool_calls() {
+        // Regression: HTTP decode_response must map `status:"completed"` to
+        // `FinishReason::ToolCalls` when the output contains a `program` item,
+        // mirroring the streaming decoder's `saw_function_call` latch.
+        // Without this, a cross-protocol encoder emits `finish_reason:"stop"`
+        // and the client never runs the tool.
+        let codec = ResponsesCodec::new();
+        let body = json!({
+            "id": "resp_1",
+            "status": "completed",
+            "output": [
+                {"type": "program", "id": "prog_1", "call_id": "call_prog_1", "code": "return 1", "fingerprint": "fp_1"}
+            ]
+        });
+        let decoded = codec.decode_response(body).unwrap();
+        assert_eq!(
+            decoded.finish_reason,
+            Some(FinishReason::ToolCalls),
+            "PTC program response must map to ToolCalls, not Stop"
+        );
+
+        // A pure-text completed response must still map to Stop.
+        let body_text = json!({
+            "id": "resp_2",
+            "status": "completed",
+            "output": [
+                {"type": "message", "id": "msg_1", "role": "assistant", "content": [{"type": "output_text", "text": "hello"}]}
+            ]
+        });
+        let decoded_text = codec.decode_response(body_text).unwrap();
+        assert_eq!(
+            decoded_text.finish_reason,
+            Some(FinishReason::Stop),
+            "pure-text response must map to Stop"
+        );
+    }
+
+    #[test]
+    fn test_http_encode_tool_calls_status_is_completed() {
+        // Regression: encode_response must map ToolCalls → "completed" to
+        // match the streaming encoder and OpenAI's wire behavior.
+        let codec = ResponsesCodec::new();
+        let ir = IrResponse {
+            content: vec![Content::ToolCall {
+                id: "fc_1".to_string(),
+                call_id: Some("call_1".to_string()),
+                name: "get_weather".to_string(),
+                arguments: json!({}),
+                caller: None,
+                wire_type: None,
+            }],
+            finish_reason: Some(FinishReason::ToolCalls),
+            usage: None,
+            response_id: Some("resp_1".to_string()),
+            stop_details: None,
+            extensions: HashMap::new(),
+        };
+        let encoded = codec.encode_response(&ir).unwrap();
+        assert_eq!(
+            encoded["status"], "completed",
+            "ToolCalls must encode to status 'completed', not 'incomplete'"
+        );
+    }
+
+    #[test]
+    fn test_programmatic_tool_calling_roundtrip() {
+        let codec = ResponsesCodec::new();
+        let env = make_raw_env();
+        let body = json!({
+            "model": "gpt-5.6",
+            "input": [
+                {"role": "user", "content": "check inventory"},
+                {"type": "program", "id": "prog_1", "call_id": "call_prog_1", "code": "await tools.lookup({})", "fingerprint": "fp_1"},
+                {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "lookup", "arguments": "{}", "caller": {"type": "program", "caller_id": "call_prog_1"}},
+                {"type": "function_call_output", "id": "fco_1", "call_id": "call_1", "output": "ok", "caller": {"type": "program", "caller_id": "call_prog_1"}},
+                {"type": "program_output", "id": "progo_1", "call_id": "call_prog_1", "result": "done", "status": "completed"}
+            ],
+            "tools": [
+                {"type": "programmatic_tool_calling"},
+                {"type": "function", "name": "lookup", "parameters": {"type": "object"}, "allowed_callers": ["programmatic"], "strict": true}
+            ]
+        });
+        let ir = codec.decode_request(body, &env).unwrap();
+        assert_eq!(
+            ir.tools[1].config.as_ref().unwrap()["allowed_callers"][0],
+            "programmatic"
+        );
+        assert!(ir
+            .messages
+            .iter()
+            .any(|message| message.content.iter().any(|content| {
+                matches!(content, Content::Program { call_id, .. } if call_id == "call_prog_1")
+            })));
+        assert!(ir.messages.iter().any(|message| message.content.iter().any(|content| {
+            matches!(content, Content::ToolCall { caller: Some(ToolCaller::Program { caller_id }), .. } if caller_id == "call_prog_1")
+        })));
+        let (encoded, _) = codec.encode_request(&ir).unwrap();
+        let input = encoded["input"].as_array().unwrap();
+        assert_eq!(input[1]["type"], "program");
+        assert_eq!(input[2]["caller"]["caller_id"], "call_prog_1");
+        assert_eq!(input[3]["caller"]["caller_id"], "call_prog_1");
+        assert_eq!(input[4]["type"], "program_output");
+        assert_eq!(encoded["tools"][1]["allowed_callers"][0], "programmatic");
+        assert_eq!(encoded["tools"][1]["strict"], true);
+    }
+
+    #[test]
+    fn test_gpt56_text_controls_and_breakpoints_roundtrip() {
+        let codec = ResponsesCodec::new();
+        let env = make_raw_env();
+        let body = json!({
+            "model": "gpt-5.6",
+            "input": [{
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": "hello",
+                    "prompt_cache_breakpoint": {"mode": "explicit"}
+                }, {
+                    "type": "input_image",
+                    "image_url": "https://example.com/a.png",
+                    "detail": "original"
+                }]
+            }],
+            "reasoning": {"effort": "none", "mode": "pro", "context": "all_turns"},
+            "text": {"verbosity": "high", "format": {"type": "text"}},
+            "prompt_cache_options": {"mode": "explicit", "ttl": "30m"},
+            "safety_identifier": "safe-user"
+        });
+        let ir = codec.decode_request(body, &env).unwrap();
+        assert_eq!(
+            ir.params.thinking.as_ref().and_then(|v| v.effort),
+            Some(tiygate_core::ThinkingEffort::None)
+        );
+        assert_eq!(ir.params.verbosity, Some(Verbosity::High));
+        assert!(matches!(
+            ir.response_format,
+            Some(tiygate_core::ResponseFormat::Text)
+        ));
+        let (encoded, _) = codec.encode_request(&ir).unwrap();
+        assert_eq!(encoded["reasoning"]["effort"], "none");
+        assert_eq!(encoded["text"]["verbosity"], "high");
+        assert_eq!(encoded["text"]["format"]["type"], "text");
+        assert_eq!(encoded["prompt_cache_options"]["mode"], "explicit");
+        assert_eq!(encoded["safety_identifier"], "safe-user");
+        assert_eq!(
+            encoded["input"][0]["content"][0]["prompt_cache_breakpoint"]["mode"],
+            "explicit"
+        );
+        assert_eq!(encoded["input"][0]["content"][1]["detail"], "original");
+    }
+
+    #[test]
+    fn test_text_format_json_schema_roundtrip_and_chat_cross() {
+        let responses = ResponsesCodec::new();
+        let chat = crate::chat_completions::ChatCompletionsCodec::new();
+        let env = make_raw_env();
+
+        // Responses → IR → Responses
+        let body = json!({
+            "model": "gpt-5.6",
+            "input": "hi",
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "answer",
+                    "schema": {"type": "object", "properties": {"ok": {"type": "boolean"}}},
+                    "strict": true
+                }
+            }
+        });
+        let ir = responses.decode_request(body, &env).unwrap();
+        match &ir.response_format {
+            Some(tiygate_core::ResponseFormat::JsonSchema { name, strict, .. }) => {
+                assert_eq!(name, "answer");
+                assert_eq!(*strict, Some(true));
+            }
+            other => panic!("expected JsonSchema, got {other:?}"),
+        }
+        let (encoded, _) = responses.encode_request(&ir).unwrap();
+        assert_eq!(encoded["text"]["format"]["type"], "json_schema");
+        assert_eq!(encoded["text"]["format"]["name"], "answer");
+        assert_eq!(encoded["text"]["format"]["strict"], true);
+
+        // Chat → IR → Responses must rehydrate text.format from IR response_format.
+        let chat_ir = chat
+            .decode_request(
+                json!({
+                    "model": "gpt-5.6",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "answer",
+                            "schema": {"type": "object"},
+                            "strict": true
+                        }
+                    }
+                }),
+                &env,
+            )
+            .unwrap();
+        let (from_chat, _) = responses.encode_request(&chat_ir).unwrap();
+        assert_eq!(from_chat["text"]["format"]["type"], "json_schema");
+        assert_eq!(from_chat["text"]["format"]["name"], "answer");
+        assert_eq!(from_chat["text"]["format"]["strict"], true);
+    }
+
+    #[test]
+    fn test_file_id_media_roundtrip() {
+        let codec = ResponsesCodec::new();
+        let env = make_raw_env();
+        let body = json!({
+            "model": "gpt-5.6",
+            "input": [{
+                "role": "user",
+                "content": [
+                    {"type": "input_image", "file_id": "file-img-1", "detail": "high"},
+                    {"type": "input_file", "file_id": "file-doc-1"},
+                    {"type": "input_file", "file_url": "https://example.com/a.pdf", "filename": "a.pdf"},
+                    {"type": "input_file", "file_data": "data:application/pdf;base64,JVBERi0=", "filename": "b.pdf"}
+                ]
+            }]
+        });
+        let ir = codec.decode_request(body, &env).unwrap();
+        assert!(ir.messages[0].content.iter().any(|c| matches!(
+            c,
+            Content::Media {
+                source: tiygate_core::ir::MediaSource::FileId { id },
+                ..
+            } if id == "file-img-1"
+        )));
+        assert!(ir.messages[0].content.iter().any(|c| matches!(
+            c,
+            Content::Media {
+                source: tiygate_core::ir::MediaSource::FileId { id },
+                ..
+            } if id == "file-doc-1"
+        )));
+        assert!(ir.messages[0].content.iter().any(|c| matches!(
+            c,
+            Content::Media {
+                source: tiygate_core::ir::MediaSource::Url { url },
+                ..
+            } if url == "https://example.com/a.pdf"
+        )));
+        assert!(ir.messages[0].content.iter().any(|c| matches!(
+            c,
+            Content::Media {
+                source: tiygate_core::ir::MediaSource::Inline { .. },
+                mime_type,
+                ..
+            } if mime_type == "application/pdf"
+        )));
+        let (encoded, _) = codec.encode_request(&ir).unwrap();
+        let parts = encoded["input"][0]["content"].as_array().unwrap();
+        assert!(parts.iter().any(|p| {
+            p["type"] == "input_image" && p["file_id"] == "file-img-1" && p["detail"] == "high"
+        }));
+        assert!(parts
+            .iter()
+            .any(|p| p["type"] == "input_file" && p["file_id"] == "file-doc-1"));
+        assert!(parts.iter().any(|p| {
+            p["type"] == "input_file"
+                && p["file_url"] == "https://example.com/a.pdf"
+                && p["filename"] == "a.pdf"
+        }));
+        assert!(parts.iter().any(|p| {
+            p["type"] == "input_file"
+                && p["file_data"]
+                    .as_str()
+                    .is_some_and(|s| s.starts_with("data:application/pdf;base64,"))
+                && p["filename"] == "b.pdf"
+        }));
+    }
+
+    #[test]
+    fn test_text_format_rejects_null_json_schema() {
+        let codec = ResponsesCodec::new();
+        let env = make_raw_env();
+        let body = json!({
+            "model": "gpt-5.6",
+            "input": "hi",
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "broken",
+                    "schema": null
+                }
+            }
+        });
+        let ir = codec.decode_request(body, &env).unwrap();
+        assert!(
+            ir.response_format.is_none(),
+            "null schema must not promote into IR response_format"
+        );
+    }
+
+    #[test]
     fn test_decode_basic_request() {
         let _codec = ResponsesCodec::new();
     }
@@ -2006,6 +3983,102 @@ mod tests {
             has_reasoning,
             "reasoning input item should decode to Reasoning"
         );
+    }
+
+    #[test]
+    fn test_stream_decoder_interleaved_function_calls_use_item_id_and_call_id() {
+        let mut decoder = ResponsesStreamDecoder::new();
+        let first = decoder
+            .feed(r#"data: {"type":"response.output_item.added","item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"one"}}"#)
+            .unwrap();
+        let second = decoder
+            .feed(r#"data: {"type":"response.output_item.added","item":{"type":"function_call","id":"fc_2","call_id":"call_2","name":"two"}}"#)
+            .unwrap();
+        assert!(matches!(
+            &first[0],
+            StreamPart::ToolCallDelta { id, name: Some(name), .. }
+                if id == "call_1" && name == "one"
+        ));
+        assert!(matches!(
+            &second[0],
+            StreamPart::ToolCallDelta { id, name: Some(name), .. }
+                if id == "call_2" && name == "two"
+        ));
+
+        let first_delta = decoder
+            .feed(r#"data: {"type":"response.function_call_arguments.delta","item_id":"fc_1","delta":"{\"a\":"}"#)
+            .unwrap();
+        let second_delta = decoder
+            .feed(r#"data: {"type":"response.function_call_arguments.delta","item_id":"fc_2","delta":"{\"b\":"}"#)
+            .unwrap();
+        assert!(matches!(
+            &first_delta[0],
+            StreamPart::ToolCallDelta { id, arguments, .. }
+                if id == "call_1" && arguments == "{\"a\":"
+        ));
+        assert!(matches!(
+            &second_delta[0],
+            StreamPart::ToolCallDelta { id, arguments, .. }
+                if id == "call_2" && arguments == "{\"b\":"
+        ));
+    }
+
+    #[test]
+    fn test_stream_encoder_completed_contains_full_text_snapshot() {
+        let mut encoder = ResponsesStreamEncoder::new();
+        let _ = encoder
+            .encode_part(&StreamPart::ResponseStarted {
+                id: "resp_1".to_string(),
+            })
+            .unwrap();
+        let _ = encoder
+            .encode_part(&StreamPart::TextDelta {
+                text: "hello ".to_string(),
+            })
+            .unwrap();
+        let _ = encoder
+            .encode_part(&StreamPart::TextDelta {
+                text: "world".to_string(),
+            })
+            .unwrap();
+        let finish = String::from_utf8(
+            encoder
+                .encode_part(&StreamPart::Finish {
+                    reason: FinishReason::Stop,
+                })
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(finish.contains("\"text\":\"hello world\""), "{finish}");
+        let completed = String::from_utf8(
+            encoder
+                .encode_part(&StreamPart::ResponseCompleted {
+                    id: "resp_1".to_string(),
+                    status: "completed".to_string(),
+                    usage: None,
+                    extensions: HashMap::new(),
+                })
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            completed.contains("\"text\":\"hello world\""),
+            "{completed}"
+        );
+    }
+
+    #[test]
+    fn test_decode_response_usage_null_is_none() {
+        let codec = ResponsesCodec::new();
+        let decoded = codec
+            .decode_response(json!({
+                "id": "resp_1",
+                "status": "completed",
+                "output": [],
+                "usage": null
+            }))
+            .unwrap();
+        assert!(decoded.usage.is_none());
     }
 
     #[test]
@@ -2067,6 +4140,127 @@ mod tests {
     }
 
     #[test]
+    fn test_stream_function_call_preserves_caller_and_dual_ids() {
+        let mut decoder = ResponsesStreamDecoder::new();
+        let parts = decoder
+            .feed(r#"data: {"type":"response.output_item.added","item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"lookup","arguments":"{}","caller":{"type":"program","caller_id":"call_prog_1"}}}"#)
+            .unwrap();
+        match &parts[0] {
+            StreamPart::ToolCallDelta {
+                id,
+                name,
+                item_id,
+                caller,
+                ..
+            } => {
+                assert_eq!(id, "call_1");
+                assert_eq!(name.as_deref(), Some("lookup"));
+                assert_eq!(item_id.as_deref(), Some("fc_1"));
+                assert!(matches!(
+                    caller,
+                    Some(ToolCaller::Program { caller_id }) if caller_id == "call_prog_1"
+                ));
+            }
+            other => panic!("expected ToolCallDelta, got {other:?}"),
+        }
+
+        let mut encoder = ResponsesStreamEncoder::new();
+        let bytes = encoder.encode_part(&parts[0]).unwrap();
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(
+            s.contains(r#""id":"fc_1""#),
+            "stream re-encode must keep item id: {s}"
+        );
+        assert!(
+            s.contains(r#""call_id":"call_1""#),
+            "stream re-encode must keep call_id: {s}"
+        );
+        assert!(
+            s.contains(r#""caller":{"type":"program","caller_id":"call_prog_1"}"#)
+                || (s.contains(r#""caller""#) && s.contains(r#""caller_id":"call_prog_1"#)),
+            "stream re-encode must keep PTC caller: {s}"
+        );
+
+        let done = encoder
+            .encode_part(&StreamPart::Finish {
+                reason: FinishReason::ToolCalls,
+            })
+            .unwrap();
+        let done2 = encoder
+            .encode_part(&StreamPart::Usage {
+                usage: Usage::default(),
+            })
+            .unwrap();
+        let combined = [done.as_slice(), done2.as_slice()].concat();
+        let completed = String::from_utf8_lossy(&combined);
+        assert!(
+            completed.contains(r#""id":"fc_1""#) && completed.contains(r#""call_id":"call_1""#),
+            "response.completed must restore dual ids: {completed}"
+        );
+        assert!(
+            completed.contains(r#""caller_id":"call_prog_1""#),
+            "response.completed must restore caller: {completed}"
+        );
+    }
+
+    #[test]
+    fn test_hosted_tool_output_items_roundtrip() {
+        let codec = ResponsesCodec::new();
+        let body = json!({
+            "id": "resp_hosted",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "web_search_call",
+                    "id": "ws_1",
+                    "status": "completed",
+                    "action": {"query": "gpt-5.6", "type": "search"}
+                },
+                {
+                    "type": "message",
+                    "id": "msg_1",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "found it"}]
+                },
+                {
+                    "type": "file_search_call",
+                    "id": "fs_1",
+                    "status": "completed",
+                    "queries": ["docs"]
+                }
+            ]
+        });
+        let decoded = codec.decode_response(body).unwrap();
+        assert!(
+            decoded
+                .extensions
+                .get("responses_opaque_output_items")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len() == 2)
+                .unwrap_or(false),
+            "hosted output items must be bagged: {:?}",
+            decoded.extensions
+        );
+        assert!(matches!(
+            &decoded.content[0],
+            Content::Text { text, .. } if text == "found it"
+        ));
+        let encoded = codec.encode_response(&decoded).unwrap();
+        let output = encoded["output"].as_array().expect("output array");
+        assert_eq!(
+            output.len(),
+            3,
+            "hosted items + message must all reappear: {encoded}"
+        );
+        assert_eq!(output[0]["type"], "web_search_call");
+        assert_eq!(output[0]["id"], "ws_1");
+        assert_eq!(output[1]["type"], "message");
+        assert_eq!(output[1]["content"][0]["text"], "found it");
+        assert_eq!(output[2]["type"], "file_search_call");
+        assert_eq!(output[2]["id"], "fs_1");
+    }
+
+    #[test]
     fn test_stream_encoder_function_call_item_includes_call_id() {
         let mut enc = ResponsesStreamEncoder::new();
         let bytes = enc
@@ -2074,6 +4268,9 @@ mod tests {
                 id: "call_123".to_string(),
                 name: Some("lookup".to_string()),
                 arguments: String::new(),
+                wire_type: None,
+                item_id: None,
+                caller: None,
             })
             .unwrap();
         let s = String::from_utf8_lossy(&bytes);
@@ -2093,6 +4290,9 @@ mod tests {
                 id: "call_123".to_string(),
                 name: Some("lookup".to_string()),
                 arguments: String::new(),
+                wire_type: None,
+                item_id: None,
+                caller: None,
             })
             .unwrap();
         let second = enc
@@ -2100,6 +4300,9 @@ mod tests {
                 id: "call_123".to_string(),
                 name: Some("lookup".to_string()),
                 arguments: String::new(),
+                wire_type: None,
+                item_id: None,
+                caller: None,
             })
             .unwrap();
 
@@ -2290,6 +4493,7 @@ mod tests {
             content: vec![Content::Text {
                 text: "Hi!".to_string(),
                 annotations: None,
+                prompt_cache_breakpoint: None,
             }],
             usage: Some(Usage {
                 prompt_tokens: 10,
@@ -2336,6 +4540,7 @@ mod tests {
             content: vec![Content::Text {
                 text: "ok".to_string(),
                 annotations: None,
+                prompt_cache_breakpoint: None,
             }],
             usage: Some(Usage {
                 prompt_tokens: 100,
@@ -2468,6 +4673,7 @@ mod tests {
                     content: vec![Content::Text {
                         text: "杭州明天天气？".to_string(),
                         annotations: None,
+                        prompt_cache_breakpoint: None,
                     }],
                 },
                 Message {
@@ -2484,6 +4690,8 @@ mod tests {
                             name: "get_weather".to_string(),
                             arguments: serde_json::json!({"location": "杭州"}),
                             call_id: None,
+                            caller: None,
+                            wire_type: None,
                         },
                     ],
                 },
@@ -2494,6 +4702,8 @@ mod tests {
                         name: "get_weather".to_string(),
                         content: "cloudy".to_string(),
                         id: None,
+                        caller: None,
+                        wire_type: None,
                     }],
                 },
             ],
@@ -2681,6 +4891,121 @@ mod tests {
     /// Cross-protocol reasoning (no Responses id) must be emitted WITHOUT an
     /// `id` field — fabricating one would be rejected by the Responses API.
     #[test]
+    fn test_responses_both_id_and_call_id_normalize_for_cross_protocol_pairing() {
+        // When function_call items carry both `id` (item ref) and `call_id`
+        // (function-call identifier) and the call_ids collide, the unique
+        // remapped call_id must live in IR.call_id AND in ToolResult.tool_call_id.
+        // Cross-protocol encoders (Anthropic/Chat) pair via
+        // call_id.as_deref().unwrap_or(id). Using the raw (duplicated) call_id
+        // would leave ToolCall and ToolResult mismatched → upstream 400.
+        let codec = ResponsesCodec::new();
+        let env = make_raw_env();
+        let duplicate = "call_shared";
+        let body = json!({
+            "model": "gpt-5.6",
+            "input": [
+                {"role": "user", "content": "review"},
+                {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": duplicate,
+                    "name": "git_status",
+                    "arguments": "{}"
+                },
+                {
+                    "type": "function_call",
+                    "id": "fc_2",
+                    "call_id": duplicate,
+                    "name": "git_diff",
+                    "arguments": "{\"path\":\"a.rs\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": duplicate,
+                    "output": "status output"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": duplicate,
+                    "output": "diff output"
+                }
+            ]
+        });
+        let ir = codec.decode_request(body, &env).unwrap();
+
+        let pairs: Vec<(String, Option<String>)> = ir
+            .messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .filter_map(|c| match c {
+                Content::ToolCall { id, call_id, .. } => Some((id.clone(), call_id.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pairs.len(), 2);
+        // IR.id keeps the item ref; IR.call_id is the unique function-call id.
+        assert_eq!(pairs[0].0, "fc_1");
+        assert_eq!(pairs[0].1.as_deref(), Some(duplicate));
+        assert_eq!(pairs[1].0, "fc_2");
+        let second_unique = format!("{duplicate}_1");
+        assert_eq!(pairs[1].1.as_deref(), Some(second_unique.as_str()));
+
+        let result_ids: Vec<String> = ir
+            .messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .filter_map(|c| match c {
+                Content::ToolResult { tool_call_id, .. } => Some(tool_call_id.clone()),
+                _ => None,
+            })
+            .collect();
+        let expected = vec![pairs[0].1.clone().unwrap(), pairs[1].1.clone().unwrap()];
+        assert_eq!(
+            result_ids, expected,
+            "ToolResult must use unique remapped call_ids"
+        );
+
+        // Anthropic cross-protocol pairing.
+        let anthropic = crate::messages::MessagesCodec::new();
+        let (a_enc, _) = anthropic.encode_request(&ir).unwrap();
+        let a_msgs = a_enc["messages"].as_array().unwrap();
+        let a_tool_use: Vec<String> = a_msgs
+            .iter()
+            .filter(|m| m["role"] == "assistant")
+            .flat_map(|m| m["content"].as_array().into_iter().flatten())
+            .filter(|b| b["type"] == "tool_use")
+            .filter_map(|b| b["id"].as_str().map(String::from))
+            .collect();
+        let a_tool_result: Vec<String> = a_msgs
+            .iter()
+            .filter(|m| m["role"] == "user")
+            .flat_map(|m| m["content"].as_array().into_iter().flatten())
+            .filter(|b| b["type"] == "tool_result")
+            .filter_map(|b| b["tool_use_id"].as_str().map(String::from))
+            .collect();
+        assert_eq!(a_tool_use, expected);
+        assert_eq!(a_tool_result, expected);
+
+        // Chat Completions cross-protocol pairing.
+        let chat = crate::chat_completions::ChatCompletionsCodec::new();
+        let (c_enc, _) = chat.encode_request(&ir).unwrap();
+        let c_msgs = c_enc["messages"].as_array().unwrap();
+        let c_tool_calls: Vec<String> = c_msgs
+            .iter()
+            .filter(|m| m["role"] == "assistant")
+            .flat_map(|m| m["tool_calls"].as_array().into_iter().flatten())
+            .filter_map(|tc| tc["id"].as_str().map(String::from))
+            .collect();
+        let c_tool_results: Vec<String> = c_msgs
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .filter_map(|m| m["tool_call_id"].as_str().map(String::from))
+            .collect();
+        assert_eq!(c_tool_calls, expected);
+        assert_eq!(c_tool_results, expected);
+    }
+
+    #[test]
     fn test_responses_cross_protocol_reasoning_has_no_id() {
         let codec = ResponsesCodec::new();
         let ir = tiygate_core::IrRequest {
@@ -2841,6 +5166,7 @@ mod tests {
             name,
             arguments,
             call_id: _,
+            ..
         } = tool_call
         {
             assert_eq!(id, "call_shell_1");
@@ -2872,6 +5198,7 @@ mod tests {
             name,
             arguments,
             call_id: _,
+            ..
         } = tool_call
         {
             assert_eq!(id, "call_custom_1");
@@ -2984,6 +5311,7 @@ mod tests {
                 content: vec![Content::Text {
                     text: "hi".to_string(),
                     annotations: None,
+                    prompt_cache_breakpoint: None,
                 }],
             }],
             tools: vec![],
@@ -3026,6 +5354,141 @@ mod tests {
     }
 
     #[test]
+    fn test_reasoning_mode_context_max_roundtrip() {
+        let codec = ResponsesCodec::new();
+        let env = make_raw_env();
+        let body = json!({
+            "model": "gpt-5.6",
+            "input": "hi",
+            "reasoning": {
+                "effort": "max",
+                "mode": "pro",
+                "context": {"preserve": true},
+                "summary": "auto"
+            }
+        });
+        let ir = codec.decode_request(body, &env).unwrap();
+        let thinking = ir.params.thinking.as_ref().expect("thinking present");
+        assert_eq!(thinking.effort, Some(tiygate_core::ThinkingEffort::Max));
+        assert_eq!(thinking.mode.as_deref(), Some("pro"));
+        assert_eq!(thinking.context, Some(json!({"preserve": true})));
+        assert_eq!(thinking.summary.as_deref(), Some("auto"));
+
+        // Cross-protocol rebuild (no reasoning_full) must still emit all fields.
+        let mut ir_cross = ir.clone();
+        ir_cross.extensions.remove("reasoning_full");
+        ir_cross.ingress_protocol =
+            ProtocolEndpoint::new(ProtocolSuite::AnthropicMessages, "messages", "2023-06-01");
+        let (encoded, _) = codec.encode_request(&ir_cross).unwrap();
+        assert_eq!(encoded["reasoning"]["effort"], "max");
+        assert_eq!(encoded["reasoning"]["mode"], "pro");
+        assert_eq!(encoded["reasoning"]["context"]["preserve"], true);
+        assert_eq!(encoded["reasoning"]["summary"], "auto");
+    }
+
+    #[test]
+    fn test_hosted_tools_roundtrip() {
+        let codec = ResponsesCodec::new();
+        let env = make_raw_env();
+        let body = json!({
+            "model": "gpt-5.6",
+            "input": "search something",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "lookup",
+                    "description": "fn",
+                    "parameters": {"type": "object"}
+                },
+                {
+                    "type": "web_search",
+                    "search_context_size": "medium"
+                },
+                {
+                    "type": "file_search",
+                    "vector_store_ids": ["vs_1"]
+                }
+            ]
+        });
+        let ir = codec.decode_request(body, &env).unwrap();
+        assert_eq!(ir.tools.len(), 3);
+        assert!(ir.tools[0].is_function());
+        assert_eq!(ir.tools[0].name, "lookup");
+        assert_eq!(ir.tools[1].tool_type.as_deref(), Some("web_search"));
+        assert_eq!(
+            ir.tools[1]
+                .config
+                .as_ref()
+                .and_then(|c| c.get("search_context_size")),
+            Some(&json!("medium"))
+        );
+        assert_eq!(ir.tools[2].tool_type.as_deref(), Some("file_search"));
+
+        let (encoded, _) = codec.encode_request(&ir).unwrap();
+        let tools = encoded["tools"].as_array().expect("tools array");
+        assert_eq!(tools.len(), 3);
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["name"], "lookup");
+        assert_eq!(tools[1]["type"], "web_search");
+        assert_eq!(tools[1]["search_context_size"], "medium");
+        assert_eq!(tools[2]["type"], "file_search");
+        assert_eq!(tools[2]["vector_store_ids"][0], "vs_1");
+    }
+
+    #[test]
+    fn test_prompt_cache_options_passthrough() {
+        let codec = ResponsesCodec::new();
+        let env = make_raw_env();
+        let body = json!({
+            "model": "gpt-5.6",
+            "input": "hi",
+            "prompt_cache_key": "k1",
+            "prompt_cache_options": {"mode": "explicit", "ttl": "30m"}
+        });
+        let ir = codec.decode_request(body, &env).unwrap();
+        let extra = ir
+            .extensions
+            .get("responses_extra")
+            .and_then(|v| v.as_object())
+            .expect("responses_extra");
+        assert_eq!(extra["prompt_cache_key"], "k1");
+        assert_eq!(extra["prompt_cache_options"]["mode"], "explicit");
+        let (encoded, _) = codec.encode_request(&ir).unwrap();
+        assert_eq!(encoded["prompt_cache_key"], "k1");
+        assert_eq!(encoded["prompt_cache_options"]["mode"], "explicit");
+        assert_eq!(encoded["prompt_cache_options"]["ttl"], "30m");
+    }
+
+    #[test]
+    fn test_hosted_tools_hard_reject_on_chat_completions() {
+        // Hosted tools (web_search/file_search/...) are Responses-only.
+        // Cross-protocol conversion must hard-reject via check_lossy_conversion
+        // rather than silently filtering them out of the Chat tools array.
+        let responses = ResponsesCodec::new();
+        let chat = crate::chat_completions::ChatCompletionsCodec::new();
+        let env = make_raw_env();
+        let body = json!({
+            "model": "gpt-5.6",
+            "input": "hi",
+            "tools": [
+                {"type": "function", "name": "lookup", "parameters": {"type": "object"}},
+                {"type": "web_search"}
+            ]
+        });
+        let ir = responses.decode_request(body, &env).unwrap();
+        let err = tiygate_core::protocol::lossy::check_lossy_conversion(
+            &ir,
+            chat.id(),
+            chat.capabilities(),
+        )
+        .expect_err("hosted tools must hard-reject on Chat Completions");
+        assert_eq!(
+            err.0,
+            tiygate_core::protocol::lossy::LossyDimension::HostedTools
+        );
+    }
+
+    #[test]
     fn test_stream_decoder_codex_local_shell_call_finish_reason() {
         let mut dec = ResponsesStreamDecoder::new();
         // Simulate a Codex streaming response with a local_shell_call item
@@ -3046,5 +5509,346 @@ mod tests {
             "Codex local_shell_call stream should produce FinishReason::ToolCalls, got: {:?}",
             parts
         );
+    }
+
+    #[test]
+    fn test_multi_agent_field_and_items_roundtrip() {
+        let codec = ResponsesCodec::new();
+        let env = make_raw_env();
+        let body = json!({
+            "model": "gpt-5.6",
+            "input": [
+                {"role": "user", "content": "coordinate agents"},
+                {
+                    "type": "multi_agent_call",
+                    "id": "ma_1",
+                    "name": "spawn_agent",
+                    "arguments": {"task": "research"}
+                },
+                {
+                    "type": "multi_agent_call_output",
+                    "id": "mao_1",
+                    "call_id": "ma_1",
+                    "output": {"agent_id": "/root/child1"}
+                }
+            ],
+            "multi_agent": {
+                "enabled": true,
+                "max_concurrent_subagents": 4
+            }
+        });
+        let ir = codec.decode_request(body, &env).unwrap();
+
+        let extra = ir
+            .extensions
+            .get("responses_extra")
+            .and_then(|v| v.as_object())
+            .expect("responses_extra should exist");
+        assert_eq!(extra["multi_agent"]["enabled"], true);
+        assert_eq!(extra["multi_agent"]["max_concurrent_subagents"], 4);
+
+        let items = ir
+            .extensions
+            .get("multi_agent_items")
+            .and_then(|v| v.as_array())
+            .expect("multi_agent_items should be in extensions");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["type"], "multi_agent_call");
+        assert_eq!(items[1]["type"], "multi_agent_call_output");
+
+        // Opaque multi-agent items must not create empty IR messages.
+        assert_eq!(ir.messages.len(), 1);
+        assert_eq!(ir.messages[0].role, Role::User);
+
+        let (encoded, _) = codec.encode_request(&ir).unwrap();
+        assert_eq!(encoded["multi_agent"]["enabled"], true);
+        assert_eq!(encoded["multi_agent"]["max_concurrent_subagents"], 4);
+        let input = encoded["input"].as_array().expect("input array");
+        let types: Vec<&str> = input
+            .iter()
+            .map(|item| {
+                item.get("type")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| item.get("role").map(|_| "message"))
+                    .unwrap_or("unknown")
+            })
+            .collect();
+        assert_eq!(
+            types,
+            vec!["message", "multi_agent_call", "multi_agent_call_output"],
+            "multi-agent items must keep original interleaving: {types:?}"
+        );
+    }
+
+    #[test]
+    fn test_custom_tool_definition_roundtrip_and_chat_cross() {
+        let responses = ResponsesCodec::new();
+        let chat = crate::chat_completions::ChatCompletionsCodec::new();
+        let env = make_raw_env();
+        let body = json!({
+            "model": "gpt-5.6",
+            "input": "hi",
+            "tools": [{
+                "type": "custom",
+                "name": "code_exec",
+                "description": "run code",
+                "format": {"type": "text"}
+            }]
+        });
+        let ir = responses.decode_request(body, &env).unwrap();
+        assert!(ir.tools[0].is_custom());
+        assert!(!ir.tools[0].is_hosted());
+        assert_eq!(ir.tools[0].name, "code_exec");
+        assert_eq!(
+            ir.tools[0]
+                .config
+                .as_ref()
+                .and_then(|c| c.get("format"))
+                .and_then(|f| f.get("type")),
+            Some(&json!("text"))
+        );
+
+        let (encoded, _) = responses.encode_request(&ir).unwrap();
+        assert_eq!(encoded["tools"][0]["type"], "custom");
+        assert_eq!(encoded["tools"][0]["name"], "code_exec");
+        assert_eq!(encoded["tools"][0]["format"]["type"], "text");
+
+        let (chat_encoded, _) = chat.encode_request(&ir).unwrap();
+        assert_eq!(chat_encoded["tools"][0]["type"], "custom");
+        assert_eq!(chat_encoded["tools"][0]["name"], "code_exec");
+        assert_eq!(chat_encoded["tools"][0]["format"]["type"], "text");
+    }
+
+    #[test]
+    fn test_custom_tool_call_wire_type_roundtrip() {
+        let codec = ResponsesCodec::new();
+        let env = make_raw_env();
+        let body = json!({
+            "model": "gpt-5.6",
+            "input": [
+                {"role": "user", "content": "run custom tool"},
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "call_custom_1",
+                    "name": "my_tool",
+                    "input": "some input text"
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_custom_1",
+                    "output": "tool result"
+                }
+            ]
+        });
+        let ir = codec.decode_request(body, &env).unwrap();
+        assert!(ir.messages.iter().any(|m| {
+            m.content.iter().any(|c| {
+                matches!(
+                    c,
+                    Content::ToolCall {
+                        wire_type: Some(wt),
+                        ..
+                    } if wt == "custom_tool_call"
+                )
+            })
+        }));
+        assert!(ir.messages.iter().any(|m| {
+            m.content.iter().any(|c| {
+                matches!(
+                    c,
+                    Content::ToolResult {
+                        wire_type: Some(wt),
+                        ..
+                    } if wt == "custom_tool_call_output"
+                )
+            })
+        }));
+
+        let (encoded, _) = codec.encode_request(&ir).unwrap();
+        let input = encoded["input"].as_array().expect("input");
+        assert!(
+            input.iter().any(|item| item["type"] == "custom_tool_call"
+                && item["name"] == "my_tool"
+                && item["input"] == "some input text"),
+            "custom_tool_call wire type must survive re-encode: {input:?}"
+        );
+        assert!(
+            input
+                .iter()
+                .any(|item| item["type"] == "custom_tool_call_output"
+                    && item["output"] == "tool result"),
+            "custom_tool_call_output wire type must survive re-encode: {input:?}"
+        );
+    }
+
+    #[test]
+    fn test_stream_custom_tool_call_wire_type_fidelity() {
+        // Streaming custom_tool_call must preserve wire_type through
+        // decode → encode so same-protocol clients do not see a plain
+        // function_call.
+        let mut decoder = ResponsesStreamDecoder::new();
+        let parts = decoder
+            .feed(r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"custom_tool_call","id":"ctc_1","call_id":"call_custom_1","name":"my_tool","input":"hello"}}"#)
+            .unwrap();
+        assert!(
+            matches!(
+                &parts[0],
+                StreamPart::ToolCallDelta { id, name: Some(name), wire_type: Some(wt), .. } if id == "call_custom_1" && name == "my_tool" && wt == "custom_tool_call"
+            ),
+            "stream decode must set wire_type=custom_tool_call, got: {parts:?}"
+        );
+
+        let mut encoder = ResponsesStreamEncoder::new();
+        let bytes = encoder.encode_part(&parts[0]).unwrap();
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(
+            s.contains(r#""type":"custom_tool_call""#),
+            "stream re-encode must emit custom_tool_call, got: {s}"
+        );
+        assert!(
+            !s.contains(r#""type":"function_call""#),
+            "stream re-encode must not collapse custom_tool_call to function_call: {s}"
+        );
+
+        let delta = decoder
+            .feed(r#"data: {"type":"response.custom_tool_call_input.delta","output_index":0,"item_id":"ctc_1","delta":" world"}"#)
+            .unwrap();
+        assert!(matches!(
+            &delta[0],
+            StreamPart::ToolCallDelta {
+                id,
+                name: None,
+                arguments,
+                wire_type: Some(wire_type),
+                ..
+            } if id == "call_custom_1" && arguments == " world" && wire_type == "custom_tool_call"
+        ));
+        let encoded_delta = encoder.encode_part(&delta[0]).unwrap();
+        let encoded_delta = String::from_utf8_lossy(&encoded_delta);
+        assert!(
+            encoded_delta.contains(r#""type":"response.custom_tool_call_input.delta""#),
+            "custom inputs must use their native delta event: {encoded_delta}"
+        );
+        assert!(
+            !encoded_delta.contains(r#""type":"response.function_call_arguments.delta""#),
+            "custom inputs must not use function-call delta events: {encoded_delta}"
+        );
+
+        let done = encoder
+            .encode_part(&StreamPart::Finish {
+                reason: FinishReason::ToolCalls,
+            })
+            .unwrap();
+        let done = String::from_utf8_lossy(&done);
+        assert!(
+            done.contains(r#""type":"response.custom_tool_call_input.done""#),
+            "custom inputs must emit their native done event: {done}"
+        );
+
+        let mut done_only_decoder = ResponsesStreamDecoder::new();
+        done_only_decoder
+            .feed(r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"custom_tool_call","id":"ctc_2","call_id":"call_custom_2","name":"my_tool","input":""}}"#)
+            .unwrap();
+        let done_only = done_only_decoder
+            .feed(r#"data: {"type":"response.custom_tool_call_input.done","output_index":0,"item_id":"ctc_2","input":"final input"}"#)
+            .unwrap();
+        assert!(matches!(
+            &done_only[0],
+            StreamPart::ToolCallDelta {
+                id,
+                name: None,
+                arguments,
+                wire_type: Some(wire_type),
+                ..
+            } if id == "call_custom_2" && arguments == "final input" && wire_type == "custom_tool_call"
+        ));
+    }
+
+    #[test]
+    fn test_opaque_items_preserve_interleaving_order() {
+        let codec = ResponsesCodec::new();
+        let env = make_raw_env();
+        let body = json!({
+            "model": "gpt-5.6",
+            "input": [
+                {"role": "user", "content": "before"},
+                {"type": "compaction", "id": "comp_1", "summary": "compacted"},
+                {"role": "user", "content": "after"},
+                {
+                    "type": "multi_agent_call",
+                    "id": "ma_1",
+                    "name": "spawn_agent",
+                    "arguments": {"task": "research"}
+                }
+            ],
+            "multi_agent": {"enabled": true}
+        });
+        let ir = codec.decode_request(body, &env).unwrap();
+        let (encoded, _) = codec.encode_request(&ir).unwrap();
+        let input = encoded["input"].as_array().expect("input");
+        let types: Vec<&str> = input
+            .iter()
+            .map(|item| {
+                item.get("type")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| item.get("role").map(|_| "message"))
+                    .unwrap_or("unknown")
+            })
+            .collect();
+        assert_eq!(
+            types,
+            vec!["message", "compaction", "message", "multi_agent_call"],
+            "opaque items must keep original interleaving: {types:?}"
+        );
+        assert_eq!(input[0]["content"], "before");
+        assert_eq!(input[2]["content"], "after");
+    }
+
+    #[test]
+    fn test_opaque_input_keeps_boundaries_before_later_item() {
+        let codec = ResponsesCodec::new();
+        let env = make_raw_env();
+        let body = json!({
+            "model": "gpt-5.6",
+            "input": [
+                {"role": "user", "content": "first"},
+                {"role": "user", "content": "second"},
+                {"type": "compaction", "id": "comp_1", "summary": "compact"},
+                {"role": "user", "content": "third"}
+            ]
+        });
+
+        let ir = codec.decode_request(body, &env).unwrap();
+        let (encoded, _) = codec.encode_request(&ir).unwrap();
+        let input = encoded["input"].as_array().expect("input array");
+        assert_eq!(input.len(), 4);
+        assert_eq!(input[0]["content"], "first");
+        assert_eq!(input[1]["content"], "second");
+        assert_eq!(input[2]["type"], "compaction");
+        assert_eq!(input[3]["content"], "third");
+    }
+
+    #[test]
+    fn test_opaque_output_preserves_later_message_order() {
+        let codec = ResponsesCodec::new();
+        let body = json!({
+            "id": "resp_1",
+            "status": "completed",
+            "output": [
+                {"type": "message", "id": "msg_1", "role": "assistant", "content": [{"type": "output_text", "text": "first"}]},
+                {"type": "message", "id": "msg_2", "role": "assistant", "content": [{"type": "output_text", "text": "second"}]},
+                {"type": "web_search_call", "id": "ws_1", "status": "completed", "action": {"query": "q"}},
+                {"type": "message", "id": "msg_3", "role": "assistant", "content": [{"type": "output_text", "text": "third"}]}
+            ]
+        });
+
+        let ir = codec.decode_response(body).unwrap();
+        let encoded = codec.encode_response(&ir).unwrap();
+        let output = encoded["output"].as_array().expect("output array");
+        assert_eq!(output.len(), 4);
+        assert_eq!(output[0]["content"][0]["text"], "first");
+        assert_eq!(output[1]["content"][0]["text"], "second");
+        assert_eq!(output[2]["type"], "web_search_call");
+        assert_eq!(output[3]["content"][0]["text"], "third");
     }
 }

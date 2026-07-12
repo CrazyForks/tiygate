@@ -201,6 +201,9 @@ fn chat_stream_encoder_assigns_distinct_tool_call_indices() {
             id: "call_a".to_string(),
             name: Some("f".to_string()),
             arguments: String::new(),
+            wire_type: None,
+            item_id: None,
+            caller: None,
         })
         .unwrap();
     let second = enc
@@ -208,6 +211,9 @@ fn chat_stream_encoder_assigns_distinct_tool_call_indices() {
             id: "call_b".to_string(),
             name: Some("g".to_string()),
             arguments: String::new(),
+            wire_type: None,
+            item_id: None,
+            caller: None,
         })
         .unwrap();
     let s1 = String::from_utf8_lossy(&first);
@@ -228,6 +234,9 @@ fn chat_stream_encoder_assigns_distinct_tool_call_indices() {
             id: "call_b".to_string(),
             name: None,
             arguments: "{\"x\":1}".to_string(),
+            wire_type: None,
+            item_id: None,
+            caller: None,
         })
         .unwrap();
     let s3 = String::from_utf8_lossy(&frag);
@@ -263,6 +272,9 @@ fn anthropic_stream_encoder_frames_blocks() {
             id: "call_a".to_string(),
             name: Some("f".to_string()),
             arguments: String::new(),
+            wire_type: None,
+            item_id: None,
+            caller: None,
         })
         .unwrap(),
     ));
@@ -271,6 +283,9 @@ fn anthropic_stream_encoder_frames_blocks() {
             id: "call_a".to_string(),
             name: None,
             arguments: "{\"x\":1}".to_string(),
+            wire_type: None,
+            item_id: None,
+            caller: None,
         })
         .unwrap(),
     ));

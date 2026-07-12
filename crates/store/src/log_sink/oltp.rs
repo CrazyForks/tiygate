@@ -183,10 +183,10 @@ impl EventSink for OltpSink {
                 egress_protocol = excluded.egress_protocol, \
                 lossy = excluded.lossy, \
                 cache_hit = excluded.cache_hit, \
-                status = CASE WHEN request_logs.truncation_reason IN ('idle', 'total', 'upstream_error') THEN request_logs.status ELSE excluded.status END, \
-                error_class = CASE WHEN request_logs.truncation_reason IN ('idle', 'total', 'upstream_error') THEN request_logs.error_class ELSE excluded.error_class END, \
-                http_status = excluded.http_status, \
-                error_source = CASE WHEN request_logs.truncation_reason IN ('idle', 'total', 'upstream_error') THEN request_logs.error_source ELSE excluded.error_source END, \
+                status = CASE WHEN request_logs.truncation_reason IN ('idle', 'total', 'upstream_error', 'client_disconnect') THEN request_logs.status ELSE excluded.status END, \
+                error_class = CASE WHEN request_logs.truncation_reason IN ('idle', 'total', 'upstream_error', 'client_disconnect') THEN request_logs.error_class ELSE excluded.error_class END, \
+                http_status = CASE WHEN request_logs.truncation_reason IN ('idle', 'total', 'upstream_error', 'client_disconnect') THEN request_logs.http_status ELSE excluded.http_status END, \
+                error_source = CASE WHEN request_logs.truncation_reason IN ('idle', 'total', 'upstream_error', 'client_disconnect') THEN request_logs.error_source ELSE excluded.error_source END, \
                 total_latency_ms = excluded.total_latency_ms, \
                 upstream_latency_ms = excluded.upstream_latency_ms, \
                 queue_latency_ms = excluded.queue_latency_ms, \
@@ -392,6 +392,22 @@ impl EventSink for OltpSink {
                         error = %e,
                         request_id = %capture.request_id,
                         "oltp sink: failure status write-back failed"
+                    );
+                }
+            }
+            // The client left before the stream reached a terminal event.
+            // This is not an upstream failure and must not affect routing
+            // health, but it is an abnormal request outcome rather than the
+            // optimistic success emitted when the upstream handshake opened.
+            if reason == "client_disconnect" {
+                if let Err(e) = self
+                    .update_request_client_disconnect(&capture.request_id)
+                    .await
+                {
+                    warn!(
+                        error = %e,
+                        request_id = %capture.request_id,
+                        "oltp sink: client-disconnect write-back failed"
                     );
                 }
             }
@@ -841,6 +857,34 @@ impl OltpSink {
         .bind(now)
         .bind(error_class)
         .bind(error_source)
+        .execute(self.pool.any())
+        .await?;
+        Ok(())
+    }
+
+    /// Persist a client-cancelled stream as an abnormal HTTP 499 outcome.
+    /// The capture can race with the optimistic success RequestEvent, so this
+    /// uses the same upsert strategy as [`Self::update_request_failure`].
+    /// Unlike an upstream failure, this status must never feed the health
+    /// registry or trigger a routing fallback.
+    async fn update_request_client_disconnect(&self, request_id: &str) -> Result<(), sqlx::Error> {
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO request_logs (\
+                request_id, ts, virtual_model, ingress_protocol, status, \
+                total_latency_ms, upstream_latency_ms, queue_latency_ms, lossy, \
+                error_class, http_status, error_source, truncation_reason) \
+             VALUES ($1, $2, '', '', 'abnormal', 0, 0, 0, 0, 'client_disconnect', 499, \
+                     'client disconnected before stream completed', 'client_disconnect') \
+             ON CONFLICT(request_id) DO UPDATE SET \
+                status = excluded.status, \
+                error_class = excluded.error_class, \
+                http_status = excluded.http_status, \
+                error_source = excluded.error_source, \
+                truncation_reason = excluded.truncation_reason",
+        )
+        .bind(request_id)
+        .bind(now)
         .execute(self.pool.any())
         .await?;
         Ok(())
@@ -1487,19 +1531,66 @@ fn merge_openai_response_tool_item(
     item: &serde_json::Value,
     output_index: Option<usize>,
 ) {
-    if item.get("type").and_then(|t| t.as_str()) != Some("function_call") {
-        return;
+    match item.get("type").and_then(|t| t.as_str()) {
+        Some("function_call") => {
+            upsert_openai_response_tool_call(
+                &mut m.tool_calls,
+                item.get("call_id")
+                    .or(item.get("id"))
+                    .and_then(|i| i.as_str()),
+                item.get("name").and_then(|n| n.as_str()),
+                item.get("arguments").and_then(|a| a.as_str()),
+                false,
+                output_index,
+            );
+        }
+        Some("program") => {
+            // PTC program items count as tool-call turns for finish_reason /
+            // detail-view purposes even though they are not function tools.
+            upsert_openai_response_tool_call(
+                &mut m.tool_calls,
+                item.get("call_id")
+                    .or(item.get("id"))
+                    .and_then(|i| i.as_str()),
+                Some("program"),
+                item.get("code").and_then(|a| a.as_str()),
+                false,
+                output_index,
+            );
+        }
+        Some("custom_tool_call") => {
+            // Codex custom tools use free-text `input` rather than JSON
+            // `arguments`; surface the input as the arguments payload.
+            let input = item.get("input").and_then(|a| a.as_str());
+            upsert_openai_response_tool_call(
+                &mut m.tool_calls,
+                item.get("call_id")
+                    .or(item.get("id"))
+                    .and_then(|i| i.as_str()),
+                item.get("name").and_then(|n| n.as_str()),
+                input,
+                false,
+                output_index,
+            );
+        }
+        Some("local_shell_call") => {
+            let action = item
+                .get("action")
+                .map(|a| a.to_string())
+                .unwrap_or_default();
+            upsert_openai_response_tool_call(
+                &mut m.tool_calls,
+                item.get("call_id")
+                    .or(item.get("id"))
+                    .and_then(|i| i.as_str()),
+                Some("local_shell"),
+                Some(action.as_str()),
+                false,
+                output_index,
+            );
+        }
+        _ => {}
     }
-    upsert_openai_response_tool_call(
-        &mut m.tool_calls,
-        item.get("call_id")
-            .or(item.get("id"))
-            .and_then(|i| i.as_str()),
-        item.get("name").and_then(|n| n.as_str()),
-        item.get("arguments").and_then(|a| a.as_str()),
-        false,
-        output_index,
-    );
 }
 
 fn upsert_openai_response_tool_call(
@@ -1826,14 +1917,17 @@ fn extract_usage_from_json(body: &serde_json::Value) -> Option<Usage> {
         // (subset model); subtract to keep the IR cache-free, mirroring
         // protocols/responses.rs decode_response.
         let cache_read = u["input_tokens_details"]["cached_tokens"].as_u64();
+        let cache_write = u["input_tokens_details"]["cache_write_tokens"].as_u64();
         let raw_input = u["input_tokens"].as_u64().unwrap_or(0);
         return Some(Usage {
-            prompt_tokens: raw_input.saturating_sub(cache_read.unwrap_or(0)),
+            prompt_tokens: raw_input
+                .saturating_sub(cache_read.unwrap_or(0))
+                .saturating_sub(cache_write.unwrap_or(0)),
             completion_tokens: u["output_tokens"].as_u64().unwrap_or(0),
             total_tokens: u["total_tokens"].as_u64().unwrap_or(0),
             reasoning_tokens: u["output_tokens_details"]["reasoning_tokens"].as_u64(),
             cache_read_tokens: cache_read,
-            cache_write_tokens: None,
+            cache_write_tokens: cache_write,
         });
     }
 
@@ -1841,14 +1935,17 @@ fn extract_usage_from_json(body: &serde_json::Value) -> Option<Usage> {
     // prompt_tokens includes cached_tokens (subset model); subtract to
     // keep the IR cache-free, mirroring protocols/chat_completions.rs.
     let cache_read = u["prompt_tokens_details"]["cached_tokens"].as_u64();
+    let cache_write = u["prompt_tokens_details"]["cache_write_tokens"].as_u64();
     let raw_prompt = u["prompt_tokens"].as_u64().unwrap_or(0);
     Some(Usage {
-        prompt_tokens: raw_prompt.saturating_sub(cache_read.unwrap_or(0)),
+        prompt_tokens: raw_prompt
+            .saturating_sub(cache_read.unwrap_or(0))
+            .saturating_sub(cache_write.unwrap_or(0)),
         completion_tokens: u["completion_tokens"].as_u64().unwrap_or(0),
         total_tokens: u["total_tokens"].as_u64().unwrap_or(0),
         reasoning_tokens: u["completion_tokens_details"]["reasoning_tokens"].as_u64(),
         cache_read_tokens: cache_read,
-        cache_write_tokens: None,
+        cache_write_tokens: cache_write,
     })
 }
 
@@ -1907,15 +2004,18 @@ fn extract_usage_from_sse(raw: &str) -> Option<Usage> {
                     // the IR cache-free, mirroring
                     // protocols/chat_completions.rs stream decoder.
                     let cache_read = u["prompt_tokens_details"]["cached_tokens"].as_u64();
+                    let cache_write = u["prompt_tokens_details"]["cache_write_tokens"].as_u64();
                     let raw_prompt = u["prompt_tokens"].as_u64().unwrap_or(0);
                     last_json_usage = Some(Usage {
-                        prompt_tokens: raw_prompt.saturating_sub(cache_read.unwrap_or(0)),
+                        prompt_tokens: raw_prompt
+                            .saturating_sub(cache_read.unwrap_or(0))
+                            .saturating_sub(cache_write.unwrap_or(0)),
                         completion_tokens: u["completion_tokens"].as_u64().unwrap_or(0),
                         total_tokens: u["total_tokens"].as_u64().unwrap_or(0),
                         reasoning_tokens: u["completion_tokens_details"]["reasoning_tokens"]
                             .as_u64(),
                         cache_read_tokens: cache_read,
-                        cache_write_tokens: None,
+                        cache_write_tokens: cache_write,
                     });
                 }
             }
@@ -1931,15 +2031,18 @@ fn extract_usage_from_sse(raw: &str) -> Option<Usage> {
                         // keep the IR cache-free, mirroring
                         // protocols/responses.rs stream decoder.
                         let cache_read = u["input_tokens_details"]["cached_tokens"].as_u64();
+                        let cache_write = u["input_tokens_details"]["cache_write_tokens"].as_u64();
                         let raw_input = u["input_tokens"].as_u64().unwrap_or(0);
                         last_json_usage = Some(Usage {
-                            prompt_tokens: raw_input.saturating_sub(cache_read.unwrap_or(0)),
+                            prompt_tokens: raw_input
+                                .saturating_sub(cache_read.unwrap_or(0))
+                                .saturating_sub(cache_write.unwrap_or(0)),
                             completion_tokens: u["output_tokens"].as_u64().unwrap_or(0),
                             total_tokens: u["total_tokens"].as_u64().unwrap_or(0),
                             reasoning_tokens: u["output_tokens_details"]["reasoning_tokens"]
                                 .as_u64(),
                             cache_read_tokens: cache_read,
-                            cache_write_tokens: None,
+                            cache_write_tokens: cache_write,
                         });
                     }
                 }
@@ -2092,14 +2195,20 @@ fn normalise_responses_status(raw: &str, saw_tool_call: bool) -> String {
     }
 }
 
+fn responses_item_is_tool_call(item: &serde_json::Value) -> bool {
+    matches!(
+        item.get("type").and_then(|t| t.as_str()),
+        Some("function_call")
+            | Some("program")
+            | Some("local_shell_call")
+            | Some("custom_tool_call")
+    )
+}
+
 fn responses_body_has_tool_call(body: &serde_json::Value) -> bool {
     body.get("output")
         .and_then(|o| o.as_array())
-        .is_some_and(|items| {
-            items
-                .iter()
-                .any(|item| item.get("type").and_then(|t| t.as_str()) == Some("function_call"))
-        })
+        .is_some_and(|items| items.iter().any(responses_item_is_tool_call))
 }
 
 /// Extract a canonical `finish_reason` from a non-streaming upstream
@@ -2195,9 +2304,10 @@ fn extract_finish_reason_from_sse(raw: &str) -> Option<String> {
         // Type-discriminated frames: Anthropic + Responses
         match ev.get("type").and_then(|t| t.as_str()) {
             Some("response.output_item.added") => {
-                let item = &ev["item"];
-                if item["type"].as_str() == Some("function_call") {
-                    saw_tool_call = true;
+                if let Some(item) = ev.get("item") {
+                    if responses_item_is_tool_call(item) {
+                        saw_tool_call = true;
+                    }
                 }
             }
             Some("response.function_call_arguments.delta") => {
@@ -2207,16 +2317,24 @@ fn extract_finish_reason_from_sse(raw: &str) -> Option<String> {
                 saw_tool_call = true;
             }
             Some("response.output_item.done") => {
-                if ev
-                    .get("item")
-                    .and_then(|item| item.get("type"))
-                    .and_then(|t| t.as_str())
-                    == Some("function_call")
-                {
-                    saw_tool_call = true;
+                if let Some(item) = ev.get("item") {
+                    if responses_item_is_tool_call(item) {
+                        saw_tool_call = true;
+                    }
                 }
             }
             Some("response.completed") | Some("response.incomplete") => {
+                // Terminal frames may be the only place that carries completed
+                // output items (e.g. non-streamed program/custom_tool_call).
+                if let Some(output) = ev
+                    .get("response")
+                    .and_then(|r| r.get("output"))
+                    .and_then(|o| o.as_array())
+                {
+                    if output.iter().any(responses_item_is_tool_call) {
+                        saw_tool_call = true;
+                    }
+                }
                 if let Some(status) = ev
                     .get("response")
                     .and_then(|r| r.get("status"))
@@ -2693,7 +2811,8 @@ pub struct RequestLogEntry {
     /// `request_payloads.truncation_reason`. `Some("idle" | "total" |
     /// "upstream_error" | "client_disconnect")` when a streaming
     /// response ended before a clean natural completion; `None` for a
-    /// clean end / non-stream. Note `status` stays "ok" in this case.
+    /// clean end / non-stream. Client disconnects are recorded as an
+    /// `abnormal` HTTP 499 outcome; upstream/gateway truncations are failed.
     pub truncation_reason: Option<String>,
     /// Upstream model finish / stop reason extracted from the response
     /// body during capture. Normalised to snake_case (e.g. `stop`,
@@ -4370,6 +4489,93 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"
     }
 
     #[test]
+    fn extract_finish_reason_json_responses_program_prefers_tool_calls() {
+        let body = serde_json::json!({
+            "id": "r1",
+            "status": "completed",
+            "output": [{
+                "type": "program",
+                "id": "prog_1",
+                "call_id": "call_prog_1",
+                "code": "return 1",
+                "fingerprint": "fp"
+            }]
+        });
+        assert_eq!(
+            extract_finish_reason_from_json(&body),
+            Some("tool_calls".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_finish_reason_json_responses_custom_tool_prefers_tool_calls() {
+        let body = serde_json::json!({
+            "id": "r1",
+            "status": "completed",
+            "output": [{
+                "type": "custom_tool_call",
+                "id": "call_c1",
+                "name": "my_tool",
+                "input": "hello"
+            }]
+        });
+        assert_eq!(
+            extract_finish_reason_from_json(&body),
+            Some("tool_calls".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_finish_reason_sse_responses_program_prefers_tool_calls() {
+        let raw = "\
+data: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\"}}\n\
+data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"program\",\"id\":\"prog_1\",\"call_id\":\"call_prog_1\",\"code\":\"return 1\",\"fingerprint\":\"fp\"}}\n\
+data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\"}}\n";
+        assert_eq!(
+            extract_finish_reason_from_sse(raw),
+            Some("tool_calls".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_sse_merges_openai_responses_program_as_tool_call() {
+        let raw = "\
+data: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"model\":\"gpt-5.6\",\"status\":\"in_progress\"}}\n\
+data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"program\",\"id\":\"prog_1\",\"call_id\":\"call_prog_1\",\"code\":\"return 1\",\"fingerprint\":\"fp\"}}\n\
+data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\",\"output\":[{\"type\":\"program\",\"id\":\"prog_1\",\"call_id\":\"call_prog_1\",\"code\":\"return 1\",\"fingerprint\":\"fp\"}]}}\n\
+data: [DONE]\n";
+        let parsed = parse_sse_to_json(raw).expect("should parse");
+        let v: serde_json::Value = serde_json::from_str(&parsed).unwrap();
+        assert_eq!(v["protocol"], "openai_responses");
+        assert_eq!(v["finish_reason"], "tool_calls");
+        assert_eq!(v["tool_call_count"], 1);
+        assert_eq!(v["tool_calls"][0]["name"], "program");
+        assert_eq!(v["tool_calls"][0]["id"], "call_prog_1");
+    }
+
+    #[test]
+    fn extract_usage_openai_cache_write_tokens() {
+        let chat = serde_json::json!({
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 10,
+                "total_tokens": 110,
+                "prompt_tokens_details": {"cached_tokens": 20, "cache_write_tokens": 30}
+            }
+        });
+        let usage = extract_usage_from_json(&chat).unwrap();
+        assert_eq!(usage.prompt_tokens, 50);
+        assert_eq!(usage.cache_read_tokens, Some(20));
+        assert_eq!(usage.cache_write_tokens, Some(30));
+
+        let responses = "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":100,\"output_tokens\":10,\"total_tokens\":110,\"input_tokens_details\":{\"cached_tokens\":20,\"cache_write_tokens\":30}}}}\n";
+        let usage = extract_usage_from_sse(responses).unwrap();
+        assert_eq!(usage.prompt_tokens, 50);
+        assert_eq!(usage.cache_read_tokens, Some(20));
+        assert_eq!(usage.cache_write_tokens, Some(30));
+    }
+
+    #[test]
     fn extract_usage_json_openai_chat() {
         let body = serde_json::json!({
             "usage": {
@@ -4763,7 +4969,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"
         sink.write_capture(&capture).await.expect("write capture");
 
         let row = sqlx::query(
-            "SELECT status, error_class, error_source, truncation_reason \
+            "SELECT status, error_class, http_status, error_source, truncation_reason \
              FROM request_logs WHERE request_id = $1",
         )
         .bind("req-1")
@@ -4836,7 +5042,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"
     }
 
     #[tokio::test]
-    async fn write_capture_client_disconnect_does_not_mark_failed() {
+    async fn write_capture_client_disconnect_marks_request_abnormal() {
         let pool = db::open_pool("sqlite::memory:").await.expect("pool");
         db::run_migrations(&pool).await.expect("migrate");
         let sink = OltpSink::new(Arc::new(pool.clone()));
@@ -4865,18 +5071,77 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"
         sink.write_capture(&capture).await.expect("write capture");
 
         let row = sqlx::query(
-            "SELECT status, error_class, error_source, truncation_reason \
+            "SELECT status, error_class, http_status, error_source, truncation_reason \
              FROM request_logs WHERE request_id = $1",
         )
         .bind("req-1")
         .fetch_one(pool.any())
         .await
         .expect("query");
-        // Status stays success — client_disconnect is not a gateway
-        // failure.
-        assert_eq!(row.get::<String, _>("status"), "success");
-        assert!(row.get::<Option<String>, _>("error_class").is_none());
-        assert!(row.get::<Option<String>, _>("error_source").is_none());
+        // A client disconnect is not an upstream failure, but it is not a
+        // completed success either. Dashboard state must expose it as an
+        // abnormal 499 outcome.
+        assert_eq!(row.get::<String, _>("status"), "abnormal");
+        assert_eq!(
+            row.get::<Option<String>, _>("error_class"),
+            Some("client_disconnect".to_string())
+        );
+        assert_eq!(row.get::<Option<i64>, _>("http_status"), Some(499));
+        assert_eq!(
+            row.get::<Option<String>, _>("error_source"),
+            Some("client disconnected before stream completed".to_string())
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("truncation_reason"),
+            Some("client_disconnect".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn client_disconnect_capture_is_not_overridden_by_later_success_event() {
+        let pool = db::open_pool("sqlite::memory:").await.expect("pool");
+        db::run_migrations(&pool).await.expect("migrate");
+        let sink = OltpSink::new(Arc::new(pool.clone()));
+
+        let capture = ExchangeCapture {
+            request_id: "req-client-disconnect-race".to_string(),
+            egress_method: "GET".to_string(),
+            egress_path: "/backend-api/codex/responses".to_string(),
+            egress_headers: vec![],
+            egress_body: None,
+            upstream_status: Some(101),
+            upstream_resp_headers: vec![],
+            upstream_resp_body: None,
+            client_resp_headers: vec![],
+            client_resp_body: None,
+            is_stream: true,
+            truncation_reason: Some("client_disconnect".to_string()),
+            stream_duration_ms: Some(12),
+            upstream_error: None,
+            upstream_error_class: None,
+        };
+        sink.write_capture(&capture).await.expect("write capture");
+
+        let mut event = dummy_request_event();
+        event.request_id = "req-client-disconnect-race".to_string();
+        sink.write_request_event(&event)
+            .await
+            .expect("write later success event");
+
+        let row = sqlx::query(
+            "SELECT status, error_class, http_status, truncation_reason \
+             FROM request_logs WHERE request_id = $1",
+        )
+        .bind("req-client-disconnect-race")
+        .fetch_one(pool.any())
+        .await
+        .expect("query");
+        assert_eq!(row.get::<String, _>("status"), "abnormal");
+        assert_eq!(
+            row.get::<Option<String>, _>("error_class"),
+            Some("client_disconnect".to_string())
+        );
+        assert_eq!(row.get::<Option<i64>, _>("http_status"), Some(499));
         assert_eq!(
             row.get::<Option<String>, _>("truncation_reason"),
             Some("client_disconnect".to_string())

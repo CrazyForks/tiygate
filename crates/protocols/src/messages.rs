@@ -8,8 +8,8 @@ use serde_json::{json, Value};
 
 use tiygate_core::{
     Content, EndpointCapabilities, EndpointCodec, ErrorClass, FinishReason, IrRequest, IrResponse,
-    Message, ProtocolEndpoint, ProtocolSuite, RawEnvelope, Role, StreamDecoder, StreamEncoder,
-    StreamPart, Tool, Usage,
+    Message, ProtocolEndpoint, ProtocolSuite, RawEnvelope, ResponseFormat, Role, StreamDecoder,
+    StreamEncoder, StreamPart, Tool, Usage,
 };
 
 /// Map an `ErrorClass` to the Anthropic-native `error.type` string.
@@ -59,6 +59,48 @@ fn flatten_anthropic_content(value: &Value) -> String {
     String::new()
 }
 
+/// Decode Anthropic Structured Outputs into the canonical response format.
+///
+/// Anthropic exposes this as `output_config.format`, whose currently supported
+/// native format is `json_schema`. There is no native schema name, so use a
+/// stable IR name when the request subsequently crosses to an OpenAI protocol.
+fn decode_output_format(output_config: &Value) -> Option<ResponseFormat> {
+    let format = output_config.get("format")?;
+    if format.get("type").and_then(Value::as_str) != Some("json_schema") {
+        return None;
+    }
+
+    let schema = format.get("schema")?.clone();
+    if !schema.is_object() {
+        return None;
+    }
+
+    Some(ResponseFormat::JsonSchema {
+        name: "response".to_string(),
+        schema,
+        // Anthropic JSON outputs constrain the response to the supplied schema.
+        strict: Some(true),
+    })
+}
+
+/// Encode the canonical response format as Anthropic's `output_config.format`.
+fn encode_output_format(format: &ResponseFormat) -> Option<Value> {
+    match format {
+        ResponseFormat::JsonSchema { schema, .. } => Some(json!({
+            "type": "json_schema",
+            "schema": schema,
+        })),
+        // Anthropic does not have OpenAI's `json_object` shorthand. A JSON
+        // Schema whose root is an object preserves its semantics while using
+        // the native Structured Outputs mechanism.
+        ResponseFormat::JsonObject => Some(json!({
+            "type": "json_schema",
+            "schema": {"type": "object"},
+        })),
+        ResponseFormat::Text => None,
+    }
+}
+
 pub struct MessagesCodec {
     id: ProtocolEndpoint,
     capabilities: EndpointCapabilities,
@@ -83,7 +125,7 @@ impl MessagesCodec {
                 override_model_in_body: false,
                 ingress_routes: &[("POST", "/v1/messages")],
                 multimodal: true,
-                structured_output: false,
+                structured_output: true,
                 function_calling: true,
                 // §1 of docs/protocol-capability-matrix.md: parallel tool
                 // calls are lossy when crossing chat→messages (Anthropic
@@ -92,6 +134,8 @@ impl MessagesCodec {
                 // concurrently" are not preserved). Mark as unsupported so
                 // `check_lossy_conversion` rejects the crossing.
                 parallel_tool_calls: false,
+                hosted_tools: false,
+                programmatic_tool_calling: false,
                 extended_reasoning: true,
                 deterministic_seed: false,
                 // Anthropic supports tool_choice={type:"any"} (equivalent to
@@ -162,6 +206,7 @@ impl EndpointCodec for MessagesCodec {
                                 parts.push(Content::Text {
                                     text: block["text"].as_str().unwrap_or("").to_string(),
                                     annotations: None,
+                                    prompt_cache_breakpoint: None,
                                 });
                             }
                             Some("thinking") => {
@@ -199,6 +244,8 @@ impl EndpointCodec for MessagesCodec {
                                         block["input"].clone()
                                     },
                                     call_id: None,
+                                    caller: None,
+                                    wire_type: None,
                                 });
                             }
                             Some("tool_result") => {
@@ -210,6 +257,8 @@ impl EndpointCodec for MessagesCodec {
                                     name: String::new(),
                                     content: flatten_anthropic_content(&block["content"]),
                                     id: None,
+                                    caller: None,
+                                    wire_type: None,
                                 });
                             }
                             Some("image") => {
@@ -224,6 +273,7 @@ impl EndpointCodec for MessagesCodec {
                                             .unwrap_or("image/*")
                                             .to_string(),
                                         metadata: Default::default(),
+                                        prompt_cache_breakpoint: None,
                                     });
                                 } else {
                                     parts.push(Content::Media {
@@ -235,6 +285,7 @@ impl EndpointCodec for MessagesCodec {
                                             .unwrap_or("image/*")
                                             .to_string(),
                                         metadata: Default::default(),
+                                        prompt_cache_breakpoint: None,
                                     });
                                 }
                             }
@@ -246,6 +297,7 @@ impl EndpointCodec for MessagesCodec {
                     vec![Content::Text {
                         text: text.to_string(),
                         annotations: None,
+                        prompt_cache_breakpoint: None,
                     }]
                 } else {
                     vec![]
@@ -265,6 +317,7 @@ impl EndpointCodec for MessagesCodec {
                         description: t["description"].as_str().map(|s| s.to_string()),
                         parameters: Some(t["input_schema"].clone()),
                         required: false,
+                        ..Default::default()
                     })
                     .collect()
             })
@@ -294,16 +347,17 @@ impl EndpointCodec for MessagesCodec {
                     .and_then(|oc| oc.get("effort"))
                     .or_else(|| t.get("output_config").and_then(|oc| oc.get("effort")))
                     .and_then(|v| v.as_str())
-                    .map(|s| {
+                    .and_then(|s| {
                         use tiygate_core::ThinkingEffort;
                         match s {
-                            "minimal" => ThinkingEffort::Minimal,
-                            "low" => ThinkingEffort::Low,
-                            "medium" => ThinkingEffort::Medium,
-                            "high" => ThinkingEffort::High,
-                            "xhigh" => ThinkingEffort::XHigh,
-                            "max" => ThinkingEffort::Max,
-                            _ => ThinkingEffort::High,
+                            "none" => Some(ThinkingEffort::None),
+                            "minimal" => Some(ThinkingEffort::Minimal),
+                            "low" => Some(ThinkingEffort::Low),
+                            "medium" => Some(ThinkingEffort::Medium),
+                            "high" => Some(ThinkingEffort::High),
+                            "xhigh" => Some(ThinkingEffort::XHigh),
+                            "max" => Some(ThinkingEffort::Max),
+                            _ => None,
                         }
                     });
                 let budget_tokens = t["budget_tokens"].as_u64().map(|v| v as u32);
@@ -328,6 +382,7 @@ impl EndpointCodec for MessagesCodec {
                         display,
                         include_thoughts,
                         summary: None,
+                        ..Default::default()
                     })
                 }
             }),
@@ -340,7 +395,7 @@ impl EndpointCodec for MessagesCodec {
             messages,
             tools,
             params,
-            response_format: None,
+            response_format: body.get("output_config").and_then(decode_output_format),
             stream,
             ingress_protocol: self.id.clone(),
             metadata: body.get("metadata").and_then(|m| {
@@ -423,11 +478,13 @@ impl EndpointCodec for MessagesCodec {
                     id,
                     name,
                     arguments,
+                    call_id,
                     ..
                 } => {
+                    let wire_id = call_id.as_deref().unwrap_or(id);
                     content_blocks.push(json!({
                         "type": "tool_use",
-                        "id": id,
+                        "id": wire_id,
                         "name": name,
                         "input": arguments,
                     }));
@@ -494,12 +551,26 @@ impl EndpointCodec for MessagesCodec {
         &self,
         ir: &IrRequest,
     ) -> Result<(serde_json::Value, HeaderMap), tiygate_core::Error> {
+        tiygate_core::protocol::structured_output::validate_response_format_for_target(
+            ir.response_format.as_ref(),
+            self.id(),
+        )
+        .map_err(|error| tiygate_core::Error::Codec(error.to_string()))?;
+
         let mut body = json!({
             "model": ir.model,
             "stream": ir.stream,
             // Messages 协议要求 max_tokens 必填；上游未提供时填充默认值 64k
             "max_tokens": ir.params.max_tokens.unwrap_or(65536),
         });
+
+        // Anthropic's `output_config` carries both Structured Outputs format
+        // and adaptive-thinking effort. Accumulate its fields so either
+        // feature can be used alone or both can be used together.
+        let mut output_config = serde_json::Map::new();
+        if let Some(format) = ir.response_format.as_ref().and_then(encode_output_format) {
+            output_config.insert("format".to_string(), format);
+        }
 
         // 写缓存（prompt caching）注入开关。
         //
@@ -571,10 +642,14 @@ impl EndpointCodec for MessagesCodec {
                         id,
                         name,
                         arguments,
+                        call_id,
                         ..
-                    } => Some(
-                        json!({"type": "tool_use", "id": id, "name": name, "input": arguments}),
-                    ),
+                    } => {
+                        let wire_id = call_id.as_deref().unwrap_or(id);
+                        Some(
+                        json!({"type": "tool_use", "id": wire_id, "name": name, "input": arguments}),
+                    )
+                    },
                     Content::ToolResult {
                         tool_call_id,
                         name: _,
@@ -599,6 +674,7 @@ impl EndpointCodec for MessagesCodec {
                         _ => None,
                     },
                     Content::Refusal { text, .. } => Some(json!({"type": "text", "text": text})),
+                    Content::Program { .. } | Content::ProgramOutput { .. } => None,
                 })
                 .collect()
         }
@@ -642,28 +718,30 @@ impl EndpointCodec for MessagesCodec {
 
         body["messages"] = json!(messages);
 
-        // Tools
+        // Tools — only emit function tools; hosted tools are Responses-only.
         if !ir.tools.is_empty() {
-            let tool_count = ir.tools.len();
-            let tools: Vec<Value> = ir
-                .tools
-                .iter()
-                .enumerate()
-                .map(|(idx, t)| {
-                    let mut tool = json!({
-                        "name": t.name,
-                        "description": t.description,
-                        "input_schema": t.parameters,
-                    });
-                    // 在最后一个 tool 上打断点即可缓存整段 tools 前缀
-                    // （Anthropic 缓存层级中 tools 是第一级）。
-                    if inject_cache && idx + 1 == tool_count {
-                        tool["cache_control"] = json!({ "type": "ephemeral" });
-                    }
-                    tool
-                })
-                .collect();
-            body["tools"] = json!(tools);
+            let function_tools: Vec<_> = ir.tools.iter().filter(|t| t.is_function()).collect();
+            let tool_count = function_tools.len();
+            if tool_count > 0 {
+                let tools: Vec<Value> = function_tools
+                    .into_iter()
+                    .enumerate()
+                    .map(|(idx, t)| {
+                        let mut tool = json!({
+                            "name": t.name,
+                            "description": t.description,
+                            "input_schema": t.parameters,
+                        });
+                        // 在最后一个 tool 上打断点即可缓存整段 tools 前缀
+                        // （Anthropic 缓存层级中 tools 是第一级）。
+                        if inject_cache && idx + 1 == tool_count {
+                            tool["cache_control"] = json!({ "type": "ephemeral" });
+                        }
+                        tool
+                    })
+                    .collect();
+                body["tools"] = json!(tools);
+            }
         }
 
         // Other params
@@ -699,7 +777,10 @@ impl EndpointCodec for MessagesCodec {
                 })
             });
 
-            if let Some(effort) = thinking.effort {
+            if let Some(effort) = thinking
+                .effort
+                .filter(|e| *e != tiygate_core::ThinkingEffort::None)
+            {
                 // Effort-based adaptive thinking (new Anthropic mechanism).
                 // Anthropic supports low/medium/high/xhigh/max; Minimal clamps
                 // to "low" since Anthropic has no "minimal" effort level.
@@ -718,16 +799,18 @@ impl EndpointCodec for MessagesCodec {
                     });
                 }
                 body["thinking"] = t;
-                body["output_config"] = json!({
-                    "effort": match effort {
+                output_config.insert(
+                    "effort".to_string(),
+                    json!(match effort {
+                        tiygate_core::ThinkingEffort::None => "low",
                         tiygate_core::ThinkingEffort::Minimal => "low",
                         tiygate_core::ThinkingEffort::Low => "low",
                         tiygate_core::ThinkingEffort::Medium => "medium",
                         tiygate_core::ThinkingEffort::High => "high",
                         tiygate_core::ThinkingEffort::XHigh => "xhigh",
                         tiygate_core::ThinkingEffort::Max => "max",
-                    }
-                });
+                    }),
+                );
             } else if let Some(budget) = thinking.budget_tokens {
                 // Budget-based enabled thinking (traditional mechanism).
                 // Anthropic's enabled type requires budget_tokens; when only
@@ -742,6 +825,9 @@ impl EndpointCodec for MessagesCodec {
                 }
                 body["thinking"] = t;
             }
+        }
+        if !output_config.is_empty() {
+            body["output_config"] = Value::Object(output_config);
         }
         // tool_choice: convert normalized extensions format to Anthropic native
         if let Some(tc) = ir.extensions.get("tool_choice") {
@@ -798,6 +884,7 @@ impl EndpointCodec for MessagesCodec {
                         content.push(Content::Text {
                             text: block["text"].as_str().unwrap_or("").to_string(),
                             annotations: None,
+                            prompt_cache_breakpoint: None,
                         });
                     }
                     Some("thinking") => {
@@ -828,6 +915,8 @@ impl EndpointCodec for MessagesCodec {
                             name: block["name"].as_str().unwrap_or("").to_string(),
                             arguments: block["input"].clone(),
                             call_id: None,
+                            caller: None,
+                            wire_type: None,
                         });
                     }
                     _ => {}
@@ -848,37 +937,47 @@ impl EndpointCodec for MessagesCodec {
             other => FinishReason::Other(other.to_string()),
         });
 
-        let usage = body.get("usage").map(|u| {
-            let input = u["input_tokens"].as_u64().unwrap_or(0);
-            let output = u["output_tokens"].as_u64().unwrap_or(0);
-            let cache_creation = u["cache_creation_input_tokens"].as_u64().unwrap_or(0);
-            let cache_read = u["cache_read_input_tokens"].as_u64().unwrap_or(0);
-            // Anthropic 协议无 total_tokens；按官方 spec 派生：
-            //   total = input + cache_creation + cache_read + output
-            // 优先用上游响应里若带的 total_tokens（部分 SDK/代理会注入）
-            let total = u["total_tokens"]
-                .as_u64()
-                .unwrap_or(input + cache_creation + cache_read + output);
-            let reasoning = u["output_tokens_details"]["thinking_tokens"].as_u64();
-            let has_cache_creation_field = u.get("cache_creation_input_tokens").is_some();
-            let has_cache_read_field = u.get("cache_read_input_tokens").is_some();
-            Usage {
-                prompt_tokens: input,
-                completion_tokens: output,
-                total_tokens: total,
-                reasoning_tokens: reasoning,
-                cache_read_tokens: if has_cache_read_field {
-                    Some(cache_read)
-                } else {
-                    None
-                },
-                cache_write_tokens: if has_cache_creation_field {
-                    Some(cache_creation)
-                } else {
-                    None
-                },
-            }
-        });
+        let usage = body
+            .get("usage")
+            .filter(|usage| {
+                usage.is_object()
+                    && (usage["input_tokens"].is_u64()
+                        || usage["output_tokens"].is_u64()
+                        || usage["total_tokens"].is_u64()
+                        || usage["cache_creation_input_tokens"].is_u64()
+                        || usage["cache_read_input_tokens"].is_u64())
+            })
+            .map(|u| {
+                let input = u["input_tokens"].as_u64().unwrap_or(0);
+                let output = u["output_tokens"].as_u64().unwrap_or(0);
+                let cache_creation = u["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+                let cache_read = u["cache_read_input_tokens"].as_u64().unwrap_or(0);
+                // Anthropic 协议无 total_tokens；按官方 spec 派生：
+                //   total = input + cache_creation + cache_read + output
+                // 优先用上游响应里若带的 total_tokens（部分 SDK/代理会注入）
+                let total = u["total_tokens"]
+                    .as_u64()
+                    .unwrap_or(input + cache_creation + cache_read + output);
+                let reasoning = u["output_tokens_details"]["thinking_tokens"].as_u64();
+                let has_cache_creation_field = u.get("cache_creation_input_tokens").is_some();
+                let has_cache_read_field = u.get("cache_read_input_tokens").is_some();
+                Usage {
+                    prompt_tokens: input,
+                    completion_tokens: output,
+                    total_tokens: total,
+                    reasoning_tokens: reasoning,
+                    cache_read_tokens: if has_cache_read_field {
+                        Some(cache_read)
+                    } else {
+                        None
+                    },
+                    cache_write_tokens: if has_cache_creation_field {
+                        Some(cache_creation)
+                    } else {
+                        None
+                    },
+                }
+            });
 
         let stop_details = body["stop_reason"].as_str().map(|s| {
             // Anthropic may emit a structured `stop_details` object (e.g. for
@@ -1080,6 +1179,7 @@ impl StreamEncoder for MessagesStreamEncoder {
                 id,
                 name,
                 arguments,
+                ..
             } => {
                 // The opener carries `name`: always close any prior block and
                 // open a FRESH tool_use block. Two consecutive openers (e.g.
@@ -1119,6 +1219,10 @@ impl StreamEncoder for MessagesStreamEncoder {
                         serde_json::to_string(&data).unwrap_or_default()
                     )
                 }
+            }
+            // PTC is Responses-only; no Anthropic wire carrier.
+            StreamPart::ProgramDelta { .. } | StreamPart::ProgramOutputDelta { .. } => {
+                String::new()
             }
             StreamPart::Usage { usage } => {
                 self.last_usage = Some(usage.clone());
@@ -1356,6 +1460,9 @@ impl StreamDecoder for MessagesStreamDecoder {
                             id,
                             name,
                             arguments: String::new(),
+                            wire_type: None,
+                            item_id: None,
+                            caller: None,
                         });
                     }
                     Some("text") => {
@@ -1421,6 +1528,9 @@ impl StreamDecoder for MessagesStreamDecoder {
                                 id: self.tool_use_id(index),
                                 name: None,
                                 arguments: json.to_string(),
+                                wire_type: None,
+                                item_id: None,
+                                caller: None,
                             });
                         }
                     }
@@ -1600,6 +1710,20 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_response_usage_null_is_none() {
+        let codec = MessagesCodec::new();
+        let decoded = codec
+            .decode_response(json!({
+                "id": "msg_1",
+                "content": [],
+                "stop_reason": "end_turn",
+                "usage": null
+            }))
+            .unwrap();
+        assert!(decoded.usage.is_none());
+    }
+
+    #[test]
     fn test_decode_basic_request() {
         let codec = MessagesCodec::new();
         let env = make_raw_envelope();
@@ -1607,6 +1731,78 @@ mod tests {
         assert_eq!(ir.model, "claude-sonnet-4-20250514");
         assert_eq!(ir.messages.len(), 1);
         assert_eq!(ir.params.max_tokens, Some(100));
+    }
+
+    #[test]
+    fn test_structured_output_round_trip_preserves_format_and_effort() {
+        let codec = MessagesCodec::new();
+        let env = make_raw_envelope();
+        let schema = json!({
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+            "additionalProperties": false,
+        });
+        let request = json!({
+            "model": "claude-sonnet-4",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "Hi"}],
+            "thinking": {"type": "adaptive"},
+            "output_config": {
+                "effort": "high",
+                "format": {"type": "json_schema", "schema": schema},
+            },
+        });
+
+        let ir = codec.decode_request(request, &env).unwrap();
+        assert!(matches!(
+            ir.response_format,
+            Some(ResponseFormat::JsonSchema { .. })
+        ));
+        assert_eq!(
+            ir.params
+                .thinking
+                .as_ref()
+                .and_then(|thinking| thinking.effort),
+            Some(tiygate_core::ThinkingEffort::High)
+        );
+
+        let (encoded, _) = codec.encode_request(&ir).unwrap();
+        assert_eq!(encoded["output_config"]["format"]["type"], "json_schema");
+        assert_eq!(encoded["output_config"]["format"]["schema"], schema);
+        assert_eq!(encoded["output_config"]["effort"], "high");
+    }
+
+    #[test]
+    fn test_json_object_encodes_as_anthropic_object_schema() {
+        let codec = MessagesCodec::new();
+        let env = make_raw_envelope();
+        let mut ir = codec.decode_request(make_basic_request(), &env).unwrap();
+        ir.response_format = Some(ResponseFormat::JsonObject);
+
+        let (encoded, _) = codec.encode_request(&ir).unwrap();
+        assert_eq!(
+            encoded["output_config"]["format"],
+            json!({"type": "json_schema", "schema": {"type": "object"}})
+        );
+    }
+
+    #[test]
+    fn test_encode_request_rejects_anthropic_unsupported_schema_constraint() {
+        let codec = MessagesCodec::new();
+        let env = make_raw_envelope();
+        let mut ir = codec.decode_request(make_basic_request(), &env).unwrap();
+        ir.response_format = Some(ResponseFormat::JsonSchema {
+            name: "out".to_string(),
+            schema: json!({
+                "type": "object",
+                "properties": {"score": {"type": "number", "minimum": 0}},
+            }),
+            strict: Some(true),
+        });
+
+        let error = codec.encode_request(&ir).unwrap_err();
+        assert!(error.to_string().contains("/properties/score/minimum"));
     }
 
     #[test]
@@ -1654,6 +1850,7 @@ mod tests {
                     content: vec![Content::Text {
                         text: "Hello".to_string(),
                         annotations: None,
+                        prompt_cache_breakpoint: None,
                     }],
                 },
                 Message {
@@ -1661,6 +1858,7 @@ mod tests {
                     content: vec![Content::Text {
                         text: "Hi!".to_string(),
                         annotations: None,
+                        prompt_cache_breakpoint: None,
                     }],
                 },
                 Message {
@@ -1668,6 +1866,7 @@ mod tests {
                     content: vec![Content::Text {
                         text: "How are you?".to_string(),
                         annotations: None,
+                        prompt_cache_breakpoint: None,
                     }],
                 },
             ],
@@ -1677,12 +1876,14 @@ mod tests {
                     description: Some("first".to_string()),
                     parameters: Some(json!({"type": "object"})),
                     required: false,
+                    ..Default::default()
                 },
                 tiygate_core::Tool {
                     name: "t2".to_string(),
                     description: Some("second".to_string()),
                     parameters: Some(json!({"type": "object"})),
                     required: false,
+                    ..Default::default()
                 },
             ],
             params: GenerationParams {
@@ -1749,6 +1950,7 @@ mod tests {
                 content: vec![Content::Text {
                     text: "Hello".to_string(),
                     annotations: None,
+                    prompt_cache_breakpoint: None,
                 }],
             }],
             tools: vec![],
@@ -1789,6 +1991,7 @@ mod tests {
             content: vec![Content::Text {
                 text: "Hello!".to_string(),
                 annotations: None,
+                prompt_cache_breakpoint: None,
             }],
             usage: Some(Usage {
                 prompt_tokens: 10,
@@ -1823,6 +2026,8 @@ mod tests {
                 name: "get_weather".to_string(),
                 arguments: json!({"city": "London"}),
                 call_id: None,
+                caller: None,
+                wire_type: None,
             }],
             usage: None,
             finish_reason: Some(FinishReason::ToolCalls),
@@ -1870,6 +2075,21 @@ mod tests {
                 id: "tc1".to_string(),
                 name: Some("fn".to_string()),
                 arguments: "{}".to_string(),
+                wire_type: None,
+                item_id: None,
+                caller: None,
+            },
+            StreamPart::ProgramDelta {
+                id: "prog_1".to_string(),
+                call_id: "call_prog_1".to_string(),
+                code: "x".to_string(),
+                fingerprint: "fp".to_string(),
+            },
+            StreamPart::ProgramOutputDelta {
+                id: "progo_1".to_string(),
+                call_id: "call_prog_1".to_string(),
+                result: "ok".to_string(),
+                status: "completed".to_string(),
             },
             StreamPart::Usage {
                 usage: Usage::default(),
@@ -1988,6 +2208,7 @@ mod tests {
                     content: vec![Content::Text {
                         text: "hi".to_string(),
                         annotations: None,
+                        prompt_cache_breakpoint: None,
                     }],
                 },
                 Message {
@@ -1997,6 +2218,8 @@ mod tests {
                         name: "f".to_string(),
                         arguments: json!({}),
                         call_id: None,
+                        caller: None,
+                        wire_type: None,
                     }],
                 },
                 Message {
@@ -2006,6 +2229,8 @@ mod tests {
                         name: "f".to_string(),
                         content: "r1".to_string(),
                         id: None,
+                        caller: None,
+                        wire_type: None,
                     }],
                 },
                 Message {
@@ -2015,6 +2240,8 @@ mod tests {
                         name: "f".to_string(),
                         content: "r2".to_string(),
                         id: None,
+                        caller: None,
+                        wire_type: None,
                     }],
                 },
             ],
@@ -2065,6 +2292,7 @@ mod tests {
                 id,
                 name: None,
                 arguments,
+                ..
             } => Some((id.clone(), arguments.clone())),
             _ => None,
         });
@@ -2073,6 +2301,7 @@ mod tests {
                 id,
                 name: None,
                 arguments,
+                ..
             } => Some((id.clone(), arguments.clone())),
             _ => None,
         });
@@ -2091,11 +2320,17 @@ mod tests {
                 id: "a".to_string(),
                 name: Some("fa".to_string()),
                 arguments: String::new(),
+                wire_type: None,
+                item_id: None,
+                caller: None,
             },
             StreamPart::ToolCallDelta {
                 id: "b".to_string(),
                 name: Some("fb".to_string()),
                 arguments: String::new(),
+                wire_type: None,
+                item_id: None,
+                caller: None,
             },
         ] {
             all.push_str(&String::from_utf8(enc.encode_part(&part).unwrap()).unwrap());
@@ -2114,6 +2349,9 @@ mod tests {
             id: "gemini_call_shell".to_string(),
             name: Some("shell".to_string()),
             arguments: r#"{"command":"git status"}"#.to_string(),
+            wire_type: None,
+            item_id: None,
+            caller: None,
         };
         let out = String::from_utf8(enc.encode_part(&part).unwrap()).unwrap();
         assert!(out.contains("content_block_start"));
@@ -2142,11 +2380,17 @@ mod tests {
                 id: "a".to_string(),
                 name: Some("fa".to_string()),
                 arguments: r#"{"x":1}"#.to_string(),
+                wire_type: None,
+                item_id: None,
+                caller: None,
             },
             StreamPart::ToolCallDelta {
                 id: "b".to_string(),
                 name: Some("fb".to_string()),
                 arguments: r#"{"y":2}"#.to_string(),
+                wire_type: None,
+                item_id: None,
+                caller: None,
             },
         ] {
             all.push_str(&String::from_utf8(enc.encode_part(&part).unwrap()).unwrap());
@@ -2260,6 +2504,7 @@ mod tests {
                     content: vec![Content::Text {
                         text: "hi".to_string(),
                         annotations: None,
+                        prompt_cache_breakpoint: None,
                     }],
                 },
                 // reasoning 无 signature(来自 OpenAI 历史)→ 应被丢弃
@@ -2275,6 +2520,7 @@ mod tests {
                         Content::Text {
                             text: "answer A".to_string(),
                             annotations: None,
+                            prompt_cache_breakpoint: None,
                         },
                     ],
                 },
@@ -2291,6 +2537,7 @@ mod tests {
                         Content::Text {
                             text: "answer B".to_string(),
                             annotations: None,
+                            prompt_cache_breakpoint: None,
                         },
                     ],
                 },

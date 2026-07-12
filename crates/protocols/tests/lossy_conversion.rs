@@ -9,7 +9,9 @@
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use std::collections::HashMap;
-use tiygate_core::ir::{Content, MediaSource, ResponseFormat};
+use tiygate_core::ir::{
+    Content, MediaSource, PromptCacheBreakpoint, PromptCacheBreakpointMode, ResponseFormat,
+};
 use tiygate_core::protocol::lossy::{check_lossy_conversion, LossyDimension};
 use tiygate_core::{
     EndpointCapabilities, EndpointCodec, IrRequest, Message, ProtocolEndpoint, ProtocolSuite, Role,
@@ -29,6 +31,7 @@ fn req_with_tools() -> IrRequest {
             content: vec![Content::Text {
                 text: "hi".to_string(),
                 annotations: None,
+                prompt_cache_breakpoint: None,
             }],
         }],
         tools: vec![Tool {
@@ -36,6 +39,7 @@ fn req_with_tools() -> IrRequest {
             description: Some("Get weather".to_string()),
             parameters: Some(serde_json::json!({})),
             required: false,
+            ..Default::default()
         }],
         params: Default::default(),
         response_format: None,
@@ -54,6 +58,14 @@ fn text_only_req() -> IrRequest {
     let mut r = req_with_tools();
     r.tools.clear();
     r
+}
+
+fn with_responses_reasoning_controls(req: &mut IrRequest) {
+    req.params.thinking = Some(tiygate_core::ThinkingConfig {
+        mode: Some("pro".to_string()),
+        context: Some(serde_json::json!({"preserve": true})),
+        ..Default::default()
+    });
 }
 
 fn with_required_tool(req: &mut IrRequest) {
@@ -87,6 +99,7 @@ fn with_media_url(req: &mut IrRequest) {
         },
         mime_type: "image/png".to_string(),
         metadata: HashMap::new(),
+        prompt_cache_breakpoint: None,
     });
 }
 
@@ -97,6 +110,7 @@ fn with_file_id_media(req: &mut IrRequest) {
         },
         mime_type: "image/png".to_string(),
         metadata: HashMap::new(),
+        prompt_cache_breakpoint: None,
     });
 }
 
@@ -107,6 +121,7 @@ fn with_inline_media(req: &mut IrRequest) {
         },
         mime_type: "image/png".to_string(),
         metadata: HashMap::new(),
+        prompt_cache_breakpoint: None,
     });
 }
 
@@ -118,6 +133,7 @@ fn with_data_url_media(req: &mut IrRequest) {
         source,
         mime_type,
         metadata: HashMap::new(),
+        prompt_cache_breakpoint: None,
     });
 }
 
@@ -293,7 +309,7 @@ fn data_url_parsed_as_inline_passes_anthropic_lossy() {
 // --- Dimension 6: structured output ---
 
 #[test]
-fn json_schema_to_anthropic_rejected() {
+fn json_schema_to_anthropic_passes() {
     let mut req = text_only_req();
     with_response_format(
         &mut req,
@@ -303,15 +319,33 @@ fn json_schema_to_anthropic_rejected() {
             strict: Some(true),
         },
     );
-    let err = check_lossy_conversion(&req, &anthropic_endpoint(), &messages_caps());
-    assert_eq!(extract_dim(&err), Some(LossyDimension::StructuredOutput));
+    assert!(check_lossy_conversion(&req, &anthropic_endpoint(), &messages_caps()).is_ok());
 }
 
 #[test]
-fn json_object_to_responses_passes() {
+fn unsupported_json_schema_constraint_to_anthropic_is_rejected() {
+    let mut req = text_only_req();
+    with_response_format(
+        &mut req,
+        ResponseFormat::JsonSchema {
+            name: "out".to_string(),
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {"score": {"type": "number", "minimum": 0}},
+            }),
+            strict: Some(true),
+        },
+    );
+    let (_, error) =
+        check_lossy_conversion(&req, &anthropic_endpoint(), &messages_caps()).unwrap_err();
+    assert!(error.to_string().contains("/properties/score/minimum"));
+}
+
+#[test]
+fn json_object_to_anthropic_passes() {
     let mut req = text_only_req();
     with_response_format(&mut req, ResponseFormat::JsonObject);
-    assert!(check_lossy_conversion(&req, &responses_endpoint(), &responses_caps()).is_ok());
+    assert!(check_lossy_conversion(&req, &anthropic_endpoint(), &messages_caps()).is_ok());
 }
 
 #[test]
@@ -358,7 +392,7 @@ fn text_only_round_trip_never_rejected() {
 }
 
 #[test]
-fn error_message_names_dimension() {
+fn structured_output_is_not_reported_as_lossy_for_anthropic() {
     let mut req = text_only_req();
     with_response_format(
         &mut req,
@@ -368,13 +402,69 @@ fn error_message_names_dimension() {
             strict: None,
         },
     );
-    let (_, err) = check_lossy_conversion(&req, &anthropic_endpoint(), &messages_caps())
-        .expect_err("expected lossy rejection");
-    let msg = err.to_string();
+    assert!(check_lossy_conversion(&req, &anthropic_endpoint(), &messages_caps()).is_ok());
+}
+
+#[test]
+fn hosted_and_programmatic_tools_are_rejected_outside_responses() {
+    let mut hosted = text_only_req();
+    hosted.tools.push(Tool {
+        tool_type: Some("web_search".to_string()),
+        ..Default::default()
+    });
+    let (dimension, _) =
+        check_lossy_conversion(&hosted, &chat_endpoint(), &chat_caps()).unwrap_err();
+    assert_eq!(dimension, LossyDimension::HostedTools);
+    assert!(check_lossy_conversion(&hosted, &responses_endpoint(), &responses_caps()).is_ok());
+
+    let mut allowed_callers = text_only_req();
+    allowed_callers.tools.push(Tool {
+        name: "lookup".to_string(),
+        tool_type: Some("function".to_string()),
+        config: Some(serde_json::json!({"allowed_callers": ["programmatic"]})),
+        ..Default::default()
+    });
+    let (dimension, _) =
+        check_lossy_conversion(&allowed_callers, &chat_endpoint(), &chat_caps()).unwrap_err();
+    assert_eq!(dimension, LossyDimension::ProgrammaticToolCalling);
     assert!(
-        msg.contains("response_format"),
-        "error should name the dimension; got: {msg}"
+        check_lossy_conversion(&allowed_callers, &responses_endpoint(), &responses_caps()).is_ok()
     );
+
+    let mut programmatic = text_only_req();
+    programmatic.messages[0].content.push(Content::Program {
+        id: "prog_1".to_string(),
+        call_id: "call_prog_1".to_string(),
+        code: "return 1".to_string(),
+        fingerprint: "fp_1".to_string(),
+    });
+    let (dimension, _) =
+        check_lossy_conversion(&programmatic, &anthropic_endpoint(), &messages_caps()).unwrap_err();
+    assert_eq!(dimension, LossyDimension::ProgrammaticToolCalling);
+    assert!(
+        check_lossy_conversion(&programmatic, &responses_endpoint(), &responses_caps()).is_ok()
+    );
+}
+
+#[test]
+fn custom_tools_rejected_outside_openai() {
+    let mut custom = text_only_req();
+    custom.tools.push(Tool {
+        name: "code_exec".to_string(),
+        tool_type: Some("custom".to_string()),
+        config: Some(serde_json::json!({"format": {"type": "text"}})),
+        ..Default::default()
+    });
+    // Custom tools are expressible on Chat and Responses.
+    assert!(check_lossy_conversion(&custom, &chat_endpoint(), &chat_caps()).is_ok());
+    assert!(check_lossy_conversion(&custom, &responses_endpoint(), &responses_caps()).is_ok());
+    // Custom tools are NOT expressible on Anthropic Messages or Gemini —
+    // reject instead of silently dropping.
+    let (dim, _) =
+        check_lossy_conversion(&custom, &anthropic_endpoint(), &messages_caps()).unwrap_err();
+    assert_eq!(dim, LossyDimension::CustomTools);
+    let (dim, _) = check_lossy_conversion(&custom, &gemini_endpoint(), &gemini_caps()).unwrap_err();
+    assert_eq!(dim, LossyDimension::CustomTools);
 }
 
 // --- Codex extension: opaque items should not trigger lossy rejection ---
@@ -398,5 +488,124 @@ fn codex_opaque_items_do_not_trigger_lossy_rejection() {
             err.is_ok(),
             "codex_opaque_items should not trigger lossy rejection at {label}: {err:?}"
         );
+    }
+}
+
+#[test]
+fn multi_agent_rejected_outside_responses() {
+    let mut with_config = text_only_req();
+    with_config.extensions.insert(
+        "responses_extra".to_string(),
+        serde_json::json!({
+            "multi_agent": {
+                "enabled": true,
+                "max_concurrent_subagents": 4
+            }
+        }),
+    );
+
+    assert!(
+        check_lossy_conversion(&with_config, &responses_endpoint(), &responses_caps()).is_ok(),
+        "Responses should accept multi_agent config"
+    );
+
+    for (label, endpoint, caps) in [
+        ("chat", chat_endpoint(), chat_caps()),
+        ("anthropic", anthropic_endpoint(), messages_caps()),
+        ("gemini", gemini_endpoint(), gemini_caps()),
+    ] {
+        let (dim, err) = check_lossy_conversion(&with_config, &endpoint, &caps).unwrap_err();
+        assert_eq!(
+            dim,
+            LossyDimension::MultiAgent,
+            "{label} should reject multi_agent config"
+        );
+        assert!(
+            err.to_string().contains("multi_agent"),
+            "{label} rejection should mention multi_agent: {err}"
+        );
+    }
+
+    let mut with_items = text_only_req();
+    with_items.extensions.insert(
+        "multi_agent_items".to_string(),
+        serde_json::json!([{"type": "multi_agent_call", "id": "ma_1", "name": "spawn_agent"}]),
+    );
+    assert!(
+        check_lossy_conversion(&with_items, &responses_endpoint(), &responses_caps()).is_ok(),
+        "Responses should accept multi_agent_items"
+    );
+    let (dim, _) = check_lossy_conversion(&with_items, &chat_endpoint(), &chat_caps()).unwrap_err();
+    assert_eq!(dim, LossyDimension::MultiAgent);
+}
+
+// --- Prompt cache breakpoint ---
+
+#[test]
+fn prompt_cache_breakpoint_rejected_outside_openai() {
+    let mut req = text_only_req();
+    req.messages[0].content.push(Content::Text {
+        text: "cached prefix".to_string(),
+        annotations: None,
+        prompt_cache_breakpoint: Some(PromptCacheBreakpoint {
+            mode: PromptCacheBreakpointMode::Explicit,
+        }),
+    });
+
+    // Chat and Responses carry the breakpoint on the canonical content block.
+    assert!(
+        check_lossy_conversion(&req, &chat_endpoint(), &chat_caps()).is_ok(),
+        "Chat should accept prompt_cache_breakpoint"
+    );
+    assert!(
+        check_lossy_conversion(&req, &responses_endpoint(), &responses_caps()).is_ok(),
+        "Responses should accept prompt_cache_breakpoint"
+    );
+
+    // Anthropic and Gemini have no equivalent carrier — reject, not silently drop.
+    let (dim, _) =
+        check_lossy_conversion(&req, &anthropic_endpoint(), &messages_caps()).unwrap_err();
+    assert_eq!(
+        dim,
+        LossyDimension::PromptCacheBreakpoint,
+        "Anthropic should reject prompt_cache_breakpoint"
+    );
+    let (dim, _) = check_lossy_conversion(&req, &gemini_endpoint(), &gemini_caps()).unwrap_err();
+    assert_eq!(
+        dim,
+        LossyDimension::PromptCacheBreakpoint,
+        "Gemini should reject prompt_cache_breakpoint"
+    );
+}
+
+#[test]
+fn verbosity_rejected_outside_openai() {
+    let mut req = text_only_req();
+    req.params.verbosity = Some(tiygate_core::Verbosity::High);
+
+    assert!(check_lossy_conversion(&req, &chat_endpoint(), &chat_caps()).is_ok());
+    assert!(check_lossy_conversion(&req, &responses_endpoint(), &responses_caps()).is_ok());
+
+    let (dim, _) =
+        check_lossy_conversion(&req, &anthropic_endpoint(), &messages_caps()).unwrap_err();
+    assert_eq!(dim, LossyDimension::Verbosity);
+    let (dim, _) = check_lossy_conversion(&req, &gemini_endpoint(), &gemini_caps()).unwrap_err();
+    assert_eq!(dim, LossyDimension::Verbosity);
+}
+
+#[test]
+fn responses_reasoning_mode_and_context_rejected_outside_responses() {
+    let mut req = text_only_req();
+    with_responses_reasoning_controls(&mut req);
+
+    assert!(check_lossy_conversion(&req, &responses_endpoint(), &responses_caps()).is_ok());
+
+    for (endpoint, caps) in [
+        (chat_endpoint(), chat_caps()),
+        (anthropic_endpoint(), messages_caps()),
+        (gemini_endpoint(), gemini_caps()),
+    ] {
+        let (dimension, _) = check_lossy_conversion(&req, &endpoint, &caps).unwrap_err();
+        assert_eq!(dimension, LossyDimension::ExtendedReasoning);
     }
 }

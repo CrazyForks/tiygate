@@ -10,6 +10,11 @@ export interface Provider {
   auth_mode: string;
   encrypted_api_key: string;
   encrypted_oauth_meta: string;
+  oauth_status?: {
+    state: "not_connected" | "connected" | "healthy" | "invalid" | "error";
+    reason?: string | null;
+    checked_at?: string | null;
+  } | null;
   metadata: Record<string, unknown>;
   enabled: boolean;
   created_at: string;
@@ -51,6 +56,28 @@ export interface ProviderModelEntry {
 
 export interface ProviderModelsResponse {
   models: ProviderModelEntry[];
+}
+
+export interface ProviderUsageWindow {
+  used_percent?: number | null;
+  reset_at?: number | null;
+}
+
+export type ProviderUsageState =
+  | "available"
+  | "not_connected"
+  | "unsupported"
+  | "unavailable";
+
+export interface ProviderUsage {
+  provider_id: string;
+  state: ProviderUsageState;
+  reason?: string | null;
+  checked_at?: string | null;
+  account_email?: string | null;
+  plan_type?: string | null;
+  five_hour?: ProviderUsageWindow | null;
+  seven_day?: ProviderUsageWindow | null;
 }
 
 export interface ProviderCatalogEntry {
@@ -333,7 +360,6 @@ export interface OAuthStartResponse {
 
 export interface OAuthTokenResponse {
   provider_id: string;
-  access_token?: string | null;
   expires_in_s?: number | null;
 }
 

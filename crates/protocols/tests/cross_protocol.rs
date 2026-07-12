@@ -36,6 +36,7 @@ fn basic_request() -> IrRequest {
             content: vec![Content::Text {
                 text: "Hello".to_string(),
                 annotations: None,
+                prompt_cache_breakpoint: None,
             }],
         }],
         tools: vec![],
@@ -49,6 +50,7 @@ fn basic_request() -> IrRequest {
             presence_penalty: None,
             seed: None,
             thinking: None,
+            verbosity: None,
         },
         response_format: None,
         stream: false,
@@ -83,6 +85,7 @@ fn response() -> IrResponse {
         content: vec![Content::Text {
             text: "Hi!".to_string(),
             annotations: None,
+            prompt_cache_breakpoint: None,
         }],
         usage: None,
         finish_reason: Some(tiygate_core::FinishReason::Stop),
@@ -269,28 +272,26 @@ fn lossy_parallel_tool_calls_chat_to_messages() {
 }
 
 #[test]
-fn lossy_no_response_format_in_anthropic() {
-    // Anthropic messages protocol does not support response_format
-    // (structured output). The gateway must reject when the request
-    // contains a non-null response_format.
+fn structured_output_supported_in_anthropic() {
+    // Anthropic Messages supports Structured Outputs through
+    // `output_config.format` with a `json_schema` format.
     let ingress = find_codec(ProtocolSuite::OpenAiCompatible, "chat-completions");
     let egress = find_codec(ProtocolSuite::AnthropicMessages, "messages");
 
     assert!(ingress.capabilities().structured_output);
-    assert!(!egress.capabilities().structured_output);
+    assert!(egress.capabilities().structured_output);
     assert!(ingress.capabilities().lossy_default_reject);
     assert!(egress.capabilities().lossy_default_reject);
 }
 
 #[test]
-fn lossy_structured_output_chat_to_anthropic() {
-    // OpenAI supports response_format. Anthropic messages does not.
-    // Gateway should reject when response_format is non-null.
+fn structured_output_chat_to_anthropic_is_supported() {
+    // Both protocols support a JSON Schema response format.
     let ingress = find_codec(ProtocolSuite::OpenAiCompatible, "chat-completions");
     let egress = find_codec(ProtocolSuite::AnthropicMessages, "messages");
 
     assert!(ingress.capabilities().structured_output);
-    assert!(!egress.capabilities().structured_output);
+    assert!(egress.capabilities().structured_output);
     assert!(ingress.capabilities().lossy_default_reject);
     assert!(egress.capabilities().lossy_default_reject);
 }
@@ -360,6 +361,7 @@ fn pass_through_bytes_preserved_in_response() {
             content: vec![Content::Text {
                 text: original_text.to_string(),
                 annotations: None,
+                prompt_cache_breakpoint: None,
             }],
         }],
         tools: vec![],
@@ -691,6 +693,8 @@ fn orphan_tool_result_to_gemini_returns_codec_error() {
             name: String::new(),
             content: "{}".to_string(),
             id: None,
+            caller: None,
+            wire_type: None,
         }],
     });
 
@@ -743,10 +747,9 @@ fn runtime_tool_choice_to_gemini_accepted() {
 }
 
 #[test]
-fn runtime_lossy_reject_response_format_to_anthropic() {
-    // `response_format: { "type": "json_schema", ... }` (OpenAI) → Anthropic.
-    // Anthropic has no equivalent of json_schema response_format — only
-    // free-form text. The runtime must surface a lossy rejection.
+fn json_schema_response_format_encodes_to_anthropic() {
+    // OpenAI's JSON Schema response format maps to Anthropic's
+    // `output_config.format` Structured Outputs field.
     let ingress = find_codec(ProtocolSuite::OpenAiCompatible, "chat-completions");
     let body = json!({
         "model": "m",
@@ -759,14 +762,12 @@ fn runtime_lossy_reject_response_format_to_anthropic() {
     let ir = ingress.decode_request(body, &make_env()).expect("decode");
     // Sanity: the IR models response_format.
     assert!(ir.response_format.is_some());
-    // The runtime contract: Anthropic cannot express json_schema, so
-    // the gateway must reject. We simulate the check inline.
     let egress = find_codec(ProtocolSuite::AnthropicMessages, "messages");
     let caps = egress.capabilities();
-    assert!(
-        caps.lossy_default_reject,
-        "Anthropic must declare lossy_default_reject"
-    );
+    assert!(tiygate_core::protocol::lossy::check_lossy_conversion(&ir, egress.id(), caps,).is_ok());
+    let (encoded, _) = egress.encode_request(&ir).expect("encode");
+    assert_eq!(encoded["output_config"]["format"]["type"], "json_schema");
+    assert_eq!(encoded["output_config"]["format"]["schema"], json!({}));
 }
 
 #[test]
@@ -990,6 +991,7 @@ fn thinking_ir_for_model(model: &str, thinking: ThinkingConfig) -> IrRequest {
             content: vec![Content::Text {
                 text: "Hello".to_string(),
                 annotations: None,
+                prompt_cache_breakpoint: None,
             }],
         }],
         tools: vec![],
@@ -1262,6 +1264,34 @@ fn cross_thinking_include_thoughts_to_display_gemini_to_anthropic() {
 }
 
 #[test]
+fn cross_thinking_none_preserves_or_safely_disables() {
+    let chat = find_codec(ProtocolSuite::OpenAiCompatible, "chat-completions");
+    let responses = find_codec(ProtocolSuite::OpenAiResponses, "responses");
+    let anthropic = find_codec(ProtocolSuite::AnthropicMessages, "messages");
+    let gemini = find_codec(ProtocolSuite::GoogleGemini, "generateContent");
+    let ir = thinking_ir_for_model(
+        "gemini-2.5-pro",
+        ThinkingConfig {
+            effort: Some(ThinkingEffort::None),
+            ..Default::default()
+        },
+    );
+
+    let (chat_body, _) = chat.encode_request(&ir).unwrap();
+    assert_eq!(chat_body["reasoning_effort"], "none");
+    let (responses_body, _) = responses.encode_request(&ir).unwrap();
+    assert_eq!(responses_body["reasoning"]["effort"], "none");
+    let (anthropic_body, _) = anthropic.encode_request(&ir).unwrap();
+    assert!(anthropic_body.get("thinking").is_none());
+    assert!(anthropic_body.get("output_config").is_none());
+    let (gemini_body, _) = gemini.encode_request(&ir).unwrap();
+    assert_eq!(
+        gemini_body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+        0
+    );
+}
+
+#[test]
 fn cross_thinking_minimal_effort_clamping() {
     // Minimal effort: Anthropic clamps to "low", Gemini supports "minimal"
     let anthropic = find_codec(ProtocolSuite::AnthropicMessages, "messages");
@@ -1298,8 +1328,8 @@ fn cross_thinking_max_effort_clamping() {
         },
     );
     let (chat_out, _) = chat.encode_request(&ir).unwrap();
-    // OpenAI has no "max", clamps to "xhigh"
-    assert_eq!(chat_out["reasoning_effort"], "xhigh");
+    // OpenAI GPT-5.6+ supports "max" natively.
+    assert_eq!(chat_out["reasoning_effort"], "max");
 
     let (gem_out, _) = gemini.encode_request(&ir).unwrap();
     // Gemini only has 4 levels, clamps to "high"
@@ -1532,6 +1562,7 @@ fn gemini_encode_response_includes_cache_write_in_prompt() {
         content: vec![Content::Text {
             text: "ok".to_string(),
             annotations: None,
+            prompt_cache_breakpoint: None,
         }],
         usage: Some(tiygate_core::Usage {
             prompt_tokens: 100,
@@ -1675,6 +1706,7 @@ fn chat_encode_image_url_emits_detail() {
                     m.insert(tiygate_core::ir::IMAGE_DETAIL_KEY.to_string(), json!("low"));
                     m
                 },
+                prompt_cache_breakpoint: None,
             }],
         }],
         tools: vec![],
@@ -1772,6 +1804,7 @@ fn responses_encode_image_url_emits_detail() {
                     );
                     m
                 },
+                prompt_cache_breakpoint: None,
             }],
         }],
         tools: vec![],

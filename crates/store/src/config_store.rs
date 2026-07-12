@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 use tiygate_core::protocol::{ProtocolEndpoint, ProtocolSuite};
 use tiygate_core::provider::find_provider;
-use tiygate_core::provider::oauth::{OAuthTargetConfig, TokenRequestStyle};
+use tiygate_core::provider::oauth::{OAuthTargetConfig, TokenRequestStyle, UpstreamTransport};
 use tiygate_core::routing::{RouteEntry, RoutingTable, RoutingTarget};
 
 use crate::db::DbPool;
@@ -29,9 +29,20 @@ use crate::keys;
 use crate::model_catalog::ModelMetadata;
 use crate::models::{
     ApiKey, ApiKeyStatus, AuthMode, ConfigEpoch, ConfigExport, ConfigSnapshot, ExportSetting,
-    ImportReport, ImportSelection, Provider, Route, RouteTarget,
+    ImportReport, ImportSelection, OAuthCredentialStatus, Provider, Route, RouteTarget,
 };
 use crate::settings_keys::is_encrypted_key;
+
+const OPENAI_PLATFORM_BASE_URL: &str = "https://api.openai.com/v1";
+const OPENAI_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+/// Stable originator paired with the Codex Desktop user agent for OpenAI OAuth
+/// egress when a provider does not define its own originator.
+const OPENAI_CODEX_DESKTOP_ORIGINATOR: &str = "Codex Desktop";
+/// Stable desktop identity used for OpenAI OAuth egress when a provider does
+/// not define its own user agent. This keeps Codex OAuth traffic compatible
+/// with desktop-oriented upstream endpoints.
+const OPENAI_CODEX_DESKTOP_USER_AGENT: &str =
+    "Codex Desktop/0.144.0-alpha.4 (Mac OS 26.5.2; arm64) unknown (Codex Desktop; 26.707.51957)";
 
 /// Convenience error for store operations.
 #[derive(Debug, Error)]
@@ -259,6 +270,19 @@ pub fn snapshot_to_routing_table(snapshot: &ConfigSnapshot) -> RoutingTable {
                 .api_base_override
                 .clone()
                 .unwrap_or_else(|| provider.api_base.clone());
+            // ChatGPT/Codex OAuth is a different product surface from the
+            // usage-based OpenAI Platform API. Transparently migrate the old
+            // broken default for existing OAuth provider rows while retaining
+            // explicit custom proxy endpoints.
+            let raw_base = if provider.vendor == "openai"
+                && matches!(provider.auth_mode, AuthMode::OAuth)
+                && (raw_base.trim().is_empty()
+                    || raw_base.trim_end_matches('/') == OPENAI_PLATFORM_BASE_URL)
+            {
+                OPENAI_CODEX_BASE_URL.to_string()
+            } else {
+                raw_base
+            };
             let (api_protocol, api_base) =
                 provider_egress_for_target(provider, &t.model_id, &raw_base);
             targets.push(RoutingTarget {
@@ -331,12 +355,28 @@ pub fn build_oauth_target_config(provider: &Provider) -> Option<OAuthTargetConfi
         .get("authorization_prefix")
         .and_then(|v| v.as_str())
         .map(str::to_string);
+    // Standard HTTP/SSE remains the default Codex transport. WebSocket is an
+    // explicit opt-in because many enterprise proxies reject upgrades.
+    let upstream_transport = provider
+        .metadata_json
+        .get("upstream_transport")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or(UpstreamTransport::Http);
 
-    // Determine token request style from vendor.
-    let token_request_style = match provider.vendor.as_str() {
-        "anthropic" => TokenRequestStyle::Json,
-        _ => TokenRequestStyle::Form,
-    };
+    // Codex refreshes with form data, matching the reference CLI client.
+    let token_request_style = oauth_meta
+        .get("token_request_style")
+        .and_then(|value| value.as_str())
+        .and_then(|style| match style {
+            "form" => Some(TokenRequestStyle::Form),
+            "json" => Some(TokenRequestStyle::Json),
+            _ => None,
+        })
+        .unwrap_or(match provider.vendor.as_str() {
+            "anthropic" => TokenRequestStyle::Json,
+            _ => TokenRequestStyle::Form,
+        });
 
     // Extract extra headers from metadata, if present.
     let mut extra_headers: Vec<(String, String)> = oauth_meta
@@ -373,6 +413,46 @@ pub fn build_oauth_target_config(provider: &Provider) -> Option<OAuthTargetConfi
                 .map(str::to_string)
         })
         .unwrap_or_default();
+    let account_id = provider
+        .oauth_meta_cleartext
+        .as_deref()
+        .and_then(|meta_str| serde_json::from_str::<serde_json::Value>(meta_str).ok())
+        .and_then(|meta| {
+            meta.get("account_id")
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        });
+
+    if provider.vendor == "openai" {
+        // ChatGPT OAuth requests are scoped to the selected workspace.
+        if let Some(account_id) = account_id.as_deref() {
+            if !extra_headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("chatgpt-account-id"))
+            {
+                extra_headers.push(("chatgpt-account-id".to_string(), account_id.to_string()));
+            }
+        }
+        if !extra_headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("originator"))
+        {
+            extra_headers.push((
+                "originator".to_string(),
+                OPENAI_CODEX_DESKTOP_ORIGINATOR.to_string(),
+            ));
+        }
+        if !extra_headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+        {
+            extra_headers.push((
+                "user-agent".to_string(),
+                OPENAI_CODEX_DESKTOP_USER_AGENT.to_string(),
+            ));
+        }
+    }
 
     if token_url.is_empty() || client_id.is_empty() {
         debug!(
@@ -383,6 +463,7 @@ pub fn build_oauth_target_config(provider: &Provider) -> Option<OAuthTargetConfi
     }
 
     Some(OAuthTargetConfig {
+        upstream_transport,
         token_url,
         client_id,
         client_secret: None,
@@ -392,6 +473,7 @@ pub fn build_oauth_target_config(provider: &Provider) -> Option<OAuthTargetConfi
         authorization_header,
         authorization_prefix,
         extra_headers,
+        account_id,
     })
 }
 
@@ -629,7 +711,11 @@ impl DbConfigStore {
     // --- Provider CRUD ---
 
     pub async fn list_providers(&self) -> Result<Vec<Provider>, StoreError> {
-        self.load_providers().await
+        let mut providers = self.load_providers().await?;
+        for provider in &mut providers {
+            populate_provider_oauth_cleartext(self.encryption.as_ref(), provider);
+        }
+        Ok(providers)
     }
 
     pub async fn get_provider(&self, id: &str) -> Result<Option<Provider>, StoreError> {
@@ -871,6 +957,97 @@ impl DbConfigStore {
         // from the data plane see the new metadata.
         self.refresh().await?;
         Ok(())
+    }
+
+    /// Replace OAuth metadata only when the encrypted value has not changed
+    /// since it was read. This protects read-modify-write metadata patches
+    /// from overwriting a concurrently rotated refresh token, including when
+    /// multiple gateway instances share the same database.
+    async fn set_provider_oauth_meta_if_unchanged(
+        &self,
+        id: &str,
+        expected_encrypted: &str,
+        meta_plain: &str,
+    ) -> Result<bool, StoreError> {
+        let encrypted = match self.encryption.as_ref() {
+            Some(enc) => keys::encrypt_oauth_meta(enc, meta_plain)
+                .map_err(|e| StoreError::Decrypt(e.to_string()))?,
+            None => meta_plain.to_string(),
+        };
+        let now = chrono::Utc::now().to_rfc3339();
+        let result = sqlx::query(
+            "UPDATE providers SET encrypted_oauth_meta = $1, updated_at = $2 \
+             WHERE id = $3 AND encrypted_oauth_meta = $4",
+        )
+        .bind(&encrypted)
+        .bind(&now)
+        .bind(id)
+        .bind(expected_encrypted)
+        .execute(self.pool.any())
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Record the last observed OAuth credential health without replacing the
+    /// stored refresh token, account identity, or future metadata fields.
+    pub async fn set_provider_oauth_status(
+        &self,
+        id: &str,
+        status: OAuthCredentialStatus,
+        reason: Option<&str>,
+    ) -> Result<(), StoreError> {
+        const MAX_CAS_ATTEMPTS: usize = 4;
+
+        for _ in 0..MAX_CAS_ATTEMPTS {
+            let provider = self
+                .get_provider(id)
+                .await?
+                .ok_or_else(|| StoreError::NotFound(format!("provider {id}")))?;
+            let raw = provider
+                .oauth_meta_cleartext
+                .as_deref()
+                .filter(|meta| !meta.trim().is_empty())
+                .ok_or_else(|| StoreError::Invalid("provider has no OAuth metadata".to_string()))?;
+            let mut meta: serde_json::Value = serde_json::from_str(raw)?;
+            let object = meta.as_object_mut().ok_or_else(|| {
+                StoreError::Invalid("provider OAuth metadata must be a JSON object".to_string())
+            })?;
+            object.insert(
+                "status".to_string(),
+                serde_json::Value::String(status.as_str().to_string()),
+            );
+            object.insert(
+                "status_checked_at".to_string(),
+                serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
+            );
+            match reason.filter(|value| !value.is_empty()) {
+                Some(reason) => {
+                    object.insert(
+                        "status_reason".to_string(),
+                        serde_json::Value::String(reason.to_string()),
+                    );
+                }
+                None => {
+                    object.remove("status_reason");
+                }
+            }
+            let serialized = serde_json::to_string(&meta)?;
+            if self
+                .set_provider_oauth_meta_if_unchanged(
+                    id,
+                    &provider.encrypted_oauth_meta,
+                    &serialized,
+                )
+                .await?
+            {
+                self.refresh().await?;
+                return Ok(());
+            }
+        }
+
+        Err(StoreError::Invalid(format!(
+            "provider {id} OAuth metadata changed repeatedly while updating status"
+        )))
     }
 
     async fn load_providers(&self) -> Result<Vec<Provider>, StoreError> {
@@ -2014,6 +2191,188 @@ mod tests {
             provider.oauth_meta_cleartext.as_deref(),
             Some(meta_str.as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn oauth_status_update_preserves_encrypted_credential_metadata() {
+        let key = KeyEncryption::from_secret(&master_key_hex()).expect("key");
+        let store = boot_store(Some(Arc::new(key))).await;
+        let meta = serde_json::json!({
+            "refresh_token": "rt-test",
+            "account_id": "workspace-123",
+            "future_field": { "preserved": true },
+        });
+        store
+            .upsert_provider(
+                "oauth-status",
+                "OAuth Status",
+                "openai",
+                OPENAI_CODEX_BASE_URL,
+                "",
+                None,
+                AuthMode::OAuth,
+                Some(&meta.to_string()),
+                serde_json::json!({}),
+                true,
+            )
+            .await
+            .expect("upsert oauth provider");
+
+        store
+            .set_provider_oauth_status(
+                "oauth-status",
+                OAuthCredentialStatus::Invalid,
+                Some("credential_rejected"),
+            )
+            .await
+            .expect("persist OAuth status");
+
+        let providers = store.list_providers().await.expect("list providers");
+        let provider = providers
+            .into_iter()
+            .find(|provider| provider.id == "oauth-status")
+            .expect("provider exists");
+        assert!(!provider.encrypted_oauth_meta.contains("rt-test"));
+        let stored: serde_json::Value = serde_json::from_str(
+            provider
+                .oauth_meta_cleartext
+                .as_deref()
+                .expect("decrypted metadata"),
+        )
+        .expect("valid JSON");
+        assert_eq!(stored["refresh_token"], "rt-test");
+        assert_eq!(stored["account_id"], "workspace-123");
+        assert_eq!(stored["future_field"]["preserved"], true);
+        assert_eq!(stored["status"], "invalid");
+        assert_eq!(stored["status_reason"], "credential_rejected");
+        assert!(stored["status_checked_at"].is_string());
+    }
+
+    #[tokio::test]
+    async fn oauth_status_cas_does_not_overwrite_rotated_refresh_token() {
+        let key = KeyEncryption::from_secret(&master_key_hex()).expect("key");
+        let store = boot_store(Some(Arc::new(key))).await;
+        let initial_meta = serde_json::json!({
+            "refresh_token": "refresh-old",
+            "account_id": "workspace-123",
+        });
+        store
+            .upsert_provider(
+                "oauth-status-cas",
+                "OAuth Status CAS",
+                "openai",
+                OPENAI_CODEX_BASE_URL,
+                "",
+                None,
+                AuthMode::OAuth,
+                Some(&initial_meta.to_string()),
+                serde_json::json!({}),
+                true,
+            )
+            .await
+            .expect("upsert oauth provider");
+
+        let stale = store
+            .get_provider("oauth-status-cas")
+            .await
+            .expect("get provider")
+            .expect("provider exists");
+        let rotated_meta = serde_json::json!({
+            "refresh_token": "refresh-new",
+            "account_id": "workspace-123",
+        });
+        store
+            .set_provider_oauth_meta("oauth-status-cas", &rotated_meta.to_string())
+            .await
+            .expect("rotate refresh token");
+
+        let stale_status_meta = serde_json::json!({
+            "refresh_token": "refresh-old",
+            "account_id": "workspace-123",
+            "status": "invalid",
+        });
+        assert!(
+            !store
+                .set_provider_oauth_meta_if_unchanged(
+                    "oauth-status-cas",
+                    &stale.encrypted_oauth_meta,
+                    &stale_status_meta.to_string(),
+                )
+                .await
+                .expect("stale CAS attempt"),
+            "a stale status patch must not replace rotated credentials"
+        );
+
+        store
+            .set_provider_oauth_status(
+                "oauth-status-cas",
+                OAuthCredentialStatus::Invalid,
+                Some("credential_rejected"),
+            )
+            .await
+            .expect("retry status update against latest metadata");
+        let current = store
+            .get_provider("oauth-status-cas")
+            .await
+            .expect("get current provider")
+            .expect("provider exists");
+        let current_meta: serde_json::Value = serde_json::from_str(
+            current
+                .oauth_meta_cleartext
+                .as_deref()
+                .expect("decrypted metadata"),
+        )
+        .expect("valid metadata");
+        assert_eq!(current_meta["refresh_token"], "refresh-new");
+        assert_eq!(current_meta["status"], "invalid");
+    }
+
+    #[test]
+    fn openai_oauth_config_uses_workspace_scoped_form_refresh() {
+        let now = chrono::Utc::now();
+        let provider = Provider {
+            id: "oauth-openai".to_string(),
+            name: "OAuth OpenAI".to_string(),
+            vendor: "openai".to_string(),
+            api_base: OPENAI_PLATFORM_BASE_URL.to_string(),
+            models_endpoint: String::new(),
+            encrypted_api_key: String::new(),
+            auth_mode: AuthMode::OAuth,
+            encrypted_oauth_meta: String::new(),
+            metadata_json: serde_json::json!({
+                "oauth": {
+                    "token_url": "https://auth.openai.com/oauth/token",
+                    "client_id": "client",
+                    "scopes": ["openid", "profile", "email"],
+                }
+            }),
+            enabled: true,
+            created_at: now,
+            updated_at: now,
+            api_key_cleartext: None,
+            oauth_meta_cleartext: Some(
+                serde_json::json!({
+                    "refresh_token": "refresh",
+                    "account_id": "workspace-123",
+                })
+                .to_string(),
+            ),
+        };
+
+        let oauth = build_oauth_target_config(&provider).expect("oauth config");
+        assert_eq!(oauth.token_request_style, TokenRequestStyle::Form);
+        assert_eq!(oauth.upstream_transport, UpstreamTransport::Http);
+        assert_eq!(oauth.scopes, vec!["openid", "profile", "email"]);
+        assert_eq!(oauth.cache_label(), "workspace-123");
+        assert!(oauth.extra_headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("chatgpt-account-id") && value == "workspace-123"
+        }));
+        assert!(oauth.extra_headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("originator") && value == OPENAI_CODEX_DESKTOP_ORIGINATOR
+        }));
+        assert!(oauth.extra_headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("user-agent") && value == OPENAI_CODEX_DESKTOP_USER_AGENT
+        }));
     }
 
     fn test_model_metadata(id: &str) -> ModelMetadata {

@@ -24,6 +24,7 @@
 //! escape hatch: a lossy combination is rejected outright, full stop.
 
 use crate::ir::{Content, IrRequest, MediaSource, ResponseFormat};
+use crate::protocol::structured_output::validate_response_format_for_target;
 use crate::protocol::{EndpointCapabilities, Error, ProtocolEndpoint};
 
 /// A dimension-level lossy conversion check.
@@ -46,9 +47,22 @@ pub enum LossyDimension {
     /// Request has `response_format` constraints but the egress protocol does
     /// not support structured output.
     StructuredOutput,
+    /// Request contains non-function hosted tools unsupported by the target.
+    HostedTools,
+    /// Request contains OpenAI `type: "custom"` tool definitions unsupported by the target.
+    CustomTools,
+    /// Request contains Responses program state or program caller links.
+    ProgrammaticToolCalling,
+    /// Request uses output verbosity unsupported by the target.
+    Verbosity,
+    /// Request carries explicit content-block cache breakpoints unsupported by the target.
+    PromptCacheBreakpoint,
     /// Request has `extended_reasoning` (Anthropic-style thinking blocks) but
     /// the egress protocol cannot carry reasoning parts.
     ExtendedReasoning,
+    /// Request uses OpenAI Responses multi-agent beta state that only Responses
+    /// can express (top-level `multi_agent` and/or multi-agent input items).
+    MultiAgent,
 }
 
 impl LossyDimension {
@@ -61,7 +75,13 @@ impl LossyDimension {
             Self::ToolChoiceSpecific => "tool_choice=specific_function",
             Self::MediaSourceUnsupported => "media_source",
             Self::StructuredOutput => "response_format (structured output)",
+            Self::HostedTools => "hosted_tools",
+            Self::CustomTools => "custom_tools",
+            Self::ProgrammaticToolCalling => "programmatic_tool_calling",
+            Self::Verbosity => "verbosity",
+            Self::PromptCacheBreakpoint => "prompt_cache_breakpoint",
             Self::ExtendedReasoning => "extended_reasoning",
+            Self::MultiAgent => "multi_agent",
         }
     }
 }
@@ -175,8 +195,123 @@ pub fn check_lossy_conversion(
             ),
         ));
     }
+    if let Err(error) =
+        validate_response_format_for_target(request.response_format.as_ref(), egress)
+    {
+        return Err((
+            LossyDimension::StructuredOutput,
+            lossy_error(LossyDimension::StructuredOutput, egress, &error.to_string()),
+        ));
+    }
 
-    // 7. Extended reasoning — request contains Reasoning content blocks (e.g.
+    // 7. Hosted tools are first-class only on Responses. Do not silently
+    // filter them from Chat/Messages/Gemini requests. Custom tools
+    // (`type: "custom"`) are expressible on Chat and Responses but not on
+    // Anthropic Messages or Gemini, so reject them on those egress paths
+    // instead of silently dropping the tool definition.
+    let openai_egress = matches!(
+        egress.suite,
+        crate::protocol::ProtocolSuite::OpenAiCompatible
+            | crate::protocol::ProtocolSuite::OpenAiResponses
+    );
+    if request.tools.iter().any(|tool| tool.is_hosted()) && !egress_caps.hosted_tools {
+        return Err((
+            LossyDimension::HostedTools,
+            lossy_error(
+                LossyDimension::HostedTools,
+                egress,
+                "non-function hosted tool definition",
+            ),
+        ));
+    }
+    if request.tools.iter().any(|tool| tool.is_custom()) && !openai_egress {
+        return Err((
+            LossyDimension::CustomTools,
+            lossy_error(
+                LossyDimension::CustomTools,
+                egress,
+                "custom tool definition (OpenAI-only)",
+            ),
+        ));
+    }
+
+    // 8. Programmatic Tool Calling state cannot be flattened without losing
+    // replay state or caller ancestry.
+    let has_programmatic_state = request
+        .messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .any(|content| {
+            matches!(
+                content,
+                Content::Program { .. }
+                    | Content::ProgramOutput { .. }
+                    | Content::ToolCall {
+                        caller: Some(_),
+                        ..
+                    }
+                    | Content::ToolResult {
+                        caller: Some(_),
+                        ..
+                    }
+            )
+        });
+    let tool_config_uses_programmatic_callers = request.tools.iter().any(|tool| {
+        tool.is_function()
+            && tool
+                .config
+                .as_ref()
+                .and_then(|config| config.get("allowed_callers"))
+                .is_some()
+    });
+    if (has_programmatic_state || tool_config_uses_programmatic_callers)
+        && !egress_caps.programmatic_tool_calling
+    {
+        return Err((
+            LossyDimension::ProgrammaticToolCalling,
+            lossy_error(
+                LossyDimension::ProgrammaticToolCalling,
+                egress,
+                "program/program_output/caller relationship",
+            ),
+        ));
+    }
+
+    if request.params.verbosity.is_some() && !openai_egress {
+        return Err((
+            LossyDimension::Verbosity,
+            lossy_error(LossyDimension::Verbosity, egress, "text verbosity"),
+        ));
+    }
+
+    let has_breakpoint = request
+        .messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .any(|content| {
+            matches!(
+                content,
+                Content::Text {
+                    prompt_cache_breakpoint: Some(_),
+                    ..
+                } | Content::Media {
+                    prompt_cache_breakpoint: Some(_),
+                    ..
+                }
+            )
+        });
+    if has_breakpoint && !openai_egress {
+        return Err((
+            LossyDimension::PromptCacheBreakpoint,
+            lossy_error(
+                LossyDimension::PromptCacheBreakpoint,
+                egress,
+                "explicit content-block cache breakpoint",
+            ),
+        ));
+    }
+
+    // 9. Extended reasoning — request contains Reasoning content blocks (e.g.
     // Anthropic thinking) but target cannot carry reasoning.
     let has_reasoning = request
         .messages
@@ -190,6 +325,58 @@ pub fn check_lossy_conversion(
                 LossyDimension::ExtendedReasoning,
                 egress,
                 "reasoning content",
+            ),
+        ));
+    }
+
+    // `reasoning.mode` and `reasoning.context` are Responses-only request
+    // controls. Unlike replayed reasoning content, they live in generation
+    // parameters, so the check above cannot see them. Reject crossings to
+    // every other suite rather than allowing their encoders to silently drop
+    // the controls.
+    let has_responses_reasoning_controls = request
+        .params
+        .thinking
+        .as_ref()
+        .is_some_and(|thinking| thinking.mode.is_some() || thinking.context.is_some());
+    if has_responses_reasoning_controls
+        && egress.suite != crate::protocol::ProtocolSuite::OpenAiResponses
+    {
+        return Err((
+            LossyDimension::ExtendedReasoning,
+            lossy_error(
+                LossyDimension::ExtendedReasoning,
+                egress,
+                "Responses-only reasoning.mode or reasoning.context",
+            ),
+        ));
+    }
+
+    // 10. Multi-agent Beta is Responses-only. Detect either the top-level
+    // `multi_agent` config bag or opaque multi-agent input items; reject when
+    // the egress suite cannot express them (do not silently drop).
+    let has_multi_agent_config = request
+        .extensions
+        .get("responses_extra")
+        .and_then(|v| v.get("multi_agent"))
+        .is_some();
+    let has_multi_agent_items = request
+        .extensions
+        .get("multi_agent_items")
+        .and_then(|v| v.as_array())
+        .is_some_and(|items| !items.is_empty());
+    if (has_multi_agent_config || has_multi_agent_items)
+        && !matches!(
+            egress.suite,
+            crate::protocol::ProtocolSuite::OpenAiResponses
+        )
+    {
+        return Err((
+            LossyDimension::MultiAgent,
+            lossy_error(
+                LossyDimension::MultiAgent,
+                egress,
+                "multi_agent config or multi_agent_call items (Responses-only)",
             ),
         ));
     }

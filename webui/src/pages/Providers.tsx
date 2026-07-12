@@ -1,12 +1,27 @@
 import { useMemo, useRef, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Plus, Pencil, Trash2, ExternalLink, RefreshCw, Play, Copy } from "lucide-react";
+import {
+  useMutation,
+  useQueries,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
+import {
+  Plus,
+  Pencil,
+  Trash2,
+  ExternalLink,
+  RefreshCw,
+  Play,
+  Copy,
+} from "lucide-react";
 import { providersApi, providerCatalogApi, oauthApi } from "@/api/resources";
 import type {
   Provider,
   ProviderDeleteImpact,
   ProviderInput,
+  ProviderUsage,
+  ProviderUsageWindow,
 } from "@/api/types";
 import {
   Badge,
@@ -39,15 +54,15 @@ import { openExternalUrl } from "@/lib/external-url";
 import { VendorIcon } from "@/lib/vendors";
 
 const AUTH_MODES = ["api_key", "oauth"];
+const OPENAI_PLATFORM_BASE_URL = "https://api.openai.com/v1";
+const OPENAI_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
 
 /** Vendors that have a built-in OAuth preset (crates/auth/src/provider_oauth.rs). */
 const OAUTH_VENDORS = new Set(["openai", "anthropic", "xai"]);
 
 /**
- * OAuth preset metadata embedded into `metadata_json["oauth"]` when a
- * provider is saved with auth_mode=oauth. Mirrors the values in
- * crates/auth/src/provider_oauth.rs so the backend's
- * `build_oauth_target_config` can construct an `OAuthTargetConfig`.
+ * Refresh metadata embedded into `metadata_json["oauth"]` when a provider is
+ * saved with auth_mode=oauth. Authorization scopes remain backend-owned.
  */
 const OAUTH_PRESETS: Record<
   string,
@@ -55,12 +70,14 @@ const OAUTH_PRESETS: Record<
     token_url: string;
     client_id: string;
     scopes: string[];
+    token_request_style: "form" | "json";
   }
 > = {
   openai: {
     token_url: "https://auth.openai.com/oauth/token",
     client_id: "app_EMoamEEZ73f0CkXaXp7hrann",
-    scopes: ["openid", "email", "profile", "offline_access"],
+    scopes: ["openid", "profile", "email"],
+    token_request_style: "form",
   },
   anthropic: {
     token_url: "https://api.anthropic.com/v1/oauth/token",
@@ -72,6 +89,7 @@ const OAUTH_PRESETS: Record<
       "user:mcp_servers",
       "user:file_upload",
     ],
+    token_request_style: "json",
   },
   xai: {
     token_url: "https://auth.x.ai/oauth2/token",
@@ -84,6 +102,7 @@ const OAUTH_PRESETS: Record<
       "grok-cli:access",
       "api:access",
     ],
+    token_request_style: "form",
   },
 };
 
@@ -128,6 +147,146 @@ function hasOAuthMeta(provider: Provider | null): boolean {
   return meta !== "" && meta !== "[encrypted: <short>]";
 }
 
+function oauthStatusTone(
+  provider: Provider,
+): "success" | "warning" | "danger" | "info" | "neutral" {
+  switch (provider.oauth_status?.state) {
+    case "healthy":
+      return "success";
+    case "invalid":
+      return "danger";
+    case "error":
+      return "warning";
+    case "connected":
+      return "info";
+    default:
+      return "neutral";
+  }
+}
+
+function oauthStatusKey(provider: Provider): string {
+  return `providers.oauthStatus.${provider.oauth_status?.state ?? "not_connected"}`;
+}
+
+function isOpenAiOAuth(provider: Provider): boolean {
+  return provider.vendor === "openai" && provider.auth_mode === "oauth";
+}
+
+function isOAuthProvider(provider: Provider): boolean {
+  return provider.auth_mode === "oauth";
+}
+
+const PLAN_TYPE_LABELS: Record<string, string> = {
+  free: "Free",
+  go: "Go",
+  plus: "Plus",
+  pro: "Pro",
+  pro_lite: "Pro Lite",
+  business: "Business",
+  enterprise: "Enterprise",
+  education: "Education",
+  edu: "Education",
+};
+
+function formatPlanType(planType: string | null | undefined): string | null {
+  const normalized = planType?.trim().toLowerCase();
+  if (!normalized) return null;
+  return PLAN_TYPE_LABELS[normalized] ?? planType?.trim() ?? null;
+}
+
+function formatUsageResetTime(
+  resetAt: number | null | undefined,
+  t: (key: string, options?: Record<string, unknown>) => string,
+): string {
+  if (resetAt == null) return "—";
+  const remainingMinutes = Math.max(
+    1,
+    Math.ceil((resetAt * 1000 - Date.now()) / 60_000),
+  );
+  const days = Math.floor(remainingMinutes / (24 * 60));
+  const hours = Math.floor((remainingMinutes % (24 * 60)) / 60);
+  const minutes = remainingMinutes % 60;
+
+  if (days > 0) {
+    return hours > 0
+      ? t("providers.usage.resetAfter.daysHours", { days, hours })
+      : t("providers.usage.resetAfter.days", { days });
+  }
+  if (hours > 0) {
+    return minutes > 0
+      ? t("providers.usage.resetAfter.hoursMinutes", { hours, minutes })
+      : t("providers.usage.resetAfter.hours", { hours });
+  }
+  return t("providers.usage.resetAfter.minutes", { minutes });
+}
+
+function usageWindowPercent(window: ProviderUsageWindow | null | undefined) {
+  const value = window?.used_percent;
+  return typeof value === "number" && Number.isFinite(value)
+    ? Math.min(100, Math.max(0, value))
+    : null;
+}
+
+function UsageWindow({
+  label,
+  window,
+  loading,
+  state,
+  t,
+}: {
+  label: string;
+  window?: ProviderUsageWindow | null;
+  loading: boolean;
+  state?: ProviderUsage["state"];
+  t: (key: string, options?: Record<string, unknown>) => string;
+}) {
+  const percent = usageWindowPercent(window);
+  const isAvailable = state === "available" && percent != null;
+  const resetAt = formatUsageResetTime(window?.reset_at, t);
+
+  return (
+    <div className="min-w-0">
+      <div className="mb-0.5 flex min-w-0 items-center gap-1 text-[10px]">
+        <span>{label}</span>
+        <span
+          className="min-w-0 flex-1 truncate text-[9px] font-normal normal-case tracking-normal text-text-subtle"
+          title={isAvailable ? resetAt : undefined}
+        >
+          {loading
+            ? "…"
+            : isAvailable
+              ? resetAt
+              : state === "not_connected"
+                ? t("providers.usage.notConnected")
+                : t("providers.usage.unavailable")}
+        </span>
+        {loading ? (
+          <span className="text-text-subtle">…</span>
+        ) : isAvailable ? (
+          <span className="font-mono normal-case text-text">
+            {percent.toFixed(0)}%
+          </span>
+        ) : (
+          <span className="font-mono normal-case text-text-subtle">—</span>
+        )}
+      </div>
+      <div className="h-1 overflow-hidden rounded-full bg-surface-muted">
+        {loading ? (
+          <div className="h-full w-1/2 animate-pulse rounded-full bg-border-strong" />
+        ) : isAvailable ? (
+          <div
+            className={cn(
+              "h-full rounded-full transition-[width] duration-300",
+              percent >= 90 ? "bg-danger" : "bg-primary",
+            )}
+            style={{ width: `${percent}%` }}
+          />
+          ) : null}
+      </div>
+    </div>
+  );
+}
+
 export default function Providers() {
   const { t } = useTranslation();
   const qc = useQueryClient();
@@ -136,6 +295,7 @@ export default function Providers() {
   const { data, isLoading, error, refetch } = useQuery({
     queryKey: ["providers"],
     queryFn: providersApi.list,
+    refetchInterval: 30_000,
   });
   const {
     data: catalog,
@@ -144,6 +304,16 @@ export default function Providers() {
   } = useQuery({
     queryKey: ["provider-catalog"],
     queryFn: providerCatalogApi.list,
+  });
+  const usageQueries = useQueries({
+    queries: (data ?? []).map((provider) => ({
+      queryKey: ["provider-usage", provider.id],
+      queryFn: () => providersApi.usage(provider.id),
+      enabled: isOpenAiOAuth(provider),
+      staleTime: 0,
+      refetchOnMount: "always" as const,
+      retry: false,
+    })),
   });
   const { scrollRef, scrollState } = useStickyTableScroll([
     isLoading,
@@ -156,6 +326,13 @@ export default function Providers() {
     for (const e of catalog ?? []) m.set(e.id, e.display_name);
     return m;
   }, [catalog]);
+  const usageByProvider = useMemo(() => {
+    const result = new Map<string, (typeof usageQueries)[number]>();
+    for (const [index, provider] of (data ?? []).entries()) {
+      result.set(provider.id, usageQueries[index]);
+    }
+    return result;
+  }, [data, usageQueries]);
   const [modalOpen, setModalOpen] = useState(false);
   const [form, setForm] = useState<FormState>(emptyForm());
   const [editing, setEditing] = useState<Provider | null>(null);
@@ -248,7 +425,10 @@ export default function Providers() {
 
   const oauthCallbackMutation = useMutation({
     mutationFn: () => {
-      const parsed = parseCallbackUrl(oauthCallbackUrl, oauthState ?? undefined);
+      const parsed = parseCallbackUrl(
+        oauthCallbackUrl,
+        oauthState ?? undefined,
+      );
       if (!parsed) {
         throw new Error(t("oauth.callbackUrlInvalid"));
       }
@@ -284,10 +464,14 @@ export default function Providers() {
       const label = `${editing?.name ?? ""} (${res.provider_id})`;
       setOauthMessage(t("oauth.refreshed", { provider: label }));
       toast.success(t("oauth.refreshed", { provider: label }));
+      void invalidateProviders();
+      void providersApi.get(res.provider_id).then(setEditing);
     },
     onError: (e: Error) => {
       setOauthError(e.message);
       setOauthMessage(null);
+      void invalidateProviders();
+      if (editing) void providersApi.get(editing.id).then(setEditing);
     },
   });
 
@@ -382,11 +566,32 @@ export default function Providers() {
   function submit() {
     setFormError(null);
     const isOAuth = form.auth_mode === "oauth";
+    const isOpenAi = form.vendor === "openai";
+    const apiBase = isOpenAi
+      ? isOAuth
+        ? !form.api_base || form.api_base === OPENAI_PLATFORM_BASE_URL
+          ? OPENAI_CODEX_BASE_URL
+          : form.api_base
+        : !form.api_base || form.api_base === OPENAI_CODEX_BASE_URL
+          ? OPENAI_PLATFORM_BASE_URL
+          : form.api_base
+      : form.api_base;
+    const modelsEndpoint = isOpenAi
+      ? isOAuth
+        ? !form.models_endpoint ||
+          form.models_endpoint === `${OPENAI_PLATFORM_BASE_URL}/models`
+          ? `${OPENAI_CODEX_BASE_URL}/models`
+          : form.models_endpoint
+        : !form.models_endpoint ||
+            form.models_endpoint === `${OPENAI_CODEX_BASE_URL}/models`
+          ? `${OPENAI_PLATFORM_BASE_URL}/models`
+          : form.models_endpoint
+      : form.models_endpoint;
     const body: ProviderInput = {
       name: form.name,
       vendor: form.vendor,
-      api_base: form.api_base,
-      models_endpoint: form.models_endpoint,
+      api_base: apiBase,
+      models_endpoint: modelsEndpoint,
       auth_mode: form.auth_mode,
       enabled: form.enabled,
     };
@@ -552,14 +757,82 @@ export default function Providers() {
                         </span>
                       </div>
                     </Td>
-                    <Td
-                      className="truncate font-mono text-xs"
-                      title={p.api_base}
-                    >
-                      {p.api_base}
+                    <Td className="align-middle">
+                      {!isOAuthProvider(p) ? (
+                        <div
+                          className="truncate font-mono text-xs"
+                          title={p.api_base}
+                        >
+                          {p.api_base}
+                        </div>
+                      ) : null}
+                      {isOpenAiOAuth(p) ? (
+                        <div className="mt-1.5 grid min-w-[16rem] grid-cols-2 gap-x-3 gap-y-1.5">
+                          {(() => {
+                            const usageQuery = usageByProvider.get(p.id);
+                            const usage = usageQuery?.data;
+                            const accountEmail = usage?.account_email;
+                            const planType = formatPlanType(usage?.plan_type);
+                            return (
+                              <>
+                                <div className="col-span-2 flex min-w-0 items-center gap-1 text-[10px] leading-4">
+                                  {planType ? (
+                                    <Badge
+                                      tone="primary"
+                                      className="shrink-0 px-1.5 py-0 text-[10px]"
+                                      title={usage?.plan_type ?? undefined}
+                                    >
+                                      {planType}
+                                    </Badge>
+                                  ) : null}
+                                  <span
+                                    className="min-w-0 truncate font-mono text-[10px] text-text-muted"
+                                    title={accountEmail ?? undefined}
+                                  >
+                                    {accountEmail ??
+                                      (usageQuery?.isFetching
+                                        ? t("providers.usage.loading")
+                                        : "—")}
+                                  </span>
+                                </div>
+                                <UsageWindow
+                                  label="5h"
+                                  window={usage?.five_hour}
+                                  loading={usageQuery?.isFetching ?? true}
+                                  state={usage?.state}
+                                  t={t}
+                                />
+                                <UsageWindow
+                                  label="7d"
+                                  window={usage?.seven_day}
+                                  loading={usageQuery?.isFetching ?? true}
+                                  state={usage?.state}
+                                  t={t}
+                                />
+                              </>
+                            );
+                          })()}
+                        </div>
+                      ) : null}
                     </Td>
                     <Td className="whitespace-nowrap text-xs">
-                      {t(authModeLabelKey(p.auth_mode))}
+                      <div className="flex flex-col items-start gap-1.5">
+                        <span>{t(authModeLabelKey(p.auth_mode))}</span>
+                        {p.auth_mode === "oauth" ? (
+                          <Badge
+                            tone={oauthStatusTone(p)}
+                            title={
+                              p.oauth_status?.checked_at
+                                ? t("providers.oauthStatus.checkedAt", {
+                                    time: fmtTime(p.oauth_status.checked_at),
+                                  })
+                                : undefined
+                            }
+                          >
+                            {t(oauthStatusKey(p))}
+                          </Badge>
+                        ) : null}
+                      </div>
                     </Td>
                     <Td className="text-center whitespace-nowrap">
                       {p.enabled ? (
@@ -665,58 +938,66 @@ export default function Providers() {
               options={vendorOptions}
             />
           </Field>
-          <Field label={t("providers.apiBase")}>
-            <Input
-              value={form.api_base}
-              onChange={(e) => setForm({ ...form, api_base: e.target.value })}
-              placeholder={
-                catalog?.find((e) => e.id === form.vendor)?.default_base_url ?? ""
-              }
-              onKeyDown={(e) => {
-                if (e.key === "Tab" && !form.api_base) {
-                  const entry = catalog?.find((el) => el.id === form.vendor);
-                  if (entry?.default_base_url) {
-                    e.preventDefault();
-                    setForm((prev) => ({
-                      ...prev,
-                      api_base: entry.default_base_url,
-                    }));
+          {form.auth_mode !== "oauth" ? (
+            <>
+              <Field label={t("providers.apiBase")}>
+                <Input
+                  value={form.api_base}
+                  onChange={(e) =>
+                    setForm({ ...form, api_base: e.target.value })
                   }
-                }
-              }}
-            />
-          </Field>
-          <Field label={t("providers.modelsEndpoint")}>
-            <Input
-              value={form.models_endpoint}
-              onChange={(e) =>
-                setForm({ ...form, models_endpoint: e.target.value })
-              }
-              placeholder={(() => {
-                const base =
-                  form.api_base ||
-                  catalog?.find((e) => e.id === form.vendor)
-                    ?.default_base_url ||
-                  "";
-                return base ? base + "/models" : "";
-              })()}
-              onKeyDown={(e) => {
-                if (e.key === "Tab" && !form.models_endpoint) {
-                  const base =
-                    form.api_base ||
-                    catalog?.find((el) => el.id === form.vendor)?.default_base_url ||
-                    "";
-                  if (base) {
-                    e.preventDefault();
-                    setForm((prev) => ({
-                      ...prev,
-                      models_endpoint: base + "/models",
-                    }));
+                  placeholder={
+                    catalog?.find((e) => e.id === form.vendor)
+                      ?.default_base_url ?? ""
                   }
-                }
-              }}
-            />
-          </Field>
+                  onKeyDown={(e) => {
+                    if (e.key === "Tab" && !form.api_base) {
+                      const entry = catalog?.find((el) => el.id === form.vendor);
+                      if (entry?.default_base_url) {
+                        e.preventDefault();
+                        setForm((prev) => ({
+                          ...prev,
+                          api_base: entry.default_base_url,
+                        }));
+                      }
+                    }
+                  }}
+                />
+              </Field>
+              <Field label={t("providers.modelsEndpoint")}>
+                <Input
+                  value={form.models_endpoint}
+                  onChange={(e) =>
+                    setForm({ ...form, models_endpoint: e.target.value })
+                  }
+                  placeholder={(() => {
+                    const base =
+                      form.api_base ||
+                      catalog?.find((e) => e.id === form.vendor)
+                        ?.default_base_url ||
+                      "";
+                    return base ? base + "/models" : "";
+                  })()}
+                  onKeyDown={(e) => {
+                    if (e.key === "Tab" && !form.models_endpoint) {
+                      const base =
+                        form.api_base ||
+                        catalog?.find((el) => el.id === form.vendor)
+                          ?.default_base_url ||
+                        "";
+                      if (base) {
+                        e.preventDefault();
+                        setForm((prev) => ({
+                          ...prev,
+                          models_endpoint: base + "/models",
+                        }));
+                      }
+                    }
+                  }}
+                />
+              </Field>
+            </>
+          ) : null}
           <Field label={t("providers.authMode")}>
             <Select
               value={form.auth_mode}
@@ -745,16 +1026,25 @@ export default function Providers() {
                   <span className="text-sm font-medium text-text">
                     {t("providers.oauthPanel.title")}
                   </span>
-                  {hasOAuthMeta(editing) ? (
-                    <Badge tone="success">
-                      {t("providers.oauthPanel.connected")}
-                    </Badge>
-                  ) : (
-                    <Badge tone="neutral">
-                      {t("providers.oauthPanel.notConnected")}
-                    </Badge>
-                  )}
+                  <Badge tone={oauthStatusTone(editing)}>
+                    {t(oauthStatusKey(editing))}
+                  </Badge>
                 </div>
+                {editing.oauth_status?.state === "invalid" ? (
+                  <Alert tone="danger">
+                    {t("providers.oauthStatus.invalidHint")}
+                  </Alert>
+                ) : null}
+                {editing.oauth_status?.state === "error" ? (
+                  <Alert tone="warning">
+                    {t("providers.oauthStatus.errorHint")}
+                  </Alert>
+                ) : null}
+                {editing.oauth_status?.state === "connected" ? (
+                  <Alert tone="info">
+                    {t("providers.oauthStatus.connectedHint")}
+                  </Alert>
+                ) : null}
                 <div className="flex flex-wrap gap-2">
                   <Button
                     variant="primary"
@@ -762,7 +1052,11 @@ export default function Providers() {
                     loading={oauthStartMutation.isPending}
                     onClick={() => oauthStartMutation.mutate()}
                   >
-                    {t("providers.oauthPanel.start")}
+                    {t(
+                      editing.oauth_status?.state === "invalid"
+                        ? "providers.oauthPanel.reauthorize"
+                        : "providers.oauthPanel.start",
+                    )}
                   </Button>
                   <Button
                     variant="secondary"
@@ -827,9 +1121,7 @@ export default function Providers() {
                 ) : null}
               </div>
             ) : (
-              <Alert tone="info">
-                {t("providers.oauthPanel.saveFirst")}
-              </Alert>
+              <Alert tone="info">{t("providers.oauthPanel.saveFirst")}</Alert>
             )
           ) : null}
           {form.auth_mode !== "oauth" ? (
