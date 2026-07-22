@@ -43,6 +43,7 @@ use tiygate_auth::provider_oauth::{
     build_authorize_url, classify_refresh_failure, do_refresh_token, exchange_code, generate_pkce,
     preset_for_vendor, OAuthRefreshFailureKind,
 };
+use tiygate_store::config_store::validate_provider_auth_mode;
 use tiygate_store::models::{AuthMode, OAuthCredentialStatus};
 
 use crate::state::{AdminState, OAuthPendingFlow};
@@ -86,12 +87,13 @@ async fn start_oauth(
             "provider is not configured for OAuth",
         ));
     }
+    validate_oauth_vendor(&provider.vendor)?;
 
     // Look up the OAuth preset for the provider's vendor.
     let preset = preset_for_vendor(&provider.vendor).ok_or_else(|| {
         ApiError::bad_request(format!(
             "no built-in OAuth preset for vendor '{}'; \
-             supported vendors: openai, anthropic, xai",
+             supported vendors: openai, anthropic",
             provider.vendor
         ))
     })?;
@@ -195,6 +197,8 @@ async fn callback_oauth_inner(
             StatusCode::NOT_FOUND,
             "provider vanished during oauth flow".to_string(),
         ))?;
+    validate_provider_auth_mode(&provider.vendor, AuthMode::OAuth)
+        .map_err(|message| (StatusCode::BAD_REQUEST, message.to_string()))?;
 
     let preset = preset_for_vendor(&provider.vendor).ok_or((
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -206,14 +210,20 @@ async fn callback_oauth_inner(
 
     // Exchange the authorization code for tokens.
     let http_client = reqwest::Client::new();
-    let result = exchange_code(&preset, &code, &pending.verifier, &http_client)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("oauth exchange failed: {e}"),
-            )
-        })?;
+    let result = exchange_code(
+        &preset,
+        &code,
+        &pending.verifier,
+        Some(&csrf_state),
+        &http_client,
+    )
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("oauth exchange failed: {e}"),
+        )
+    })?;
 
     if result.refresh_token.is_none() {
         return Err((
@@ -252,6 +262,8 @@ async fn callback_oauth_inner(
     let expires_in = result.expires_in;
     let account_id = result.account_id;
     let account_email = result.account_email;
+    let organization_id = result.organization_id;
+    let organization_name = result.organization_name;
 
     // Persist the refresh-token metadata (encrypted at rest by
     // the `DbConfigStore`). The access token itself is *not*
@@ -261,6 +273,8 @@ async fn callback_oauth_inner(
         "refresh_token": &refresh_token,
         "account_id": account_id.as_deref(),
         "account_email": account_email.as_deref(),
+        "organization_id": organization_id.as_deref(),
+        "organization_name": organization_name.as_deref(),
         "expires_in_s": expires_in.map(|d| d.as_secs()),
         "status": OAuthCredentialStatus::Healthy.as_str(),
         "status_checked_at": chrono::Utc::now().to_rfc3339(),
@@ -322,6 +336,7 @@ async fn refresh_oauth(
             "provider is not configured for OAuth",
         ));
     }
+    validate_oauth_vendor(&provider.vendor)?;
 
     if let Some(service) = state.oauth_service.as_ref() {
         let summary = service
@@ -505,4 +520,9 @@ fn mint_state() -> String {
         out.push_str(&format!("{:02x}", b));
     }
     out
+}
+
+fn validate_oauth_vendor(vendor: &str) -> Result<(), ApiError> {
+    validate_provider_auth_mode(vendor, AuthMode::OAuth)
+        .map_err(|message| ApiError::bad_request(message.to_string()))
 }

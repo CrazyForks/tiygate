@@ -35,9 +35,9 @@ logs or telemetry.
 5. Other instances reuse the committed access token instead of issuing another
    refresh grant.
 
-Editing a provider's authentication mode, vendor, OAuth endpoint configuration,
-or explicit OAuth metadata clears its shared and local access-token state while
-holding the same provider lock. Explicitly submitted OAuth metadata is restored
+Editing a provider's authentication mode or vendor, reconnecting OAuth, or
+installing replacement OAuth metadata clears its shared and local access-token
+state while holding the same provider lock. Replacement metadata is restored
 inside that critical section so an already-running refresh cannot overwrite the
 new credential.
 
@@ -45,6 +45,52 @@ An upstream `401 Unauthorized` is handled once at the common fallback layer for
 all protocols. Before refreshing, TiyGate checks whether the local cache or
 shared database already contains an access token different from the rejected
 one. The original upstream request is retried once with the resulting token.
+
+## Provider egress profiles
+
+OAuth providers use their built-in authorization and API endpoints. Provider
+creation and editing do not expose custom OAuth endpoint configuration.
+
+The provider vendor selects an immutable `OAuthEgressProfile`:
+
+- OpenAI OAuth uses `openai_codex` only for OpenAI Responses egress. The
+  profile owns Codex request normalization, session-header behavior, HTTP/SSE
+  terminal-response parsing, and WebSocket negotiation. `UpstreamTransport`
+  independently selects HTTP/SSE or Codex Responses WebSocket. HTTP/SSE uses
+  the shared upstream client; Codex does not maintain a separate HTTP pool.
+- Anthropic OAuth uses `anthropic_oauth` only for Anthropic Messages egress.
+  The profile owns OAuth beta and client headers, summarized-thinking defaults,
+  re-signing of an existing billing header, and a dedicated verified-Rustls
+  HTTP/2 pool. It does not synthesize prompts, rewrite tools, or impersonate a
+  browser TLS fingerprint.
+- Other OAuth providers use `standard` egress behavior.
+
+OAuth egress profiles never apply to API-key credentials or unrelated egress
+protocols. Profile selection does not depend on OAuth client IDs or endpoint
+URL matching.
+
+## Subscription usage windows
+
+The Admin provider list reads Codex subscription usage from
+`/backend-api/wham/usage`. The upstream `primary_window` and
+`secondary_window` fields are transport slots, not fixed 5-hour and 7-day
+semantics. TiyGate preserves each returned window and derives its display label
+from `limit_window_seconds`, so a response containing only a 7-day
+`primary_window` renders one `7d` meter instead of an unavailable `5h` meter.
+
+`GET /admin/v1/providers/:id/usage` exposes the ordered windows through
+`windows`. The legacy `five_hour` and `seven_day` fields remain available for
+API compatibility and are populated by matching window duration rather than
+field position.
+
+Anthropic OAuth providers read subscription usage from `/api/oauth/usage` with
+the same access token and `anthropic-beta` header used by the OAuth profile.
+TiyGate maps `five_hour`, `seven_day`, model-specific weekly fields such as
+`seven_day_sonnet`, future `seven_day_*` fields, and
+`limits[].weekly_scoped` into `windows`. Named scopes carry an explicit label
+so equal-duration weekly limits remain distinguishable. Null or non-applicable
+windows are omitted, and the WebUI keeps successful usage results fresh for 60
+seconds to avoid repeatedly probing the upstream endpoint during navigation.
 
 ## Background keepalive
 

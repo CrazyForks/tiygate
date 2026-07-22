@@ -20,7 +20,9 @@ use uuid::Uuid;
 
 use tiygate_core::protocol::{ProtocolEndpoint, ProtocolSuite};
 use tiygate_core::provider::find_provider;
-use tiygate_core::provider::oauth::{OAuthTargetConfig, TokenRequestStyle, UpstreamTransport};
+use tiygate_core::provider::oauth::{
+    OAuthEgressProfile, OAuthTargetConfig, TokenRequestStyle, UpstreamTransport,
+};
 use tiygate_core::routing::{RouteEntry, RoutingTable, RoutingTarget};
 
 use crate::db::DbPool;
@@ -43,6 +45,21 @@ const OPENAI_CODEX_DESKTOP_ORIGINATOR: &str = "Codex Desktop";
 /// with desktop-oriented upstream endpoints.
 const OPENAI_CODEX_DESKTOP_USER_AGENT: &str =
     "Codex Desktop/0.144.0-alpha.4 (Mac OS 26.5.2; arm64) unknown (Codex Desktop; 26.707.51957)";
+
+/// xAI OAuth is intentionally disabled until the gateway has a supported
+/// first-party OAuth egress contract. xAI providers must use an API key.
+pub const XAI_API_KEY_ONLY_ERROR: &str =
+    "xAI OAuth is temporarily disabled; configure xAI with auth_mode 'api_key'";
+
+/// Validate provider authentication modes that are constrained by a built-in
+/// provider integration. Keeping this beside persistence ensures Admin API,
+/// config imports, and internal callers follow the same policy.
+pub fn validate_provider_auth_mode(vendor: &str, auth_mode: AuthMode) -> Result<(), &'static str> {
+    if vendor.eq_ignore_ascii_case("xai") && auth_mode != AuthMode::ApiKey {
+        return Err(XAI_API_KEY_ONLY_ERROR);
+    }
+    Ok(())
+}
 
 /// Convenience error for store operations.
 #[derive(Debug, Error)]
@@ -326,6 +343,11 @@ pub fn snapshot_to_routing_table(snapshot: &ConfigSnapshot) -> RoutingTable {
 /// will fall through to the static key path (which will also fail,
 /// but with a clearer error).
 pub fn build_oauth_target_config(provider: &Provider) -> Option<OAuthTargetConfig> {
+    // Existing xAI OAuth rows are retained so the temporary disablement is
+    // reversible, but they must not be routed or refreshed as OAuth.
+    if validate_provider_auth_mode(&provider.vendor, provider.auth_mode).is_err() {
+        return None;
+    }
     let oauth_meta = provider.metadata_json.get("oauth")?;
 
     let token_url = oauth_meta
@@ -363,6 +385,13 @@ pub fn build_oauth_target_config(provider: &Provider) -> Option<OAuthTargetConfi
         .cloned()
         .and_then(|value| serde_json::from_value(value).ok())
         .unwrap_or(UpstreamTransport::Http);
+    // Built-in OAuth providers select immutable egress behavior by vendor.
+    // Other OAuth providers retain the generic standard profile.
+    let egress_profile = match provider.vendor.as_str() {
+        "openai" => OAuthEgressProfile::OpenAiCodex,
+        "anthropic" => OAuthEgressProfile::AnthropicOAuth,
+        _ => OAuthEgressProfile::Standard,
+    };
 
     // Codex refreshes with form data, matching the reference CLI client.
     let token_request_style = oauth_meta
@@ -464,6 +493,7 @@ pub fn build_oauth_target_config(provider: &Provider) -> Option<OAuthTargetConfi
 
     Some(OAuthTargetConfig {
         upstream_transport,
+        egress_profile,
         token_url,
         client_id,
         client_secret: None,
@@ -807,6 +837,8 @@ impl DbConfigStore {
         metadata_json: serde_json::Value,
         enabled: bool,
     ) -> Result<Provider, StoreError> {
+        validate_provider_auth_mode(vendor, auth_mode)
+            .map_err(|message| StoreError::Invalid(message.to_string()))?;
         let now = chrono::Utc::now().to_rfc3339();
         let existing = self.get_provider(id).await?;
         let encrypted_api_key = match (api_key_plain, self.encryption.as_ref()) {
@@ -1471,6 +1503,8 @@ impl DbConfigStore {
                 report.providers_skipped += 1;
                 continue;
             }
+            validate_provider_auth_mode(&p.vendor, p.auth_mode)
+                .map_err(|message| StoreError::Invalid(message.to_string()))?;
             // Re-encrypt provider secrets so they are readable by
             // this instance. When the source had encryption, decrypt
             // with the source key first; otherwise the column holds
@@ -2441,6 +2475,95 @@ mod tests {
         assert!(oauth.extra_headers.iter().any(|(name, value)| {
             name.eq_ignore_ascii_case("user-agent") && value == OPENAI_CODEX_DESKTOP_USER_AGENT
         }));
+        assert_eq!(oauth.egress_profile, OAuthEgressProfile::OpenAiCodex);
+    }
+
+    #[test]
+    fn anthropic_oauth_config_uses_isolated_egress_profile() {
+        let now = chrono::Utc::now();
+        let provider = Provider {
+            id: "oauth-anthropic".to_string(),
+            name: "OAuth Anthropic".to_string(),
+            vendor: "anthropic".to_string(),
+            api_base: "https://api.anthropic.com".to_string(),
+            models_endpoint: String::new(),
+            encrypted_api_key: String::new(),
+            auth_mode: AuthMode::OAuth,
+            encrypted_oauth_meta: String::new(),
+            metadata_json: serde_json::json!({
+                "oauth": {
+                    "token_url": "https://api.anthropic.com/v1/oauth/token",
+                    "client_id": "client",
+                }
+            }),
+            enabled: true,
+            created_at: now,
+            updated_at: now,
+            api_key_cleartext: None,
+            oauth_meta_cleartext: Some(serde_json::json!({"refresh_token": "refresh"}).to_string()),
+        };
+
+        let oauth = build_oauth_target_config(&provider).expect("oauth config");
+        assert_eq!(oauth.egress_profile, OAuthEgressProfile::AnthropicOAuth);
+        assert_eq!(oauth.token_request_style, TokenRequestStyle::Json);
+    }
+
+    #[test]
+    fn xai_oauth_config_is_disabled() {
+        let now = chrono::Utc::now();
+        let provider = Provider {
+            id: "oauth-xai".to_string(),
+            name: "OAuth xAI".to_string(),
+            vendor: "xai".to_string(),
+            api_base: "https://api.x.ai/v1".to_string(),
+            models_endpoint: String::new(),
+            encrypted_api_key: String::new(),
+            auth_mode: AuthMode::OAuth,
+            encrypted_oauth_meta: String::new(),
+            metadata_json: serde_json::json!({
+                "oauth": {
+                    "token_url": "https://auth.x.ai/oauth2/token",
+                    "client_id": "client",
+                }
+            }),
+            enabled: true,
+            created_at: now,
+            updated_at: now,
+            api_key_cleartext: None,
+            oauth_meta_cleartext: Some(serde_json::json!({"refresh_token": "refresh"}).to_string()),
+        };
+
+        assert!(build_oauth_target_config(&provider).is_none());
+        assert_eq!(
+            validate_provider_auth_mode("xai", AuthMode::OAuth),
+            Err(XAI_API_KEY_ONLY_ERROR)
+        );
+        assert!(validate_provider_auth_mode("xai", AuthMode::ApiKey).is_ok());
+    }
+
+    #[tokio::test]
+    async fn upsert_rejects_xai_oauth() {
+        let store = boot_store(None).await;
+        let error = store
+            .upsert_provider(
+                "oauth-xai",
+                "OAuth xAI",
+                "xai",
+                "https://api.x.ai/v1",
+                "",
+                None,
+                AuthMode::OAuth,
+                None,
+                serde_json::json!({}),
+                true,
+            )
+            .await
+            .expect_err("xAI OAuth must be rejected");
+
+        assert!(matches!(
+            error,
+            StoreError::Invalid(message) if message == XAI_API_KEY_ONLY_ERROR
+        ));
     }
 
     fn test_model_metadata(id: &str) -> ModelMetadata {
